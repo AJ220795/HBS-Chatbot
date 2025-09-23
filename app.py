@@ -36,6 +36,7 @@ EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
     "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-exp",
     "gemini-1.5-flash-001",
     "gemini-1.5-pro-001",
 ]
@@ -613,7 +614,7 @@ def get_conversational_response(query: str) -> str:
     casual = ["what's up", "how are you", "how's it going", "what's new"]
     
     if any(greeting in query_lower for greeting in greetings):
-        return "Hello! I'm your HBS Help Chatbot. I can help you with questions about HBS systems, features, and procedures. What would you like to know?"
+        return "Hi! How can I help you?"
     
     if any(farewell in query_lower for farewell in farewells):
         return "Goodbye! Feel free to come back anytime if you have more questions about HBS systems."
@@ -632,7 +633,7 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
         return conversational
     
     if not context_chunks:
-        return "I don't have specific information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
+        return "I don't have information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
     
     # Build context from retrieved chunks
     context_text = "\n\n".join([
@@ -659,7 +660,7 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
     if structured_answers:
         return "\n\n".join(structured_answers)
     
-    # Improved system prompt
+    # Improved system prompt with better fallback handling
     system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
 
 CONTEXT FROM KNOWLEDGE BASE:
@@ -673,8 +674,10 @@ INSTRUCTIONS:
 3. If the context contains step-by-step procedures, provide them clearly
 4. If the context mentions specific options, fields, or settings, list them exactly
 5. If you need to make assumptions, state them clearly
-6. If the context doesn't contain enough information to fully answer the question, say so and suggest what additional information might be needed
-7. Always be helpful and professional
+6. If the context doesn't contain enough information to fully answer the question, say "I don't have enough information to answer that question based on my resources" and suggest what additional information might be needed
+7. If the question is unclear or ambiguous, ask clarifying questions
+8. Always be helpful and professional
+9. For vague requests like "concise version" or "short version", ask what specifically they want to be more concise about
 
 RESPONSE:"""
 
@@ -738,7 +741,7 @@ def main():
     if "location" not in st.session_state:
         st.session_state.location = None
     if "model_name" not in st.session_state:
-        st.session_state.model_name = CANDIDATE_MODELS[0]
+        st.session_state.model_name = CANDIDATE_MODELS[0]  # Now defaults to gemini-2.5-flash-lite
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
     if "uploaded_image" not in st.session_state:
@@ -822,6 +825,11 @@ def main():
 
     # Main chat interface
     st.title("HBS Help Chatbot")
+    
+    # Show initial greeting if no messages
+    if not st.session_state.messages:
+        with st.chat_message("assistant"):
+            st.markdown("Hi! How can I help you?")
     
     # Chat messages
     for message in st.session_state.messages:
