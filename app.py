@@ -45,8 +45,8 @@ CANDIDATE_MODELS = [
 DEFAULT_LOCATION = "us-central1"
 
 # ---- Streamlit page ----
-st.set_page_config(page_title="RAG Chatbot (Vertex AI + FAISS)", page_icon="🤖", layout="wide")
-st.title("RAG Chatbot (Vertex AI + FAISS + Streamlit)")
+st.set_page_config(page_title="HBS Help Chatbot", page_icon="🤖", layout="wide")
+st.title("HBS Help Chatbot")
 
 # ---- Session defaults ----
 if "creds" not in st.session_state:
@@ -61,10 +61,12 @@ if "index" not in st.session_state:
     st.session_state.index = None
 if "corpus" not in st.session_state:
     st.session_state.corpus = None
-if "history" not in st.session_state:
-    st.session_state.history = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "index_built" not in st.session_state:
+    st.session_state.index_built = False
 
-# ---- Credentials via Streamlit Secrets (preferred on Streamlit Cloud) ----
+# ---- Credentials via Streamlit Secrets ----
 try:
     if "google" in st.secrets:
         sa_info = json.loads(st.secrets["google"]["credentials_json"])
@@ -79,50 +81,8 @@ try:
         st.session_state.project_id = project_id
         st.session_state.location = location_secret
 except Exception as e:
-    st.warning(f"Secrets-based auth not configured or failed: {e}")
-
-# ---- Sidebar ----
-with st.sidebar:
-    st.header("1) Credentials")
-    if st.session_state.creds:
-        st.success(f"Authenticated. Project: {st.session_state.project_id} | Region: {st.session_state.location}")
-        st.caption("Using Streamlit Secrets.")
-    else:
-        st.caption("Optional local dev fallback (not for Streamlit Cloud):")
-        sa_file = st.file_uploader("Upload Vertex AI service account JSON", type=["json"], key="sa_uploader")
-        project_override = st.text_input("Project ID (optional)", key="project_override")
-        location_input = st.text_input("Location", value=st.session_state.location, key="location_input")
-        apply_creds = st.button("Use Uploaded Credentials", key="apply_creds")
-        if apply_creds and sa_file is not None:
-            try:
-                sa_bytes = sa_file.read()
-                sa_info = json.loads(sa_bytes.decode("utf-8"))
-                creds = service_account.Credentials.from_service_account_info(sa_info)
-                project_id = (project_override or sa_info.get("project_id") or "").strip()
-                if not project_id:
-                    st.error("Project ID not found. Enter it or include it in the JSON.")
-                else:
-                    aiplatform.init(project=project_id, location=location_input, credentials=creds)
-                    vertexai_init(project=project_id, location=location_input, credentials=creds)
-                    st.session_state.creds = creds
-                    st.session_state.project_id = project_id
-                    st.session_state.location = location_input
-                    st.success(f"Authenticated. Project: {project_id} | Region: {location_input}")
-            except Exception as e:
-                st.error(f"Failed to load credentials: {e}")
-
-    st.header("2) Knowledge Base")
-    kb_files = st.file_uploader(
-        "Upload KB files (.docx, .pdf, .png/.jpg). You can multi-select",
-        type=["docx", "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
-        accept_multiple_files=True,
-        key="kb_uploader"
-    )
-    do_build = st.button("Build / Rebuild Index", key="build_btn")
-
-    st.header("3) Persistence")
-    do_load = st.button("Load Existing Index", key="load_btn")
-    do_save = st.button("Save Current Index", key="save_btn")
+    st.error(f"Authentication failed: {e}")
+    st.stop()
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -168,7 +128,6 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
         return ""
 
 def extract_text_from_image_bytes(b: bytes) -> str:
-    # Note: Streamlit Cloud does not provide system Tesseract. This will return "" there.
     try:
         img = Image.open(io.BytesIO(b)).convert("RGB")
         arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
@@ -229,19 +188,30 @@ def embed_query(q: str, project_id: str, location: str, creds) -> np.ndarray:
     embs = model.get_embeddings([q])
     return np.array([embs[0].values], dtype="float32")
 
-# ---- Build index ----
-def build_index_from_uploads(files):
-    if not files:
-        st.warning("Upload some KB files first.")
-        return
+# ---- Pre-load KB files ----
+def load_kb_files():
+    """Load KB files from the kb directory"""
+    kb_files = []
+    for ext in [".docx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
+        kb_files.extend(KB_DIR.glob(f"*{ext}"))
+    return kb_files
+
+def build_index_from_kb_files():
+    """Build index from pre-loaded KB files"""
+    kb_files = load_kb_files()
+    if not kb_files:
+        st.error("No KB files found in the kb directory. Please add your documents to the kb folder.")
+        return False
+    
     texts, corpus = [], []
-    # Save original files to disk and extract text
-    for f in files:
+    
+    # Extract text from files
+    for file_path in kb_files:
         try:
-            raw = f.read()
-            dest = KB_DIR / f.name
-            dest.write_bytes(raw)
-            ext = dest.suffix.lower()
+            with open(file_path, "rb") as f:
+                raw = f.read()
+            
+            ext = file_path.suffix.lower()
             text = ""
             if ext == ".docx":
                 text = extract_text_from_docx_bytes(raw)
@@ -251,13 +221,15 @@ def build_index_from_uploads(files):
                 text = extract_text_from_image_bytes(raw)
             else:
                 continue
+                
             text = (text or "").strip()
             if not text:
                 continue
-            out_path = EXTRACT_DIR / f"{dest.stem}.txt"
+                
+            out_path = EXTRACT_DIR / f"{file_path.stem}.txt"
             out_path.write_text(text, encoding="utf-8")
         except Exception as e:
-            st.warning(f"Failed to process {f.name}: {e}")
+            st.warning(f"Failed to process {file_path.name}: {e}")
 
     # Build corpus from extracted
     docs = []
@@ -275,10 +247,10 @@ def build_index_from_uploads(files):
             texts.append(ch)
 
     if not texts:
-        st.error("No text extracted. Ensure your files contain readable text.")
-        return
+        st.error("No text extracted from KB files.")
+        return False
 
-    with st.spinner("Embedding texts and building FAISS index..."):
+    with st.spinner("Building knowledge base index..."):
         embs = embed_texts(texts, st.session_state.project_id, st.session_state.location, st.session_state.creds)
         dim = int(embs.shape[1])
         faiss.normalize_L2(embs)
@@ -287,30 +259,23 @@ def build_index_from_uploads(files):
 
     st.session_state.index = index
     st.session_state.corpus = corpus
-    st.success(f"Index built with {len(corpus)} chunks.")
+    st.session_state.index_built = True
+    return True
 
-# ---- Button actions ----
-if do_build:
-    if st.session_state.creds is None or st.session_state.project_id is None:
-        st.error("Configure credentials first (use Secrets on Streamlit Cloud).")
-    else:
-        build_index_from_uploads(kb_files)
-
-if do_load:
-    idx, corp = load_index_and_corpus()
-    if idx is not None:
-        st.session_state.index = idx
-        st.session_state.corpus = corp
-        st.success(f"Loaded existing index with {len(corp)} chunks.")
-    else:
-        st.warning("No saved index found. Build first.")
-
-if do_save:
-    if st.session_state.index is not None and st.session_state.corpus is not None:
-        save_index_and_corpus(st.session_state.index, st.session_state.corpus)
-        st.success("Index and corpus saved.")
-    else:
-        st.warning("Nothing to save. Build an index first.")
+# ---- Initialize app ----
+@st.cache_resource
+def initialize_app():
+    """Initialize the app - load index or build from KB files"""
+    # Try to load existing index first
+    index, corpus = load_index_and_corpus()
+    if index is not None and corpus is not None:
+        st.session_state.index = index
+        st.session_state.corpus = corpus
+        st.session_state.index_built = True
+        return True
+    
+    # If no index exists, build from KB files
+    return build_index_from_kb_files()
 
 # ---- Model selection ----
 def ensure_model_ready():
@@ -342,60 +307,106 @@ def context_is_sufficient(hits, min_citations=2):
 
 gen_config = GenerationConfig(temperature=0.3, top_p=0.9, max_output_tokens=1024)
 
-# ---- Chat UI ----
-st.subheader("Chat")
-query = st.text_input("Ask a question (answers come strictly from your KB)", key="query_input")
-col1, col2 = st.columns([1,1])
-with col1:
-    ask = st.button("Ask", key="ask_btn")
-with col2:
-    clear = st.button("Clear conversation", key="clear_btn")
-
-if clear:
-    st.session_state.history = []
-
-if ask:
-    if st.session_state.creds is None or st.session_state.index is None:
-        st.error("Configure credentials and build/load the index first.")
-    elif not query.strip():
-        st.warning("Enter a question.")
+# ---- Initialize app ----
+if not st.session_state.index_built:
+    if initialize_app():
+        st.success("Knowledge base loaded successfully!")
     else:
-        try:
-            ensure_model_ready()
-            hits = retrieve(query, k=12)
-            if not context_is_sufficient(hits):
-                answer = (
-                    "I don't have enough information in the provided context to answer that. "
-                    "Please refine your question or upload more relevant documents."
-                )
-                st.session_state.history.append({"user": query, "assistant": answer, "hits": []})
-            else:
-                context = build_context(hits)
-                system_instruction = (
-                    "You are a helpful assistant. Use ONLY the provided KB context to answer. "
-                    "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
-                    "Do NOT use outside knowledge. Do NOT hallucinate."
-                )
-                user_message = (
-                    f"{system_instruction}\n\n"
-                    f"Context from KB:\n{context}\n\n"
-                    f"Question: {query}"
-                )
-                model = GenerativeModel(st.session_state.gemini_model)
-                resp = model.generate_content([user_message], generation_config=gen_config)
-                answer = resp.text or ""
-                st.session_state.history.append({"user": query, "assistant": answer, "hits": hits})
-        except Exception as e:
-            st.error(f"Error during generation: {e}")
+        st.error("Failed to load knowledge base. Please check your KB files.")
+        st.stop()
 
-# ---- Render conversation and citations ----
-for turn in st.session_state.history[-8:]:
-    st.markdown(f"**You:** {turn['user']}")
-    st.markdown(f"**Assistant:** {turn['assistant']}")
-    hits = turn.get("hits", [])
-    if hits:
-        with st.expander("Citations"):
-            for h in hits[:3]:
-                src = Path(h["chunk"]["source"]).name
-                snippet = h["chunk"]["text"][:240].replace("\n", " ")
-                st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
+# ---- Welcome message ----
+if not st.session_state.messages:
+    st.session_state.messages.append({"role": "assistant", "content": "Hi! How can I help you?"})
+
+# ---- Chat UI ----
+# Display chat messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "citations" in message:
+            with st.expander("Sources"):
+                for h in message["citations"][:3]:
+                    src = Path(h["chunk"]["source"]).name
+                    snippet = h["chunk"]["text"][:240].replace("\n", " ")
+                    st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
+
+# Chat input
+if prompt := st.chat_input("Ask me anything about HBS systems..."):
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Generate assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                ensure_model_ready()
+                hits = retrieve(prompt, k=12)
+                
+                if not context_is_sufficient(hits):
+                    response = (
+                        "I don't have enough information in the knowledge base to answer that. "
+                        "Could you please rephrase your question or ask about something else?"
+                    )
+                    citations = []
+                else:
+                    context = build_context(hits)
+                    system_instruction = (
+                        "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
+                        "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
+                        "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
+                    )
+                    user_message = (
+                        f"{system_instruction}\n\n"
+                        f"Context from KB:\n{context}\n\n"
+                        f"Question: {prompt}"
+                    )
+                    model = GenerativeModel(st.session_state.gemini_model)
+                    resp = model.generate_content([user_message], generation_config=gen_config)
+                    response = resp.text or "I'm sorry, I couldn't generate a response."
+                    citations = hits
+
+                st.markdown(response)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "citations": citations
+                })
+                
+            except Exception as e:
+                error_msg = f"Sorry, I encountered an error: {str(e)}"
+                st.markdown(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+# ---- Sidebar for admin functions ----
+with st.sidebar:
+    st.header("Admin")
+    
+    if st.button("Rebuild Knowledge Base", key="rebuild_btn"):
+        if build_index_from_kb_files():
+            st.success("Knowledge base rebuilt successfully!")
+            st.rerun()
+    
+    if st.button("Clear Chat History", key="clear_btn"):
+        st.session_state.messages = [{"role": "assistant", "content": "Hi! How can I help you?"}]
+        st.rerun()
+    
+    # Show KB status
+    st.subheader("Knowledge Base Status")
+    if st.session_state.index_built:
+        st.success(f"✅ Loaded ({len(st.session_state.corpus)} chunks)")
+    else:
+        st.error("❌ Not loaded")
+    
+    # Show KB files
+    kb_files = load_kb_files()
+    st.subheader("KB Files")
+    if kb_files:
+        for f in kb_files:
+            st.text(f"📄 {f.name}")
+    else:
+        st.warning("No KB files found")
