@@ -14,13 +14,13 @@ from google.oauth2 import service_account
 from google.cloud import aiplatform
 from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
-from vertexai.preview.generative_models import GenerativeModel, GenerationConfig
+from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part, Image
 
 from docx import Document
 from pypdf import PdfReader
 import cv2
 import pytesseract
-from PIL import Image
+from PIL import Image as PILImage
 
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
@@ -129,7 +129,7 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
 
 def extract_text_from_image_bytes(b: bytes) -> str:
     try:
-        img = Image.open(io.BytesIO(b)).convert("RGB")
+        img = PILImage.open(io.BytesIO(b)).convert("RGB")
         arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
         gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
         gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
@@ -187,6 +187,30 @@ def embed_query(q: str, project_id: str, location: str, creds) -> np.ndarray:
     model = TextEmbeddingModel.from_pretrained("text-embedding-005")
     embs = model.get_embeddings([q])
     return np.array([embs[0].values], dtype="float32")
+
+# ---- Conversational responses ----
+def get_conversational_response(prompt: str) -> str:
+    """Handle simple conversational inputs"""
+    prompt_lower = prompt.lower().strip()
+    
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    farewells = ["bye", "goodbye", "see you", "farewell", "take care"]
+    thanks = ["thank you", "thanks", "appreciate it"]
+    clarifications = ["i don't understand", "can you elaborate", "explain more", "what do you mean"]
+    
+    if any(greeting in prompt_lower for greeting in greetings):
+        return "Hello! I'm your HBS Help Chatbot. I can help you with questions about HBS systems, features, and procedures. What would you like to know?"
+    
+    elif any(farewell in prompt_lower for farewell in farewells):
+        return "Goodbye! Feel free to come back anytime if you have more questions about HBS systems."
+    
+    elif any(thank in prompt_lower for thank in thanks):
+        return "You're welcome! I'm here to help with any HBS-related questions you might have."
+    
+    elif any(clarification in prompt_lower for clarification in clarifications):
+        return "I'd be happy to clarify! Could you please be more specific about what you'd like me to explain? For example, you could ask about specific HBS features, procedures, or system functions."
+    
+    return None  # Not a conversational response
 
 # ---- Pre-load KB files ----
 def load_kb_files():
@@ -259,7 +283,6 @@ def build_index_from_kb_files():
 
     st.session_state.index = index
     st.session_state.corpus = corpus
-    st.session_state.index_built = True
     return True
 
 # ---- Initialize app ----
@@ -275,7 +298,10 @@ def initialize_app():
         return True
     
     # If no index exists, build from KB files
-    return build_index_from_kb_files()
+    success = build_index_from_kb_files()
+    if success:
+        st.session_state.index_built = True
+    return success
 
 # ---- Model selection ----
 def ensure_model_ready():
@@ -331,51 +357,96 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
+# Image upload
+uploaded_image = st.file_uploader("Attach an image", type=["png", "jpg", "jpeg", "webp"], key="image_upload")
+
 # Chat input
 if prompt := st.chat_input("Ask me anything about HBS systems..."):
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+        if uploaded_image:
+            st.image(uploaded_image, caption="Uploaded image", use_column_width=True)
 
     # Generate assistant response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 ensure_model_ready()
-                hits = retrieve(prompt, k=12)
                 
-                if not context_is_sufficient(hits):
-                    response = (
-                        "I don't have enough information in the knowledge base to answer that. "
-                        "Could you please rephrase your question or ask about something else?"
-                    )
-                    citations = []
+                # Check for conversational responses first
+                conversational_response = get_conversational_response(prompt)
+                if conversational_response:
+                    st.markdown(conversational_response)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": conversational_response
+                    })
                 else:
-                    context = build_context(hits)
-                    system_instruction = (
-                        "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
-                        "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
-                        "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
-                    )
-                    user_message = (
-                        f"{system_instruction}\n\n"
-                        f"Context from KB:\n{context}\n\n"
-                        f"Question: {prompt}"
-                    )
-                    model = GenerativeModel(st.session_state.gemini_model)
-                    resp = model.generate_content([user_message], generation_config=gen_config)
-                    response = resp.text or "I'm sorry, I couldn't generate a response."
-                    citations = hits
+                    # Handle image + text questions
+                    if uploaded_image:
+                        # Image-based question
+                        hits = retrieve(prompt, k=12)
+                        context = build_context(hits) if hits else ""
+                        
+                        system_instruction = (
+                            "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
+                            "If the information is not available, explicitly say you don't know and ask a clarifying question. "
+                            "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
+                        )
+                        
+                        user_message = (
+                            f"{system_instruction}\n\n"
+                            f"Context from KB:\n{context}\n\n"
+                            f"Question: {prompt}"
+                        )
+                        
+                        # Prepare image
+                        image_bytes = uploaded_image.read()
+                        image_obj = Image.load_from_file(io.BytesIO(image_bytes))
+                        img_part = Part.from_image(image_obj)
+                        
+                        model = GenerativeModel(st.session_state.gemini_model)
+                        resp = model.generate_content([user_message, img_part], generation_config=gen_config)
+                        response = resp.text or "I'm sorry, I couldn't generate a response."
+                        citations = hits
+                        
+                    else:
+                        # Text-only question
+                        hits = retrieve(prompt, k=12)
+                        
+                        if not context_is_sufficient(hits):
+                            response = (
+                                "I don't have enough information in the knowledge base to answer that. "
+                                "Could you please rephrase your question or ask about something else?"
+                            )
+                            citations = []
+                        else:
+                            context = build_context(hits)
+                            system_instruction = (
+                                "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
+                                "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
+                                "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
+                            )
+                            user_message = (
+                                f"{system_instruction}\n\n"
+                                f"Context from KB:\n{context}\n\n"
+                                f"Question: {prompt}"
+                            )
+                            model = GenerativeModel(st.session_state.gemini_model)
+                            resp = model.generate_content([user_message], generation_config=gen_config)
+                            response = resp.text or "I'm sorry, I couldn't generate a response."
+                            citations = hits
 
-                st.markdown(response)
-                
-                # Add assistant response to chat history
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "citations": citations
-                })
+                    st.markdown(response)
+                    
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "citations": citations
+                    })
                 
             except Exception as e:
                 error_msg = f"Sorry, I encountered an error: {str(e)}"
@@ -388,6 +459,7 @@ with st.sidebar:
     
     if st.button("Rebuild Knowledge Base", key="rebuild_btn"):
         if build_index_from_kb_files():
+            st.session_state.index_built = True
             st.success("Knowledge base rebuilt successfully!")
             st.rerun()
     
