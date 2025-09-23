@@ -65,8 +65,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "index_built" not in st.session_state:
     st.session_state.index_built = False
-if "uploaded_image" not in st.session_state:
-    st.session_state.uploaded_image = None
 
 # ---- Credentials via Streamlit Secrets ----
 try:
@@ -306,7 +304,7 @@ def initialize_app():
     success = build_index_from_kb_files()
     if success:
         st.session_state.index_built = True
-    return True
+    return success
 
 # ---- Model selection ----
 def ensure_model_ready():
@@ -350,101 +348,6 @@ if not st.session_state.index_built:
 if not st.session_state.messages:
     st.session_state.messages.append({"role": "assistant", "content": "Hi! How can I help you?"})
 
-# ---- Custom CSS for fixed chat input ----
-st.markdown("""
-<style>
-.main .block-container {
-    padding-bottom: 120px !important;
-}
-
-/* Hide the default file uploader */
-.stFileUploader {
-    display: none !important;
-}
-
-/* Custom input area */
-.custom-input {
-    position: fixed !important;
-    bottom: 0 !important;
-    left: 0 !important;
-    right: 0 !important;
-    z-index: 999 !important;
-    background: var(--background-color) !important;
-    border-top: 1px solid var(--border-color) !important;
-    padding: 1rem !important;
-}
-
-.input-row {
-    display: flex !important;
-    align-items: center !important;
-    gap: 10px !important;
-    max-width: 100% !important;
-}
-
-.attach-btn {
-    background: var(--secondary-background-color) !important;
-    border: 1px solid var(--border-color) !important;
-    border-radius: 50% !important;
-    width: 40px !important;
-    height: 40px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    cursor: pointer !important;
-    font-size: 16px !important;
-}
-
-.attach-btn:hover {
-    background: var(--hover-color) !important;
-}
-
-.chat-input {
-    flex: 1 !important;
-    padding: 12px 16px !important;
-    border: 1px solid var(--border-color) !important;
-    border-radius: 25px !important;
-    background: var(--background-color) !important;
-    color: var(--text-color) !important;
-    font-size: 14px !important;
-    outline: none !important;
-}
-
-.chat-input:focus {
-    border-color: var(--primary-color) !important;
-}
-
-.send-btn {
-    background: var(--primary-color) !important;
-    border: none !important;
-    border-radius: 50% !important;
-    width: 40px !important;
-    height: 40px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    cursor: pointer !important;
-    color: white !important;
-    font-size: 16px !important;
-}
-
-.send-btn:hover {
-    opacity: 0.8 !important;
-}
-
-.attached-file {
-    background: var(--secondary-background-color) !important;
-    border: 1px solid var(--border-color) !important;
-    border-radius: 20px !important;
-    padding: 8px 12px !important;
-    font-size: 12px !important;
-    color: var(--text-color) !important;
-    display: flex !important;
-    align-items: center !important;
-    gap: 8px !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
 # ---- Chat UI ----
 # Display chat messages
 for message in st.session_state.messages:
@@ -457,177 +360,118 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Custom input area with file attachment
-st.markdown("""
-<div class="custom-input">
-    <div class="input-row">
-        <div class="attach-btn" onclick="document.getElementById('file-input').click()">📎</div>
-        <input type="file" id="file-input" accept="image/*" style="display: none;" onchange="handleFileSelect(event)">
-        <input type="text" class="chat-input" id="chat-input" placeholder="Ask me anything about HBS systems..." onkeypress="handleKeyPress(event)">
-        <div class="send-btn" onclick="sendMessage()">➤</div>
-    </div>
-    <div id="attached-file" style="display: none; margin-top: 8px;"></div>
-</div>
+# Simple working input with file attachment
+st.markdown("---")
 
-<script>
-let attachedFile = null;
+# File upload in sidebar
+with st.sidebar:
+    st.subheader("Attach Image")
+    uploaded_image = st.file_uploader(
+        "Choose an image", 
+        type=["png", "jpg", "jpeg", "webp"], 
+        key="image_upload",
+        help="Upload an image to ask questions about it"
+    )
 
-function handleFileSelect(event) {
-    const file = event.target.files[0];
-    if (file) {
-        attachedFile = file;
-        const attachedDiv = document.getElementById('attached-file');
-        attachedDiv.innerHTML = `
-            <div class="attached-file">
-                <span>📎</span>
-                <span>${file.name}</span>
-                <span onclick="removeFile()" style="cursor: pointer; color: red;">✕</span>
-            </div>
-        `;
-        attachedDiv.style.display = 'block';
-    }
-}
+# Chat input - this works with Enter key
+prompt = st.chat_input("Ask me anything about HBS systems...")
 
-function removeFile() {
-    attachedFile = null;
-    document.getElementById('attached-file').style.display = 'none';
-    document.getElementById('file-input').value = '';
-}
-
-function handleKeyPress(event) {
-    if (event.key === 'Enter') {
-        sendMessage();
-    }
-}
-
-function sendMessage() {
-    const input = document.getElementById('chat-input');
-    const message = input.value.trim();
-    if (message) {
-        // Store message and file in session state
-        window.parent.postMessage({
-            type: 'streamlit:setComponentValue',
-            value: {
-                message: message,
-                file: attachedFile ? {
-                    name: attachedFile.name,
-                    type: attachedFile.type,
-                    size: attachedFile.size
-                } : null
-            }
-        }, '*');
-        
-        // Clear input
-        input.value = '';
-        removeFile();
-    }
-}
-</script>
-""", unsafe_allow_html=True)
-
-# Handle custom input
-if st.session_state.get('custom_input'):
-    custom_data = st.session_state.custom_input
-    prompt = custom_data.get('message', '')
-    file_data = custom_data.get('file')
+if prompt:
+    # Add user message to chat history
+    user_content = prompt
+    if uploaded_image:
+        user_content += f" [Image: {uploaded_image.name}]"
     
-    if prompt:
-        # Add user message to chat history
-        user_content = prompt
-        if file_data:
-            user_content += f" [Image: {file_data['name']}]"
-        
-        st.session_state.messages.append({"role": "user", "content": user_content})
-        
-        with st.chat_message("user"):
-            st.markdown(prompt)
-            if file_data:
-                st.info(f"📎 Attached: {file_data['name']}")
+    st.session_state.messages.append({"role": "user", "content": user_content})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+        if uploaded_image:
+            st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
 
-        # Generate assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    ensure_model_ready()
-                    
-                    # Check for conversational responses first
-                    conversational_response = get_conversational_response(prompt)
-                    if conversational_response:
-                        st.markdown(conversational_response)
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": conversational_response
-                        })
+    # Generate assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                ensure_model_ready()
+                
+                # Check for conversational responses first
+                conversational_response = get_conversational_response(prompt)
+                if conversational_response:
+                    st.markdown(conversational_response)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": conversational_response
+                    })
+                else:
+                    # Handle image + text questions
+                    if uploaded_image:
+                        # Image-based question
+                        hits = retrieve(prompt, k=12)
+                        context = build_context(hits) if hits else ""
+                        
+                        system_instruction = (
+                            "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
+                            "If the information is not available, explicitly say you don't know and ask a clarifying question. "
+                            "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
+                        )
+                        
+                        user_message = (
+                            f"{system_instruction}\n\n"
+                            f"Context from KB:\n{context}\n\n"
+                            f"Question: {prompt}"
+                        )
+                        
+                        # Prepare image
+                        image_bytes = uploaded_image.read()
+                        image_obj = Image.load_from_file(io.BytesIO(image_bytes))
+                        img_part = Part.from_image(image_obj)
+                        
+                        model = GenerativeModel(st.session_state.gemini_model)
+                        resp = model.generate_content([user_message, img_part], generation_config=gen_config)
+                        response = resp.text or "I'm sorry, I couldn't generate a response."
+                        citations = hits
+                        
                     else:
-                        # Handle image + text questions
-                        if file_data:
-                            # Image-based question
-                            hits = retrieve(prompt, k=12)
-                            context = build_context(hits) if hits else ""
-                            
+                        # Text-only question
+                        hits = retrieve(prompt, k=12)
+                        
+                        if not context_is_sufficient(hits):
+                            response = (
+                                "I don't have enough information in the knowledge base to answer that. "
+                                "Could you please rephrase your question or ask about something else?"
+                            )
+                            citations = []
+                        else:
+                            context = build_context(hits)
                             system_instruction = (
-                                "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
-                                "If the information is not available, explicitly say you don't know and ask a clarifying question. "
+                                "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
+                                "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
                                 "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
                             )
-                            
                             user_message = (
                                 f"{system_instruction}\n\n"
                                 f"Context from KB:\n{context}\n\n"
                                 f"Question: {prompt}"
                             )
-                            
-                            # Note: For now, we'll handle text-only since we can't easily pass file data
-                            # In a real implementation, you'd need to handle file upload differently
                             model = GenerativeModel(st.session_state.gemini_model)
                             resp = model.generate_content([user_message], generation_config=gen_config)
                             response = resp.text or "I'm sorry, I couldn't generate a response."
                             citations = hits
-                            
-                        else:
-                            # Text-only question
-                            hits = retrieve(prompt, k=12)
-                            
-                            if not context_is_sufficient(hits):
-                                response = (
-                                    "I don't have enough information in the knowledge base to answer that. "
-                                    "Could you please rephrase your question or ask about something else?"
-                                )
-                                citations = []
-                            else:
-                                context = build_context(hits)
-                                system_instruction = (
-                                    "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
-                                    "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
-                                    "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
-                                )
-                                user_message = (
-                                    f"{system_instruction}\n\n"
-                                    f"Context from KB:\n{context}\n\n"
-                                    f"Question: {prompt}"
-                                )
-                                model = GenerativeModel(st.session_state.gemini_model)
-                                resp = model.generate_content([user_message], generation_config=gen_config)
-                                response = resp.text or "I'm sorry, I couldn't generate a response."
-                                citations = hits
 
-                        st.markdown(response)
-                        
-                        # Add assistant response to chat history
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": response,
-                            "citations": citations
-                        })
+                    st.markdown(response)
                     
-                except Exception as e:
-                    error_msg = f"Sorry, I encountered an error: {str(e)}"
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        
-        # Clear the custom input
-        st.session_state.custom_input = None
-        st.rerun()
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "citations": citations
+                    })
+                
+            except Exception as e:
+                error_msg = f"Sorry, I encountered an error: {str(e)}"
+                st.markdown(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
 # ---- Sidebar for admin functions ----
 with st.sidebar:
