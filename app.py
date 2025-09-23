@@ -197,6 +197,7 @@ def get_conversational_response(prompt: str) -> str:
     farewells = ["bye", "goodbye", "see you", "farewell", "take care"]
     thanks = ["thank you", "thanks", "appreciate it"]
     clarifications = ["i don't understand", "can you elaborate", "explain more", "what do you mean"]
+    how_are_you = ["how are you", "how are u", "how's it going", "what's up"]
     
     if any(greeting in prompt_lower for greeting in greetings):
         return "Hello! I'm your HBS Help Chatbot. I can help you with questions about HBS systems, features, and procedures. What would you like to know?"
@@ -209,6 +210,9 @@ def get_conversational_response(prompt: str) -> str:
     
     elif any(clarification in prompt_lower for clarification in clarifications):
         return "I'd be happy to clarify! Could you please be more specific about what you'd like me to explain? For example, you could ask about specific HBS features, procedures, or system functions."
+    
+    elif any(how in prompt_lower for how in how_are_you):
+        return "I'm doing well, thank you! I'm here and ready to help you with any HBS system questions. What can I assist you with today?"
     
     return None  # Not a conversational response
 
@@ -356,20 +360,33 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Chat input with image upload
-col1, col2 = st.columns([4, 1])
+# Chat input with file attachment
+col1, col2 = st.columns([1, 20])
+
 with col1:
-    prompt = st.chat_input("Ask me anything about HBS systems...")
+    uploaded_image = st.file_uploader(
+        "", 
+        type=["png", "jpg", "jpeg", "webp"], 
+        key="image_upload", 
+        help="Attach image",
+        label_visibility="collapsed"
+    )
+
 with col2:
-    uploaded_image = st.file_uploader("📷", type=["png", "jpg", "jpeg", "webp"], key="image_upload", help="Attach an image")
+    prompt = st.chat_input("Ask me anything about HBS systems...")
 
 if prompt:
     # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    user_content = prompt
+    if uploaded_image:
+        user_content += f" [Image: {uploaded_image.name}]"
+    
+    st.session_state.messages.append({"role": "user", "content": user_content})
+    
     with st.chat_message("user"):
         st.markdown(prompt)
         if uploaded_image:
-            st.image(uploaded_image, caption="Uploaded image", use_column_width=True)
+            st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
 
     # Generate assistant response
     with st.chat_message("assistant"):
@@ -454,6 +471,10 @@ if prompt:
                 error_msg = f"Sorry, I encountered an error: {str(e)}"
                 st.markdown(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+# Clear the uploaded image after processing
+if uploaded_image:
+    st.rerun()
 
 # ---- Sidebar for admin functions ----
 with st.sidebar:
