@@ -286,7 +286,6 @@ def build_index_from_kb_files():
     return True
 
 # ---- Initialize app ----
-@st.cache_resource
 def initialize_app():
     """Initialize the app - load index or build from KB files"""
     # Try to load existing index first
@@ -357,11 +356,14 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Image upload
-uploaded_image = st.file_uploader("Attach an image", type=["png", "jpg", "jpeg", "webp"], key="image_upload")
+# Chat input with image upload
+col1, col2 = st.columns([4, 1])
+with col1:
+    prompt = st.chat_input("Ask me anything about HBS systems...")
+with col2:
+    uploaded_image = st.file_uploader("📷", type=["png", "jpg", "jpeg", "webp"], key="image_upload", help="Attach an image")
 
-# Chat input
-if prompt := st.chat_input("Ask me anything about HBS systems..."):
+if prompt:
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -469,7 +471,7 @@ with st.sidebar:
     
     # Show KB status
     st.subheader("Knowledge Base Status")
-    if st.session_state.index_built:
+    if st.session_state.index_built and st.session_state.corpus:
         st.success(f"✅ Loaded ({len(st.session_state.corpus)} chunks)")
     else:
         st.error("❌ Not loaded")
