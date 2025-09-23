@@ -35,7 +35,7 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
-    "gemini-2.0-flash-exp",
+    "gemini-2.5-flash-lite",
     "gemini-1.5-flash-001",
     "gemini-1.5-pro-001",
 ]
@@ -463,7 +463,7 @@ def process_kb_files() -> List[Dict]:
     
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
-    st.write(f"�� DEBUG: Found {len(files)} files in KB directory:")
+    st.write(f" DEBUG: Found {len(files)} files in KB directory:")
     for f in files:
         st.write(f"  - {f.name} ({f.suffix})")
     
@@ -472,7 +472,7 @@ def process_kb_files() -> List[Dict]:
             st.write(f"🔍 DEBUG: Processing {file_path.name}")
             try:
                 if file_path.suffix.lower() == '.docx':
-                    st.write(f"  �� Processing DOCX: {file_path.name}")
+                    st.write(f"  Processing DOCX: {file_path.name}")
                     text = extract_text_from_docx_bytes(file_path.read_bytes())
                     if text.strip():
                         chunks = chunk_text(text)
@@ -599,7 +599,7 @@ def process_kb_files() -> List[Dict]:
             except Exception as e:
                 st.error(f"❌ Error processing {file_path.name}: {e}")
                 import traceback
-                st.write(f"�� Traceback: {traceback.format_exc()}")
+                st.write(f" Traceback: {traceback.format_exc()}")
     
     st.write(f"🔍 DEBUG: Total corpus entries created: {len(corpus)}")
     return corpus
