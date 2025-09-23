@@ -2,7 +2,6 @@
 import os
 import io
 import json
-import time
 import re
 from pathlib import Path
 from typing import List, Dict
@@ -44,6 +43,90 @@ CANDIDATE_MODELS = [
 ]
 
 DEFAULT_LOCATION = "us-central1"
+
+# ---- Streamlit page ----
+st.set_page_config(page_title="RAG Chatbot (Vertex AI + FAISS)", page_icon="🤖", layout="wide")
+st.title("RAG Chatbot (Vertex AI + FAISS + Streamlit)")
+
+# ---- Session defaults ----
+if "creds" not in st.session_state:
+    st.session_state.creds = None
+if "project_id" not in st.session_state:
+    st.session_state.project_id = None
+if "location" not in st.session_state:
+    st.session_state.location = DEFAULT_LOCATION
+if "gemini_model" not in st.session_state:
+    st.session_state.gemini_model = None
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "corpus" not in st.session_state:
+    st.session_state.corpus = None
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# ---- Credentials via Streamlit Secrets (preferred on Streamlit Cloud) ----
+# In Streamlit Cloud -> App -> Settings -> Secrets, add:
+# [google]
+# project = "dauntless-karma-469023-s0"
+# location = "us-central1"
+# credentials_json = """{ ...your service account JSON... }"""
+try:
+    if "google" in st.secrets:
+        sa_info = json.loads(st.secrets["google"]["credentials_json"])
+        creds = service_account.Credentials.from_service_account_info(sa_info)
+        project_id = st.secrets["google"]["project"]
+        location_secret = st.secrets["google"].get("location", DEFAULT_LOCATION)
+
+        aiplatform.init(project=project_id, location=location_secret, credentials=creds)
+        vertexai_init(project=project_id, location=location_secret, credentials=creds)
+
+        st.session_state.creds = creds
+        st.session_state.project_id = project_id
+        st.session_state.location = location_secret
+except Exception as e:
+    st.warning(f"Secrets-based auth not configured or failed: {e}")
+
+# ---- Sidebar ----
+with st.sidebar:
+    st.header("1) Credentials")
+    if st.session_state.creds:
+        st.success(f"Authenticated. Project: {st.session_state.project_id} | Region: {st.session_state.location}")
+        st.caption("Using Streamlit Secrets.")
+    else:
+        st.caption("Optional local dev fallback (not for Streamlit Cloud):")
+        sa_file = st.file_uploader("Upload Vertex AI service account JSON", type=["json"])
+        project_override = st.text_input("Project ID (optional)")
+        location_input = st.text_input("Location", value=st.session_state.location)
+        apply_creds = st.button("Use Uploaded Credentials")
+        if apply_creds and sa_file is not None:
+            try:
+                sa_bytes = sa_file.read()
+                sa_info = json.loads(sa_bytes.decode("utf-8"))
+                creds = service_account.Credentials.from_service_account_info(sa_info)
+                project_id = (project_override or sa_info.get("project_id") or "").strip()
+                if not project_id:
+                    st.error("Project ID not found. Enter it or include it in the JSON.")
+                else:
+                    aiplatform.init(project=project_id, location=location_input, credentials=creds)
+                    vertexai_init(project=project_id, location=location_input, credentials=creds)
+                    st.session_state.creds = creds
+                    st.session_state.project_id = project_id
+                    st.session_state.location = location_input
+                    st.success(f"Authenticated. Project: {project_id} | Region: {location_input}")
+            except Exception as e:
+                st.error(f"Failed to load credentials: {e}")
+
+    st.header("2) Knowledge Base")
+    kb_files = st.file_uploader(
+        "Upload KB files (.docx, .pdf, .png/.jpg). You can multi-select",
+        type=["docx", "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
+        accept_multiple_files=True,
+    )
+    do_build = st.button("Build / Rebuild Index")
+
+    st.header("3) Persistence")
+    do_load = st.button("Load Existing Index")
+    do_save = st.button("Save Current Index")
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -89,6 +172,7 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
         return ""
 
 def extract_text_from_image_bytes(b: bytes) -> str:
+    # Note: Streamlit Cloud does not provide system Tesseract. This will return "" there.
     try:
         img = Image.open(io.BytesIO(b)).convert("RGB")
         arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
@@ -149,59 +233,7 @@ def embed_query(q: str, project_id: str, location: str, creds) -> np.ndarray:
     embs = model.get_embeddings([q])
     return np.array([embs[0].values], dtype="float32")
 
-# ---- Streamlit UI ----
-st.set_page_config(page_title="RAG Chatbot (Vertex AI + FAISS)", page_icon="🤖", layout="wide")
-st.title("RAG Chatbot (Vertex AI + FAISS + Streamlit)")
-
-with st.sidebar:
-    st.header("1) Credentials")
-    sa_file = st.file_uploader("Upload Vertex AI service account JSON", type=["json"])
-    project_override = st.text_input("Project ID (optional, overrides key)")
-    location = st.text_input("Location", value=DEFAULT_LOCATION)
-
-    st.header("2) Knowledge Base")
-    kb_files = st.file_uploader(
-        "Upload KB files (.docx, .pdf, .png/.jpg). You can multi-select",
-        type=["docx", "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
-        accept_multiple_files=True,
-    )
-    do_build = st.button("Build / Rebuild Index")
-
-    st.header("3) Persistence")
-    do_load = st.button("Load Existing Index")
-    do_save = st.button("Save Current Index")
-
-if "creds" not in st.session_state:
-    st.session_state.creds = None
-if "project_id" not in st.session_state:
-    st.session_state.project_id = None
-if "gemini_model" not in st.session_state:
-    st.session_state.gemini_model = None
-if "index" not in st.session_state:
-    st.session_state.index = None
-if "corpus" not in st.session_state:
-    st.session_state.corpus = None
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-# Handle credentials
-if sa_file is not None and st.session_state.creds is None:
-    try:
-        sa_bytes = sa_file.read()
-        sa_info = json.loads(sa_bytes.decode("utf-8"))
-        creds = service_account.Credentials.from_service_account_info(sa_info)
-        project_id = project_override.strip() or sa_info.get("project_id")
-        if not project_id:
-            st.error("Project ID not found. Enter it in the sidebar.")
-        else:
-            aiplatform.init(project=project_id, location=location, credentials=creds)
-            st.session_state.creds = creds
-            st.session_state.project_id = project_id
-            st.success(f"Authenticated as {creds.service_account_email} | Project: {project_id}")
-    except Exception as e:
-        st.error(f"Failed to load credentials: {e}")
-
-# Build index
+# ---- Build index ----
 def build_index_from_uploads(files):
     if not files:
         st.warning("Upload some KB files first.")
@@ -251,7 +283,7 @@ def build_index_from_uploads(files):
         return
 
     with st.spinner("Embedding texts and building FAISS index..."):
-        embs = embed_texts(texts, st.session_state.project_id, location, st.session_state.creds)
+        embs = embed_texts(texts, st.session_state.project_id, st.session_state.location, st.session_state.creds)
         dim = int(embs.shape[1])
         faiss.normalize_L2(embs)
         index = faiss.IndexFlatIP(dim)
@@ -261,44 +293,45 @@ def build_index_from_uploads(files):
     st.session_state.corpus = corpus
     st.success(f"Index built with {len(corpus)} chunks.")
 
-# Load existing
-if do_load:
-    idx, corp = load_index_and_corpus()
-    if idx is not None:
-        st.session_state.index = idx
-        st.session_state.corpus = corp
-        st.success(f"Loaded existing index with {len(corp)} chunks.")
-    else:
-        st.warning("No saved index found. Build first.")
+# ---- Persistence actions ----
+with st.sidebar:
+    if st.button("Load Existing Index"):
+        idx, corp = load_index_and_corpus()
+        if idx is not None:
+            st.session_state.index = idx
+            st.session_state.corpus = corp
+            st.success(f"Loaded existing index with {len(corp)} chunks.")
+        else:
+            st.warning("No saved index found. Build first.")
 
-# Save current
-if do_save:
-    if st.session_state.index is not None and st.session_state.corpus is not None:
-        save_index_and_corpus(st.session_state.index, st.session_state.corpus)
-        st.success("Index and corpus saved.")
-    else:
-        st.warning("Nothing to save. Build an index first.")
+    if st.button("Save Current Index"):
+        if st.session_state.index is not None and st.session_state.corpus is not None:
+            save_index_and_corpus(st.session_state.index, st.session_state.corpus)
+            st.success("Index and corpus saved.")
+        else:
+            st.warning("Nothing to save. Build an index first.")
 
-# Build trigger
-if do_build:
-    if st.session_state.creds is None or st.session_state.project_id is None:
-        st.error("Upload service account JSON first.")
-    else:
-        build_index_from_uploads(kb_files)
+# ---- Build trigger ----
+with st.sidebar:
+    if st.button("Build / Rebuild Index"):
+        if st.session_state.creds is None or st.session_state.project_id is None:
+            st.error("Configure credentials first (use Secrets on Streamlit Cloud).")
+        else:
+            build_index_from_uploads(kb_files)
 
-# Model selection
+# ---- Model selection ----
 def ensure_model_ready():
     if st.session_state.gemini_model is None:
         st.session_state.gemini_model = pick_available_model(
-            st.session_state.creds, st.session_state.project_id, location
+            st.session_state.creds, st.session_state.project_id, st.session_state.location
         )
 
-# Retrieval
+# ---- Retrieval ----
 MIN_SCORE = 0.25
 def retrieve(query: str, k: int = 12):
     if st.session_state.index is None or st.session_state.corpus is None:
         return []
-    q = embed_query(query, st.session_state.project_id, location, st.session_state.creds).astype("float32")
+    q = embed_query(query, st.session_state.project_id, st.session_state.location, st.session_state.creds).astype("float32")
     faiss.normalize_L2(q)
     D, I = st.session_state.index.search(q, k)
     raw = []
@@ -316,7 +349,7 @@ def context_is_sufficient(hits, min_citations=2):
 
 gen_config = GenerationConfig(temperature=0.3, top_p=0.9, max_output_tokens=1024)
 
-# Chat UI
+# ---- Chat UI ----
 st.subheader("Chat")
 query = st.text_input("Ask a question (answers come strictly from your KB)")
 col1, col2 = st.columns([1,1])
@@ -330,7 +363,7 @@ if clear:
 
 if ask:
     if st.session_state.creds is None or st.session_state.index is None:
-        st.error("Upload credentials and build/load the index first.")
+        st.error("Configure credentials and build/load the index first.")
     elif not query.strip():
         st.warning("Enter a question.")
     else:
@@ -362,7 +395,7 @@ if ask:
         except Exception as e:
             st.error(f"Error during generation: {e}")
 
-# Render conversation and citations
+# ---- Render conversation and citations ----
 for turn in st.session_state.history[-8:]:
     st.markdown(f"**You:** {turn['user']}")
     st.markdown(f"**Assistant:** {turn['assistant']}")
