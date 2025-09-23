@@ -65,11 +65,6 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 # ---- Credentials via Streamlit Secrets (preferred on Streamlit Cloud) ----
-# In Streamlit Cloud -> App -> Settings -> Secrets, add:
-# [google]
-# project = "dauntless-karma-469023-s0"
-# location = "us-central1"
-# credentials_json = """{ ...your service account JSON... }"""
 try:
     if "google" in st.secrets:
         sa_info = json.loads(st.secrets["google"]["credentials_json"])
@@ -94,10 +89,10 @@ with st.sidebar:
         st.caption("Using Streamlit Secrets.")
     else:
         st.caption("Optional local dev fallback (not for Streamlit Cloud):")
-        sa_file = st.file_uploader("Upload Vertex AI service account JSON", type=["json"])
-        project_override = st.text_input("Project ID (optional)")
-        location_input = st.text_input("Location", value=st.session_state.location)
-        apply_creds = st.button("Use Uploaded Credentials")
+        sa_file = st.file_uploader("Upload Vertex AI service account JSON", type=["json"], key="sa_uploader")
+        project_override = st.text_input("Project ID (optional)", key="project_override")
+        location_input = st.text_input("Location", value=st.session_state.location, key="location_input")
+        apply_creds = st.button("Use Uploaded Credentials", key="apply_creds")
         if apply_creds and sa_file is not None:
             try:
                 sa_bytes = sa_file.read()
@@ -121,12 +116,13 @@ with st.sidebar:
         "Upload KB files (.docx, .pdf, .png/.jpg). You can multi-select",
         type=["docx", "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
         accept_multiple_files=True,
+        key="kb_uploader"
     )
-    do_build = st.button("Build / Rebuild Index")
+    do_build = st.button("Build / Rebuild Index", key="build_btn")
 
     st.header("3) Persistence")
-    do_load = st.button("Load Existing Index")
-    do_save = st.button("Save Current Index")
+    do_load = st.button("Load Existing Index", key="load_btn")
+    do_save = st.button("Save Current Index", key="save_btn")
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -293,31 +289,28 @@ def build_index_from_uploads(files):
     st.session_state.corpus = corpus
     st.success(f"Index built with {len(corpus)} chunks.")
 
-# ---- Persistence actions ----
-with st.sidebar:
-    if st.button("Load Existing Index"):
-        idx, corp = load_index_and_corpus()
-        if idx is not None:
-            st.session_state.index = idx
-            st.session_state.corpus = corp
-            st.success(f"Loaded existing index with {len(corp)} chunks.")
-        else:
-            st.warning("No saved index found. Build first.")
+# ---- Button actions ----
+if do_build:
+    if st.session_state.creds is None or st.session_state.project_id is None:
+        st.error("Configure credentials first (use Secrets on Streamlit Cloud).")
+    else:
+        build_index_from_uploads(kb_files)
 
-    if st.button("Save Current Index"):
-        if st.session_state.index is not None and st.session_state.corpus is not None:
-            save_index_and_corpus(st.session_state.index, st.session_state.corpus)
-            st.success("Index and corpus saved.")
-        else:
-            st.warning("Nothing to save. Build an index first.")
+if do_load:
+    idx, corp = load_index_and_corpus()
+    if idx is not None:
+        st.session_state.index = idx
+        st.session_state.corpus = corp
+        st.success(f"Loaded existing index with {len(corp)} chunks.")
+    else:
+        st.warning("No saved index found. Build first.")
 
-# ---- Build trigger ----
-with st.sidebar:
-    if st.button("Build / Rebuild Index"):
-        if st.session_state.creds is None or st.session_state.project_id is None:
-            st.error("Configure credentials first (use Secrets on Streamlit Cloud).")
-        else:
-            build_index_from_uploads(kb_files)
+if do_save:
+    if st.session_state.index is not None and st.session_state.corpus is not None:
+        save_index_and_corpus(st.session_state.index, st.session_state.corpus)
+        st.success("Index and corpus saved.")
+    else:
+        st.warning("Nothing to save. Build an index first.")
 
 # ---- Model selection ----
 def ensure_model_ready():
@@ -351,12 +344,12 @@ gen_config = GenerationConfig(temperature=0.3, top_p=0.9, max_output_tokens=1024
 
 # ---- Chat UI ----
 st.subheader("Chat")
-query = st.text_input("Ask a question (answers come strictly from your KB)")
+query = st.text_input("Ask a question (answers come strictly from your KB)", key="query_input")
 col1, col2 = st.columns([1,1])
 with col1:
-    ask = st.button("Ask")
+    ask = st.button("Ask", key="ask_btn")
 with col2:
-    clear = st.button("Clear conversation")
+    clear = st.button("Clear conversation", key="clear_btn")
 
 if clear:
     st.session_state.history = []
@@ -372,7 +365,7 @@ if ask:
             hits = retrieve(query, k=12)
             if not context_is_sufficient(hits):
                 answer = (
-                    "I don’t have enough information in the provided context to answer that. "
+                    "I don't have enough information in the provided context to answer that. "
                     "Please refine your question or upload more relevant documents."
                 )
                 st.session_state.history.append({"user": query, "assistant": answer, "hits": []})
