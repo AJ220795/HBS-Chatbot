@@ -348,7 +348,7 @@ if not st.session_state.index_built:
 if not st.session_state.messages:
     st.session_state.messages.append({"role": "assistant", "content": "Hi! How can I help you?"})
 
-# ---- Custom CSS for fixed chat input ----
+# ---- Custom CSS for fixed chat input and auto-scroll ----
 st.markdown("""
 <style>
 .stChatInput {
@@ -369,6 +369,34 @@ st.markdown("""
 .main .block-container {
     padding-bottom: 120px !important;
 }
+
+/* Auto-scroll to bottom */
+.stChatMessage {
+    scroll-margin-bottom: 120px !important;
+}
+
+/* Small file uploader */
+.stFileUploader > div {
+    width: 40px !important;
+    height: 40px !important;
+}
+
+.stFileUploader > div > div {
+    width: 40px !important;
+    height: 40px !important;
+    border-radius: 50% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+.stFileUploader > div > div > button {
+    width: 40px !important;
+    height: 40px !important;
+    border-radius: 50% !important;
+    padding: 0 !important;
+    font-size: 16px !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -384,14 +412,14 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Chat input with file attachment - FIXED POSITION
+# Chat input with small file attachment - FIXED POSITION
 st.markdown("---")
 
 # Create a container for the input area
 input_container = st.container()
 
 with input_container:
-    col1, col2, col3 = st.columns([1, 20, 1])
+    col1, col2 = st.columns([1, 20])
     
     with col1:
         uploaded_image = st.file_uploader(
@@ -404,10 +432,6 @@ with input_container:
     
     with col2:
         prompt = st.chat_input("Ask me anything about HBS systems...")
-    
-    with col3:
-        if uploaded_image:
-            st.markdown(f"📎 {uploaded_image.name}")
 
 if prompt:
     # Add user message to chat history
@@ -505,6 +529,13 @@ if prompt:
                 error_msg = f"Sorry, I encountered an error: {str(e)}"
                 st.markdown(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+    # Auto-scroll to bottom after new message
+    st.markdown("""
+    <script>
+    window.scrollTo(0, document.body.scrollHeight);
+    </script>
+    """, unsafe_allow_html=True)
 
 # ---- Sidebar for admin functions ----
 with st.sidebar:
