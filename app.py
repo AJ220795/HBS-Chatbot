@@ -360,36 +360,15 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Custom input area with inline file attachment
-st.markdown("---")
-
-# Create columns for input and attach button
-col1, col2 = st.columns([20, 1])
-
-with col1:
-    prompt = st.chat_input("Ask me anything about HBS systems...")
-
-with col2:
-    uploaded_image = st.file_uploader(
-        "��", 
-        type=["png", "jpg", "jpeg", "webp"], 
-        key="image_upload",
-        help="Attach image",
-        label_visibility="collapsed"
-    )
+# Simple working input - just use the native chat_input
+prompt = st.chat_input("Ask me anything about HBS systems...")
 
 if prompt:
     # Add user message to chat history
-    user_content = prompt
-    if uploaded_image:
-        user_content += f" [Image: {uploaded_image.name}]"
-    
-    st.session_state.messages.append({"role": "user", "content": user_content})
+    st.session_state.messages.append({"role": "user", "content": prompt})
     
     with st.chat_message("user"):
         st.markdown(prompt)
-        if uploaded_image:
-            st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
 
     # Generate assistant response
     with st.chat_message("assistant"):
@@ -406,67 +385,31 @@ if prompt:
                         "content": conversational_response
                     })
                 else:
-                    # Handle image + text questions
-                    if uploaded_image:
-                        # Image-based question
-                        hits = retrieve(prompt, k=12)
-                        context = build_context(hits) if hits else ""
-                        
+                    # Text-only question
+                    hits = retrieve(prompt, k=12)
+                    
+                    if not context_is_sufficient(hits):
+                        response = (
+                            "I don't have enough information in the knowledge base to answer that. "
+                            "Could you please rephrase your question or ask about something else?"
+                        )
+                        citations = []
+                    else:
+                        context = build_context(hits)
                         system_instruction = (
-                            "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
-                            "If the information is not available, explicitly say you don't know and ask a clarifying question. "
+                            "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
+                            "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
                             "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
                         )
-                        
                         user_message = (
                             f"{system_instruction}\n\n"
                             f"Context from KB:\n{context}\n\n"
                             f"Question: {prompt}"
                         )
-                        
-                        # FIXED: Save image to temp file first
-                        temp_image_path = f"/tmp/{uploaded_image.name}"
-                        with open(temp_image_path, "wb") as f:
-                            f.write(uploaded_image.getvalue())
-                        
-                        # Load image from file path
-                        image_obj = Image.load_from_file(temp_image_path)
-                        img_part = Part.from_image(image_obj)
-                        
                         model = GenerativeModel(st.session_state.gemini_model)
-                        resp = model.generate_content([user_message, img_part], generation_config=gen_config)
+                        resp = model.generate_content([user_message], generation_config=gen_config)
                         response = resp.text or "I'm sorry, I couldn't generate a response."
                         citations = hits
-                        
-                        # Clean up temp file
-                        os.remove(temp_image_path)
-                        
-                    else:
-                        # Text-only question
-                        hits = retrieve(prompt, k=12)
-                        
-                        if not context_is_sufficient(hits):
-                            response = (
-                                "I don't have enough information in the knowledge base to answer that. "
-                                "Could you please rephrase your question or ask about something else?"
-                            )
-                            citations = []
-                        else:
-                            context = build_context(hits)
-                            system_instruction = (
-                                "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
-                                "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
-                                "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
-                            )
-                            user_message = (
-                                f"{system_instruction}\n\n"
-                                f"Context from KB:\n{context}\n\n"
-                                f"Question: {prompt}"
-                            )
-                            model = GenerativeModel(st.session_state.gemini_model)
-                            resp = model.generate_content([user_message], generation_config=gen_config)
-                            response = resp.text or "I'm sorry, I couldn't generate a response."
-                            citations = hits
 
                     st.markdown(response)
                     
@@ -482,8 +425,16 @@ if prompt:
                 st.markdown(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-# ---- Sidebar for admin functions ----
+# ---- Sidebar for admin functions and image upload ----
 with st.sidebar:
+    st.header("Attach Image")
+    uploaded_image = st.file_uploader(
+        "Choose an image", 
+        type=["png", "jpg", "jpeg", "webp"], 
+        key="image_upload",
+        help="Upload an image to ask questions about it"
+    )
+    
     st.header("Admin")
     
     if st.button("Rebuild Knowledge Base", key="rebuild_btn"):
@@ -511,3 +462,65 @@ with st.sidebar:
             st.text(f"📄 {f.name}")
     else:
         st.warning("No KB files found")
+
+# Handle image questions separately
+if uploaded_image and st.button("Ask about this image", key="ask_image_btn"):
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": f"Tell me about this image: {uploaded_image.name}"})
+    
+    with st.chat_message("user"):
+        st.markdown(f"Tell me about this image: {uploaded_image.name}")
+        st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
+
+    # Generate assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Analyzing image..."):
+            try:
+                ensure_model_ready()
+                
+                # Image-based question
+                hits = retrieve("image analysis", k=12)
+                context = build_context(hits) if hits else ""
+                
+                system_instruction = (
+                    "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
+                    "If the information is not available, explicitly say you don't know and ask a clarifying question. "
+                    "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
+                )
+                
+                user_message = (
+                    f"{system_instruction}\n\n"
+                    f"Context from KB:\n{context}\n\n"
+                    f"Question: Tell me about this image"
+                )
+                
+                # Save image to temp file first
+                temp_image_path = f"/tmp/{uploaded_image.name}"
+                with open(temp_image_path, "wb") as f:
+                    f.write(uploaded_image.getvalue())
+                
+                # Load image from file path
+                image_obj = Image.load_from_file(temp_image_path)
+                img_part = Part.from_image(image_obj)
+                
+                model = GenerativeModel(st.session_state.gemini_model)
+                resp = model.generate_content([user_message, img_part], generation_config=gen_config)
+                response = resp.text or "I'm sorry, I couldn't generate a response."
+                citations = hits
+                
+                # Clean up temp file
+                os.remove(temp_image_path)
+                
+                st.markdown(response)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "citations": citations
+                })
+                
+            except Exception as e:
+                error_msg = f"Sorry, I encountered an error: {str(e)}"
+                st.markdown(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
