@@ -35,71 +35,33 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview",
-    "gemini-2.5-flash-lite-001",
-    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-exp",
     "gemini-1.5-flash-001",
+    "gemini-1.5-pro-001",
 ]
 
 DEFAULT_LOCATION = "us-central1"
-
-# ---- Streamlit page ----
-st.set_page_config(page_title="HBS Help Chatbot", page_icon="🤖", layout="wide")
-st.title("HBS Help Chatbot")
-
-# ---- Session defaults ----
-if "creds" not in st.session_state:
-    st.session_state.creds = None
-if "project_id" not in st.session_state:
-    st.session_state.project_id = None
-if "location" not in st.session_state:
-    st.session_state.location = DEFAULT_LOCATION
-if "gemini_model" not in st.session_state:
-    st.session_state.gemini_model = None
-if "index" not in st.session_state:
-    st.session_state.index = None
-if "corpus" not in st.session_state:
-    st.session_state.corpus = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "index_built" not in st.session_state:
-    st.session_state.index_built = False
-
-# ---- Credentials via Streamlit Secrets ----
-try:
-    if "google" in st.secrets:
-        sa_info = json.loads(st.secrets["google"]["credentials_json"])
-        creds = service_account.Credentials.from_service_account_info(sa_info)
-        project_id = st.secrets["google"]["project"]
-        location_secret = st.secrets["google"].get("location", DEFAULT_LOCATION)
-
-        aiplatform.init(project=project_id, location=location_secret, credentials=creds)
-        vertexai_init(project=project_id, location=location_secret, credentials=creds)
-
-        st.session_state.creds = creds
-        st.session_state.project_id = project_id
-        st.session_state.location = location_secret
-except Exception as e:
-    st.error(f"Authentication failed: {e}")
-    st.stop()
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
     sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 1) -> List[str]:
+def chunk_text(text: str, max_tokens: int = 800, overlap_sentences: int = 2) -> List[str]:
+    """Improved chunking with better overlap and context preservation"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
+    
     for s in sents:
         s_tokens = max(1, len(s) // 4)
         if token_est + s_tokens > max_tokens and buf:
             chunks.append(" ".join(buf))
+            # Better overlap strategy
             buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
             token_est = sum(max(1, len(x)//4) for x in buf)
         buf.append(s)
         token_est += s_tokens
+    
     if buf:
         chunks.append(" ".join(buf))
     return chunks
@@ -137,460 +99,398 @@ def extract_text_from_image_bytes(b: bytes) -> str:
     except Exception:
         return ""
 
-def embed_texts(texts: List[str], project_id: str, location: str, creds) -> np.ndarray:
-    vertexai_init(project=project_id, location=location, credentials=creds)
-    model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-    vecs, bs = [], 32
-    for i in range(0, len(texts), bs):
-        embs = model.get_embeddings(texts[i:i+bs])
-        vecs.extend([e.values for e in embs])
-    return np.array(vecs, dtype="float32")
+def embed_texts(texts: List[str], project_id: str, location: str, credentials) -> np.ndarray:
+    """Generate embeddings for texts"""
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = TextEmbeddingModel.from_pretrained("text-embedding-005")
+        embeddings = model.get_embeddings(texts)
+        return np.array([e.values for e in embeddings]).astype(np.float32)
+    except Exception as e:
+        st.error(f"Embedding error: {e}")
+        return np.array([])
 
-def pick_available_model(creds, project_id: str, location: str) -> str:
-    vertexai_init(project=project_id, location=location, credentials=creds)
-    gen_cfg = GenerationConfig(max_output_tokens=8)
-    for mid in CANDIDATE_MODELS:
-        try:
-            m = GenerativeModel(mid)
-            r = m.generate_content(["ok"], generation_config=gen_cfg)
-            if getattr(r, "text", None):
-                return mid
-        except Exception:
-            continue
-    raise RuntimeError("No Gemini Flash Lite model available in this region/account.")
+def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials) -> tuple:
+    """Build FAISS index from corpus"""
+    if not corpus:
+        return None, []
+    
+    texts = [item["text"] for item in corpus]
+    embeddings = embed_texts(texts, project_id, location, credentials)
+    
+    if embeddings.size == 0:
+        return None, []
+    
+    # Create FAISS index
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+    
+    # Normalize embeddings for cosine similarity
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings)
+    
+    return index, corpus
+
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 5) -> List[Dict]:
+    """Search FAISS index for relevant chunks"""
+    if index is None or not corpus:
+        return []
+    
+    try:
+        # Generate query embedding
+        query_embeddings = embed_texts([query], project_id, location, credentials)
+        if query_embeddings.size == 0:
+            return []
+        
+        # Normalize query embedding
+        faiss.normalize_L2(query_embeddings)
+        
+        # Search
+        scores, indices = index.search(query_embeddings, min(k, len(corpus)))
+        
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < len(corpus):
+                results.append({
+                    **corpus[idx],
+                    "similarity_score": float(score)
+                })
+        
+        return results
+    except Exception as e:
+        st.error(f"Search error: {e}")
+        return []
+
+def load_index_and_corpus() -> tuple:
+    """Load existing FAISS index and corpus"""
+    try:
+        if INDEX_PATH.exists() and CORPUS_PATH.exists():
+            index = faiss.read_index(str(INDEX_PATH))
+            with open(CORPUS_PATH, 'r') as f:
+                corpus = json.load(f)
+            return index, corpus
+    except Exception as e:
+        st.error(f"Error loading index: {e}")
+    return None, []
 
 def save_index_and_corpus(index, corpus: List[Dict]):
-    faiss.write_index(index, str(INDEX_PATH))
-    CORPUS_PATH.write_text(json.dumps(corpus, ensure_ascii=False), encoding="utf-8")
+    """Save FAISS index and corpus"""
+    try:
+        if index is not None:
+            faiss.write_index(index, str(INDEX_PATH))
+        with open(CORPUS_PATH, 'w') as f:
+            json.dump(corpus, f, indent=2)
+    except Exception as e:
+        st.error(f"Error saving index: {e}")
 
-def load_index_and_corpus():
-    if INDEX_PATH.exists() and CORPUS_PATH.exists():
-        index = faiss.read_index(str(INDEX_PATH))
-        corpus = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
-        return index, corpus
-    return None, None
+def process_kb_files() -> List[Dict]:
+    """Process all KB files and create corpus"""
+    corpus = []
+    
+    if not KB_DIR.exists():
+        return corpus
+    
+    for file_path in KB_DIR.iterdir():
+        if file_path.is_file():
+            try:
+                if file_path.suffix.lower() == '.docx':
+                    text = extract_text_from_docx_bytes(file_path.read_bytes())
+                elif file_path.suffix.lower() == '.pdf':
+                    text = extract_text_from_pdf_bytes(file_path.read_bytes())
+                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
+                    text = extract_text_from_image_bytes(file_path.read_bytes())
+                else:
+                    continue
+                
+                if text.strip():
+                    chunks = chunk_text(text)
+                    for i, chunk in enumerate(chunks):
+                        corpus.append({
+                            "text": chunk,
+                            "source": file_path.name,
+                            "chunk_id": i,
+                            "file_type": file_path.suffix.lower()
+                        })
+            except Exception as e:
+                st.error(f"Error processing {file_path.name}: {e}")
+    
+    return corpus
 
-def build_context(hits: List[Dict], max_chars: int = 6000) -> str:
-    out, used = [], 0
-    for h in hits:
-        t = h["chunk"]["text"]
-        src = h["chunk"]["source"]
-        block = f"[Source: {src}]\n{t}\n"
-        if used + len(block) > max_chars:
-            break
-        out.append(block)
-        used += len(block)
-    return "\n".join(out)
-
-def embed_query(q: str, project_id: str, location: str, creds) -> np.ndarray:
-    vertexai_init(project=project_id, location=location, credentials=creds)
-    model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-    embs = model.get_embeddings([q])
-    return np.array([embs[0].values], dtype="float32")
-
-# ---- Enhanced Conversational responses ----
-def get_conversational_response(prompt: str) -> str:
-    """Handle simple conversational inputs with better reasoning"""
-    prompt_lower = prompt.lower().strip()
+def get_conversational_response(query: str) -> str:
+    """Handle simple conversational queries"""
+    query_lower = query.lower().strip()
     
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    farewells = ["bye", "goodbye", "see you", "farewell", "take care"]
-    thanks = ["thank you", "thanks", "appreciate it"]
-    clarifications = ["i don't understand", "can you elaborate", "explain more", "what do you mean"]
-    how_are_you = ["how are you", "how are u", "how's it going", "what's up"]
+    farewells = ["bye", "goodbye", "see you", "farewell", "thanks", "thank you"]
+    casual = ["what's up", "how are you", "how's it going", "what's new"]
     
-    if any(greeting in prompt_lower for greeting in greetings):
-        return """Hello! I'm your HBS Help Chatbot, specialized in assisting with HBS (Hospitality Business Systems) software. 
-
-I can help you with:
-• **System Navigation** - Finding specific functions and features
-• **Report Generation** - Creating and understanding various reports (RR, REL, RRR, OER, etc.)
-• **Process Guidance** - Step-by-step procedures for common tasks
-• **Troubleshooting** - Resolving issues and understanding error messages
-• **Feature Explanations** - Understanding what each module does and how to use it
-
-What specific HBS function or process would you like help with today?"""
+    if any(greeting in query_lower for greeting in greetings):
+        return "Hello! I'm your HBS Help Chatbot. I can help you with questions about HBS systems, features, and procedures. What would you like to know?"
     
-    elif any(farewell in prompt_lower for farewell in farewells):
-        return "Goodbye! I'm always here when you need help with HBS systems. Feel free to return anytime you have questions about reports, procedures, or any other HBS functionality."
+    if any(farewell in query_lower for farewell in farewells):
+        return "Goodbye! Feel free to come back anytime if you have more questions about HBS systems."
     
-    elif any(thank in prompt_lower for thank in thanks):
-        return "You're very welcome! I'm here to make your HBS experience smoother. If you have any other questions about reports, procedures, or system features, just ask!"
+    if any(casual_phrase in query_lower for casual_phrase in casual):
+        return "I'm doing well, thank you! I'm here to help you with any questions about HBS systems, reports, or procedures. What can I assist you with today?"
     
-    elif any(clarification in prompt_lower for clarification in clarifications):
-        return """I'd be happy to provide more detailed explanations! To give you the most helpful response, could you specify:
+    return None
 
-• **What type of information** you're looking for (reports, procedures, features, troubleshooting)
-• **Which HBS module** you're working with (Rental Reports, Equipment Lists, etc.)
-• **What specific aspect** you'd like me to elaborate on
-
-For example, you could ask:
-- "Explain how to generate a Rental Equipment List step by step"
-- "What are the different sorting options in Rental Reports?"
-- "How do I troubleshoot when a report won't print?"
-
-The more specific your question, the better I can assist you!"""
+def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> str:
+    """Generate response using Gemini with improved prompting"""
     
-    elif any(how in prompt_lower for how in how_are_you):
-        return """I'm functioning perfectly and ready to help! My knowledge base is loaded with comprehensive HBS documentation, so I'm well-equipped to assist with:
-
-• Report generation and configuration
-• System navigation and feature explanations  
-• Step-by-step procedures
-• Troubleshooting common issues
-• Understanding different HBS modules and their functions
-
-What HBS-related task can I help you with today?"""
+    # Check for conversational responses first
+    conversational = get_conversational_response(query)
+    if conversational:
+        return conversational
     
-    return None  # Not a conversational response
-
-# ---- Pre-load KB files ----
-def load_kb_files():
-    """Load KB files from the kb directory"""
-    kb_files = []
-    for ext in [".docx", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
-        kb_files.extend(KB_DIR.glob(f"*{ext}"))
-    return kb_files
-
-def build_index_from_kb_files():
-    """Build index from pre-loaded KB files"""
-    kb_files = load_kb_files()
-    if not kb_files:
-        st.error("No KB files found in the kb directory. Please add your documents to the kb folder.")
-        return False
+    if not context_chunks:
+        return "I don't have specific information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
     
-    texts, corpus = [], []
+    # Build context from retrieved chunks
+    context_text = "\n\n".join([
+        f"Source: {chunk['source']}\nContent: {chunk['text']}"
+        for chunk in context_chunks
+    ])
     
-    # Extract text from files
-    for file_path in kb_files:
-        try:
-            with open(file_path, "rb") as f:
-                raw = f.read()
-            
-            ext = file_path.suffix.lower()
-            text = ""
-            if ext == ".docx":
-                text = extract_text_from_docx_bytes(raw)
-            elif ext == ".pdf":
-                text = extract_text_from_pdf_bytes(raw)
-            elif ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
-                text = extract_text_from_image_bytes(raw)
-            else:
-                continue
-                
-            text = (text or "").strip()
-            if not text:
-                continue
-                
-            out_path = EXTRACT_DIR / f"{file_path.stem}.txt"
-            out_path.write_text(text, encoding="utf-8")
-        except Exception as e:
-            st.warning(f"Failed to process {file_path.name}: {e}")
+    # Improved system prompt
+    system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
 
-    # Build corpus from extracted
-    docs = []
-    for p in sorted(EXTRACT_DIR.glob("*.txt")):
-        try:
-            t = p.read_text(encoding="utf-8").strip()
-        except Exception:
-            t = ""
-        if t:
-            docs.append({"source": str(p), "text": t})
+CONTEXT FROM KNOWLEDGE BASE:
+{context_text}
 
-    for d in docs:
-        for i, ch in enumerate(chunk_text(d["text"], max_tokens=500, overlap_sentences=1)):
-            corpus.append({"id": f'{d["source"]}#{i}', "text": ch, "source": d["source"]})
-            texts.append(ch)
+USER QUESTION: {query}
 
-    if not texts:
-        st.error("No text extracted from KB files.")
-        return False
+INSTRUCTIONS:
+1. Answer the user's question using ONLY the information provided in the context above
+2. Be specific and detailed in your response
+3. If the context contains step-by-step procedures, provide them clearly
+4. If the context mentions specific options, fields, or settings, list them exactly
+5. If you need to make assumptions, state them clearly
+6. If the context doesn't contain enough information to fully answer the question, say so and suggest what additional information might be needed
+7. Always be helpful and professional
 
-    with st.spinner("Building knowledge base index..."):
-        embs = embed_texts(texts, st.session_state.project_id, st.session_state.location, st.session_state.creds)
-        dim = int(embs.shape[1])
-        faiss.normalize_L2(embs)
-        index = faiss.IndexFlatIP(dim)
-        index.add(embs)
+RESPONSE:"""
 
-    st.session_state.index = index
-    st.session_state.corpus = corpus
-    return True
-
-# ---- Initialize app ----
-def initialize_app():
-    """Initialize the app - load index or build from KB files"""
-    # Try to load existing index first
-    index, corpus = load_index_and_corpus()
-    if index is not None and corpus is not None:
-        st.session_state.index = index
-        st.session_state.corpus = corpus
-        st.session_state.index_built = True
-        return True
-    
-    # If no index exists, build from KB files
-    success = build_index_from_kb_files()
-    if success:
-        st.session_state.index_built = True
-    return success
-
-# ---- Model selection ----
-def ensure_model_ready():
-    if st.session_state.gemini_model is None:
-        st.session_state.gemini_model = pick_available_model(
-            st.session_state.creds, st.session_state.project_id, st.session_state.location
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        response = model.generate_content(
+            system_prompt,
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=2048,
+                top_p=0.8,
+                top_k=40
+            )
         )
-
-# ---- Enhanced Retrieval ----
-MIN_SCORE = 0.25
-def retrieve(query: str, k: int = 12):
-    if st.session_state.index is None or st.session_state.corpus is None:
-        return []
-    q = embed_query(query, st.session_state.project_id, st.session_state.location, st.session_state.creds).astype("float32")
-    faiss.normalize_L2(q)
-    D, I = st.session_state.index.search(q, k)
-    raw = []
-    for score, idx in zip(D[0], I[0]):
-        if idx == -1:
-            continue
-        raw.append({"score": float(score), "chunk": st.session_state.corpus[idx]})
-    hits = [h for h in raw if h["score"] >= MIN_SCORE]
-    hits.sort(key=lambda x: x["score"], reverse=True)
-    return hits
-
-def context_is_sufficient(hits, min_citations=2):
-    high = [h for h in hits if h["score"] >= MIN_SCORE]
-    return len(high) >= min_citations
-
-# Enhanced generation config for better reasoning
-gen_config = GenerationConfig(
-    temperature=0.1,  # Lower temperature for more focused reasoning
-    top_p=0.8,        # More focused token selection
-    max_output_tokens=2048,  # Allow longer, more detailed responses
-)
-
-# ---- Initialize app ----
-if not st.session_state.index_built:
-    if initialize_app():
-        st.success("Knowledge base loaded successfully!")
-    else:
-        st.error("Failed to load knowledge base. Please check your KB files.")
-        st.stop()
-
-# ---- Welcome message ----
-if not st.session_state.messages:
-    st.session_state.messages.append({"role": "assistant", "content": "Hi! How can I help you?"})
-
-# ---- Chat UI ----
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "citations" in message:
-            with st.expander("Sources"):
-                for h in message["citations"][:3]:
-                    src = Path(h["chunk"]["source"]).name
-                    snippet = h["chunk"]["text"][:240].replace("\n", " ")
-                    st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
-
-# Simple working input - just use the native chat_input
-prompt = st.chat_input("Ask me anything about HBS systems...")
-
-if prompt:
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        return response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
     
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
-    # Generate assistant response
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                ensure_model_ready()
-                
-                # Check for conversational responses first
-                conversational_response = get_conversational_response(prompt)
-                if conversational_response:
-                    st.markdown(conversational_response)
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": conversational_response
-                    })
-                else:
-                    # Enhanced text-only question with better reasoning
-                    hits = retrieve(prompt, k=12)
-                    
-                    if not context_is_sufficient(hits):
-                        response = """I don't have sufficient information in the knowledge base to provide a comprehensive answer to your question.
+def generate_image_response(query: str, image_bytes: bytes, model_name: str, project_id: str, location: str, credentials) -> str:
+    """Generate response for image-based queries"""
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        # Create image part
+        image_part = Part.from_data(image_bytes, mime_type="image/jpeg")
+        
+        prompt = f"""Analyze this image and answer the user's question: {query}
 
-**What I can suggest:**
-• **Reframe your question** - Try asking about specific HBS functions, reports, or procedures
-• **Be more specific** - Instead of "how do I...", try "how do I generate a Rental Equipment List?"
-• **Check the available modules** - I have documentation for RR, REL, RRR, OER, ROR, and RCR
+If this appears to be a screenshot or document related to HBS systems, provide detailed analysis. If it's not related to HBS, politely explain that you specialize in HBS system assistance."""
+        
+        response = model.generate_content([prompt, image_part])
+        return response.text if response.text else "I couldn't analyze the image. Please try again."
+    
+    except Exception as e:
+        return f"Error analyzing image: {str(e)}"
 
-**Example questions I can help with:**
-- "What are the steps to create a Rental Equipment List?"
-- "How do I configure sorting options in Rental Reports?"
-- "What information is included in an Overdue Equipment Report?"
-
-Could you provide more details about what specific HBS function or process you're trying to understand?"""
-                        citations = []
-                    else:
-                        context = build_context(hits)
-                        
-                        # Enhanced system instruction with chain of thought
-                        system_instruction = """You are an expert HBS (Hospitality Business Systems) assistant with deep knowledge of rental management software. 
-
-**Your approach should be:**
-1. **Analyze the question** - Understand what the user is trying to accomplish
-2. **Identify relevant information** - Extract key details from the provided context
-3. **Provide structured guidance** - Break down complex procedures into clear steps
-4. **Explain the reasoning** - Help the user understand WHY each step is important
-5. **Offer alternatives** - Suggest different approaches when applicable
-6. **Anticipate follow-ups** - Mention related functions or potential issues
-
-**Response format:**
-- Start with a brief summary of what you'll explain
-- Use clear headings and bullet points for procedures
-- Explain the purpose and benefits of each step
-- Include any important considerations or prerequisites
-- End with related functions or next steps
-
-**Important:** Use ONLY the provided knowledge base context. If information is missing, explicitly state what's not available and suggest how the user might find it. Do NOT use outside knowledge or make assumptions about HBS functionality not documented in the context."""
-                        
-                        user_message = (
-                            f"{system_instruction}\n\n"
-                            f"**Knowledge Base Context:**\n{context}\n\n"
-                            f"**User Question:** {prompt}\n\n"
-                            f"**Instructions:** Provide a comprehensive, well-structured response that helps the user understand not just what to do, but why and how it fits into their broader workflow."
-                        )
-                        
-                        model = GenerativeModel(st.session_state.gemini_model)
-                        resp = model.generate_content([user_message], generation_config=gen_config)
-                        response = resp.text or "I'm sorry, I couldn't generate a response."
-                        citations = hits
-
-                    st.markdown(response)
-                    
-                    # Add assistant response to chat history
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": response,
-                        "citations": citations
-                    })
-                
-            except Exception as e:
-                error_msg = f"Sorry, I encountered an error: {str(e)}"
-                st.markdown(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-# ---- Sidebar for admin functions and image upload ----
-with st.sidebar:
-    st.header("Attach Image")
-    uploaded_image = st.file_uploader(
-        "Choose an image", 
-        type=["png", "jpg", "jpeg", "webp"], 
-        key="image_upload",
-        help="Upload an image to ask questions about it"
+# ---- Streamlit App ----
+def main():
+    st.set_page_config(
+        page_title="HBS Help Chatbot",
+        page_icon="🤖",
+        layout="wide"
     )
     
-    st.header("Admin")
-    
-    if st.button("Rebuild Knowledge Base", key="rebuild_btn"):
-        if build_index_from_kb_files():
-            st.session_state.index_built = True
-            st.success("Knowledge base rebuilt successfully!")
-            st.rerun()
-    
-    if st.button("Clear Chat History", key="clear_btn"):
-        st.session_state.messages = [{"role": "assistant", "content": "Hi! How can I help you?"}]
-        st.rerun()
-    
-    # Show KB status
-    st.subheader("Knowledge Base Status")
-    if st.session_state.index_built and st.session_state.corpus:
-        st.success(f"✅ Loaded ({len(st.session_state.corpus)} chunks)")
-    else:
-        st.error("❌ Not loaded")
-    
-    # Show KB files
-    kb_files = load_kb_files()
-    st.subheader("KB Files")
-    if kb_files:
-        for f in kb_files:
-            st.text(f"📄 {f.name}")
-    else:
-        st.warning("No KB files found")
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "index" not in st.session_state:
+        st.session_state.index = None
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = []
+    if "creds" not in st.session_state:
+        st.session_state.creds = None
+    if "project_id" not in st.session_state:
+        st.session_state.project_id = None
+    if "location" not in st.session_state:
+        st.session_state.location = None
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = CANDIDATE_MODELS[0]
+    if "kb_loaded" not in st.session_state:
+        st.session_state.kb_loaded = False
+    if "uploaded_image" not in st.session_state:
+        st.session_state.uploaded_image = None
 
-# Handle image questions separately
-if uploaded_image and st.button("Ask about this image", key="ask_image_btn"):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": f"Tell me about this image: {uploaded_image.name}"})
+    # Initialize credentials
+    try:
+        sa_info = json.loads(st.secrets["google"]["credentials_json"])
+        st.session_state.creds = service_account.Credentials.from_service_account_info(sa_info)
+        st.session_state.project_id = st.secrets["google"]["project"]
+        st.session_state.location = st.secrets["google"].get("location", DEFAULT_LOCATION)
+    except Exception as e:
+        st.error(f"Error loading credentials: {e}")
+        st.stop()
+
+    # Initialize app
+    @st.cache_resource
+    def initialize_app():
+        """Initialize the app - load index or build from KB files"""
+        # Try to load existing index first
+        index, corpus = load_index_and_corpus()
+        if index is not None and corpus:
+            return index, corpus, True
+        
+        # Build index from KB files
+        corpus = process_kb_files()
+        if not corpus:
+            return None, [], False
+        
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+        if index is not None:
+            save_index_and_corpus(index, corpus)
+            return index, corpus, True
+        
+        return None, [], False
+
+    # Initialize
+    if not st.session_state.kb_loaded:
+        with st.spinner("Loading knowledge base..."):
+            index, corpus, loaded = initialize_app()
+            st.session_state.index = index
+            st.session_state.corpus = corpus
+            st.session_state.kb_loaded = loaded
+
+    # Sidebar
+    with st.sidebar:
+        st.header("HBS Help Chatbot")
+        
+        # Status
+        if st.session_state.kb_loaded:
+            st.success(f"✅ Knowledge base loaded ({len(st.session_state.corpus)} chunks)")
+        else:
+            st.error("❌ Knowledge base not loaded")
+        
+        # Model selection
+        st.subheader("Model Settings")
+        st.session_state.model_name = st.selectbox(
+            "Select Model",
+            CANDIDATE_MODELS,
+            index=0,
+            key="model_select"
+        )
+        
+        # Rebuild index button
+        if st.button("🔄 Rebuild Index", key="rebuild_btn"):
+            with st.spinner("Rebuilding index..."):
+                corpus = process_kb_files()
+                if corpus:
+                    index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+                    if index is not None:
+                        save_index_and_corpus(index, corpus)
+                        st.session_state.index = index
+                        st.session_state.corpus = corpus
+                        st.session_state.kb_loaded = True
+                        st.success("Index rebuilt successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to build index")
+                else:
+                    st.error("No KB files found")
+
+    # Main chat interface
+    st.title("HBS Help Chatbot")
     
-    with st.chat_message("user"):
-        st.markdown(f"Tell me about this image: {uploaded_image.name}")
-        st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
+    # Chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if "sources" in message and message["sources"]:
+                with st.expander("Sources"):
+                    for source in message["sources"]:
+                        st.write(f"**{source['source']}** (similarity: {source['similarity_score']:.3f})")
+                        st.write(source['text'][:200] + "...")
 
-    # Generate assistant response
-    with st.chat_message("assistant"):
-        with st.spinner("Analyzing image..."):
-            try:
-                ensure_model_ready()
-                
-                # Image-based question
-                hits = retrieve("image analysis", k=12)
-                context = build_context(hits) if hits else ""
-                
-                system_instruction = """You are an expert HBS assistant analyzing a screenshot or document image. 
-
-**Your analysis should include:**
-1. **Visual identification** - What HBS screen, report, or interface is shown
-2. **Functional explanation** - What this screen/report is used for
-3. **Key elements** - Important fields, buttons, options visible
-4. **User guidance** - How to navigate to this screen or generate this report
-5. **Related functions** - What other related screens or reports exist
-
-**Response format:**
-- Start with identifying what you see
-- Explain the purpose and context
-- Break down the key elements and their functions
-- Provide navigation guidance
-- Suggest related functions or next steps"""
-                
-                user_message = (
-                    f"{system_instruction}\n\n"
-                    f"**Knowledge Base Context:**\n{context}\n\n"
-                    f"**Image Analysis Request:** Analyze this HBS screenshot/document and explain what it shows, how to access it, and how to use it effectively."
+    # Chat input
+    if prompt := st.chat_input("Ask me anything about HBS systems..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                # Search for relevant context
+                context_chunks = search_index(
+                    prompt, 
+                    st.session_state.index, 
+                    st.session_state.corpus,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    k=5
                 )
                 
-                # Save image to temp file first
-                temp_image_path = f"/tmp/{uploaded_image.name}"
-                with open(temp_image_path, "wb") as f:
-                    f.write(uploaded_image.getvalue())
-                
-                # Load image from file path
-                image_obj = Image.load_from_file(temp_image_path)
-                img_part = Part.from_image(image_obj)
-                
-                model = GenerativeModel(st.session_state.gemini_model)
-                resp = model.generate_content([user_message, img_part], generation_config=gen_config)
-                response = resp.text or "I'm sorry, I couldn't generate a response."
-                citations = hits
-                
-                # Clean up temp file
-                os.remove(temp_image_path)
+                # Generate response
+                response = generate_response(
+                    prompt,
+                    context_chunks,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
                 
                 st.markdown(response)
                 
-                # Add assistant response to chat history
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "citations": citations
-                })
-                
-            except Exception as e:
-                error_msg = f"Sorry, I encountered an error: {str(e)}"
-                st.markdown(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                # Show sources if available
+                if context_chunks:
+                    with st.expander("Sources"):
+                        for chunk in context_chunks:
+                            st.write(f"**{chunk['source']}** (similarity: {chunk['similarity_score']:.3f})")
+                            st.write(chunk['text'][:200] + "...")
+        
+        # Add assistant message
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": response,
+            "sources": context_chunks
+        })
+
+    # Image upload (simplified)
+    if st.session_state.uploaded_image:
+        st.image(st.session_state.uploaded_image, caption="Uploaded Image", use_column_width=True)
+        
+        if st.button("Ask about this image", key="ask_image_btn"):
+            with st.spinner("Analyzing image..."):
+                image_bytes = st.session_state.uploaded_image.getvalue()
+                response = generate_image_response(
+                    "What do you see in this image?",
+                    image_bytes,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                st.write(response)
+                st.session_state.uploaded_image = None
+                st.rerun()
+
+if __name__ == "__main__":
+    main()
