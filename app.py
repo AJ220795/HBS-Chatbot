@@ -188,9 +188,9 @@ def embed_query(q: str, project_id: str, location: str, creds) -> np.ndarray:
     embs = model.get_embeddings([q])
     return np.array([embs[0].values], dtype="float32")
 
-# ---- Conversational responses ----
+# ---- Enhanced Conversational responses ----
 def get_conversational_response(prompt: str) -> str:
-    """Handle simple conversational inputs"""
+    """Handle simple conversational inputs with better reasoning"""
     prompt_lower = prompt.lower().strip()
     
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
@@ -200,19 +200,47 @@ def get_conversational_response(prompt: str) -> str:
     how_are_you = ["how are you", "how are u", "how's it going", "what's up"]
     
     if any(greeting in prompt_lower for greeting in greetings):
-        return "Hello! I'm your HBS Help Chatbot. I can help you with questions about HBS systems, features, and procedures. What would you like to know?"
+        return """Hello! I'm your HBS Help Chatbot, specialized in assisting with HBS (Hospitality Business Systems) software. 
+
+I can help you with:
+• **System Navigation** - Finding specific functions and features
+• **Report Generation** - Creating and understanding various reports (RR, REL, RRR, OER, etc.)
+• **Process Guidance** - Step-by-step procedures for common tasks
+• **Troubleshooting** - Resolving issues and understanding error messages
+• **Feature Explanations** - Understanding what each module does and how to use it
+
+What specific HBS function or process would you like help with today?"""
     
     elif any(farewell in prompt_lower for farewell in farewells):
-        return "Goodbye! Feel free to come back anytime if you have more questions about HBS systems."
+        return "Goodbye! I'm always here when you need help with HBS systems. Feel free to return anytime you have questions about reports, procedures, or any other HBS functionality."
     
     elif any(thank in prompt_lower for thank in thanks):
-        return "You're welcome! I'm here to help with any HBS-related questions you might have."
+        return "You're very welcome! I'm here to make your HBS experience smoother. If you have any other questions about reports, procedures, or system features, just ask!"
     
     elif any(clarification in prompt_lower for clarification in clarifications):
-        return "I'd be happy to clarify! Could you please be more specific about what you'd like me to explain? For example, you could ask about specific HBS features, procedures, or system functions."
+        return """I'd be happy to provide more detailed explanations! To give you the most helpful response, could you specify:
+
+• **What type of information** you're looking for (reports, procedures, features, troubleshooting)
+• **Which HBS module** you're working with (Rental Reports, Equipment Lists, etc.)
+• **What specific aspect** you'd like me to elaborate on
+
+For example, you could ask:
+- "Explain how to generate a Rental Equipment List step by step"
+- "What are the different sorting options in Rental Reports?"
+- "How do I troubleshoot when a report won't print?"
+
+The more specific your question, the better I can assist you!"""
     
     elif any(how in prompt_lower for how in how_are_you):
-        return "I'm doing well, thank you! I'm here and ready to help you with any HBS system questions. What can I assist you with today?"
+        return """I'm functioning perfectly and ready to help! My knowledge base is loaded with comprehensive HBS documentation, so I'm well-equipped to assist with:
+
+• Report generation and configuration
+• System navigation and feature explanations  
+• Step-by-step procedures
+• Troubleshooting common issues
+• Understanding different HBS modules and their functions
+
+What HBS-related task can I help you with today?"""
     
     return None  # Not a conversational response
 
@@ -313,7 +341,7 @@ def ensure_model_ready():
             st.session_state.creds, st.session_state.project_id, st.session_state.location
         )
 
-# ---- Retrieval ----
+# ---- Enhanced Retrieval ----
 MIN_SCORE = 0.25
 def retrieve(query: str, k: int = 12):
     if st.session_state.index is None or st.session_state.corpus is None:
@@ -334,7 +362,12 @@ def context_is_sufficient(hits, min_citations=2):
     high = [h for h in hits if h["score"] >= MIN_SCORE]
     return len(high) >= min_citations
 
-gen_config = GenerationConfig(temperature=0.3, top_p=0.9, max_output_tokens=1024)
+# Enhanced generation config for better reasoning
+gen_config = GenerationConfig(
+    temperature=0.1,  # Lower temperature for more focused reasoning
+    top_p=0.8,        # More focused token selection
+    max_output_tokens=2048,  # Allow longer, more detailed responses
+)
 
 # ---- Initialize app ----
 if not st.session_state.index_built:
@@ -385,27 +418,54 @@ if prompt:
                         "content": conversational_response
                     })
                 else:
-                    # Text-only question
+                    # Enhanced text-only question with better reasoning
                     hits = retrieve(prompt, k=12)
                     
                     if not context_is_sufficient(hits):
-                        response = (
-                            "I don't have enough information in the knowledge base to answer that. "
-                            "Could you please rephrase your question or ask about something else?"
-                        )
+                        response = """I don't have sufficient information in the knowledge base to provide a comprehensive answer to your question.
+
+**What I can suggest:**
+• **Reframe your question** - Try asking about specific HBS functions, reports, or procedures
+• **Be more specific** - Instead of "how do I...", try "how do I generate a Rental Equipment List?"
+• **Check the available modules** - I have documentation for RR, REL, RRR, OER, ROR, and RCR
+
+**Example questions I can help with:**
+- "What are the steps to create a Rental Equipment List?"
+- "How do I configure sorting options in Rental Reports?"
+- "What information is included in an Overdue Equipment Report?"
+
+Could you provide more details about what specific HBS function or process you're trying to understand?"""
                         citations = []
                     else:
                         context = build_context(hits)
-                        system_instruction = (
-                            "You are a helpful HBS systems assistant. Use ONLY the provided knowledge base context to answer. "
-                            "If the information is not in the context, explicitly say you don't know and ask a clarifying question. "
-                            "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
-                        )
+                        
+                        # Enhanced system instruction with chain of thought
+                        system_instruction = """You are an expert HBS (Hospitality Business Systems) assistant with deep knowledge of rental management software. 
+
+**Your approach should be:**
+1. **Analyze the question** - Understand what the user is trying to accomplish
+2. **Identify relevant information** - Extract key details from the provided context
+3. **Provide structured guidance** - Break down complex procedures into clear steps
+4. **Explain the reasoning** - Help the user understand WHY each step is important
+5. **Offer alternatives** - Suggest different approaches when applicable
+6. **Anticipate follow-ups** - Mention related functions or potential issues
+
+**Response format:**
+- Start with a brief summary of what you'll explain
+- Use clear headings and bullet points for procedures
+- Explain the purpose and benefits of each step
+- Include any important considerations or prerequisites
+- End with related functions or next steps
+
+**Important:** Use ONLY the provided knowledge base context. If information is missing, explicitly state what's not available and suggest how the user might find it. Do NOT use outside knowledge or make assumptions about HBS functionality not documented in the context."""
+                        
                         user_message = (
                             f"{system_instruction}\n\n"
-                            f"Context from KB:\n{context}\n\n"
-                            f"Question: {prompt}"
+                            f"**Knowledge Base Context:**\n{context}\n\n"
+                            f"**User Question:** {prompt}\n\n"
+                            f"**Instructions:** Provide a comprehensive, well-structured response that helps the user understand not just what to do, but why and how it fits into their broader workflow."
                         )
+                        
                         model = GenerativeModel(st.session_state.gemini_model)
                         resp = model.generate_content([user_message], generation_config=gen_config)
                         response = resp.text or "I'm sorry, I couldn't generate a response."
@@ -482,16 +542,26 @@ if uploaded_image and st.button("Ask about this image", key="ask_image_btn"):
                 hits = retrieve("image analysis", k=12)
                 context = build_context(hits) if hits else ""
                 
-                system_instruction = (
-                    "You are a helpful HBS systems assistant. Use the provided knowledge base context and attached image to answer. "
-                    "If the information is not available, explicitly say you don't know and ask a clarifying question. "
-                    "Do NOT use outside knowledge. Do NOT hallucinate. Be concise and helpful."
-                )
+                system_instruction = """You are an expert HBS assistant analyzing a screenshot or document image. 
+
+**Your analysis should include:**
+1. **Visual identification** - What HBS screen, report, or interface is shown
+2. **Functional explanation** - What this screen/report is used for
+3. **Key elements** - Important fields, buttons, options visible
+4. **User guidance** - How to navigate to this screen or generate this report
+5. **Related functions** - What other related screens or reports exist
+
+**Response format:**
+- Start with identifying what you see
+- Explain the purpose and context
+- Break down the key elements and their functions
+- Provide navigation guidance
+- Suggest related functions or next steps"""
                 
                 user_message = (
                     f"{system_instruction}\n\n"
-                    f"Context from KB:\n{context}\n\n"
-                    f"Question: Tell me about this image"
+                    f"**Knowledge Base Context:**\n{context}\n\n"
+                    f"**Image Analysis Request:** Analyze this HBS screenshot/document and explain what it shows, how to access it, and how to use it effectively."
                 )
                 
                 # Save image to temp file first
