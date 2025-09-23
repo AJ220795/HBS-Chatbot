@@ -400,8 +400,8 @@ def build_faiss_index(corpus: List[Dict], project_id: str, location: str, creden
     
     return index, corpus
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 5) -> List[Dict]:
-    """Search FAISS index for relevant chunks"""
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 2) -> List[Dict]:
+    """Search FAISS index for relevant chunks - limited to 2 sources"""
     if index is None or not corpus:
         return []
     
@@ -414,8 +414,8 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         # Normalize query embedding
         faiss.normalize_L2(query_embeddings)
         
-        # Search
-        scores, indices = index.search(query_embeddings, min(k, len(corpus)))
+        # Search - limit to 2 results
+        scores, indices = index.search(query_embeddings, min(2, len(corpus)))
         
         results = []
         for score, idx in zip(scores[0], indices[0]):
@@ -612,6 +612,7 @@ def get_conversational_response(query: str) -> str:
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     farewells = ["bye", "goodbye", "see you", "farewell", "thanks", "thank you"]
     casual = ["what's up", "how are you", "how's it going", "what's new"]
+    vague_responses = ["sure", "ok", "okay", "yes", "yep", "yeah", "alright"]
     
     if any(greeting in query_lower for greeting in greetings):
         return "Hi! How can I help you?"
@@ -621,6 +622,9 @@ def get_conversational_response(query: str) -> str:
     
     if any(casual_phrase in query_lower for casual_phrase in casual):
         return "I'm doing well, thank you! I'm here to help you with any questions about HBS systems, reports, or procedures. What can I assist you with today?"
+    
+    if any(vague in query_lower for vague in vague_responses):
+        return "I'm ready to help! What can I assist you with regarding the HBS system? Please let me know what you need."
     
     return None
 
@@ -678,6 +682,7 @@ INSTRUCTIONS:
 7. If the question is unclear or ambiguous, ask clarifying questions
 8. Always be helpful and professional
 9. For vague requests like "concise version" or "short version", ask what specifically they want to be more concise about
+10. For requests like "in pts" or unclear abbreviations, ask for clarification about what they mean
 
 RESPONSE:"""
 
@@ -837,9 +842,35 @@ def main():
             st.markdown(message["content"])
             if "sources" in message and message["sources"]:
                 with st.expander("Sources"):
-                    for source in message["sources"]:
-                        st.write(f"**{source['source']}** (similarity: {source['similarity_score']:.3f})")
-                        st.write(source['text'][:200] + "...")
+                    for i, source in enumerate(message["sources"][:2]):  # Limit to 2 sources
+                        # Create clickable source link
+                        source_name = source['source']
+                        similarity = source['similarity_score']
+                        content_preview = source['text'][:200] + "..."
+                        
+                        # Try to create a clickable link to the source file
+                        try:
+                            # Check if source file exists in KB directory
+                            source_path = KB_DIR / source_name
+                            if source_path.exists():
+                                # Create a download link
+                                with open(source_path, 'rb') as f:
+                                    file_data = f.read()
+                                
+                                st.download_button(
+                                    label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                    data=file_data,
+                                    file_name=source_name,
+                                    mime="application/octet-stream",
+                                    key=f"download_{i}_{message.get('timestamp', 0)}"
+                                )
+                            else:
+                                st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                        except Exception:
+                            st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                        
+                        st.write(content_preview)
+                        st.write("---")
 
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
@@ -851,7 +882,7 @@ def main():
         # Generate response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                # Search for relevant context
+                # Search for relevant context - limit to 2 sources
                 context_chunks = search_index(
                     prompt, 
                     st.session_state.index, 
@@ -859,7 +890,7 @@ def main():
                     st.session_state.project_id,
                     st.session_state.location,
                     st.session_state.creds,
-                    k=5
+                    k=2  # Limit to 2 sources
                 )
                 
                 # Generate response
@@ -874,18 +905,45 @@ def main():
                 
                 st.markdown(response)
                 
-                # Show sources if available
+                # Show sources if available - limit to 2
                 if context_chunks:
                     with st.expander("Sources"):
-                        for chunk in context_chunks:
-                            st.write(f"**{chunk['source']}** (similarity: {chunk['similarity_score']:.3f})")
-                            st.write(chunk['text'][:200] + "...")
+                        for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
+                            # Create clickable source link
+                            source_name = chunk['source']
+                            similarity = chunk['similarity_score']
+                            content_preview = chunk['text'][:200] + "..."
+                            
+                            # Try to create a clickable link to the source file
+                            try:
+                                # Check if source file exists in KB directory
+                                source_path = KB_DIR / source_name
+                                if source_path.exists():
+                                    # Create a download link
+                                    with open(source_path, 'rb') as f:
+                                        file_data = f.read()
+                                    
+                                    st.download_button(
+                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                        data=file_data,
+                                        file_name=source_name,
+                                        mime="application/octet-stream",
+                                        key=f"download_{i}_{len(st.session_state.messages)}"
+                                    )
+                                else:
+                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                            except Exception:
+                                st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                            
+                            st.write(content_preview)
+                            st.write("---")
         
         # Add assistant message
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response,
-            "sources": context_chunks
+            "sources": context_chunks,
+            "timestamp": len(st.session_state.messages)
         })
 
     # Image upload (simplified)
