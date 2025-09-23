@@ -348,6 +348,30 @@ if not st.session_state.index_built:
 if not st.session_state.messages:
     st.session_state.messages.append({"role": "assistant", "content": "Hi! How can I help you?"})
 
+# ---- Custom CSS for fixed chat input ----
+st.markdown("""
+<style>
+.stChatInput {
+    position: fixed !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    z-index: 999 !important;
+    background: var(--background-color) !important;
+    border-top: 1px solid var(--border-color) !important;
+    padding: 1rem !important;
+}
+
+.stChatInput > div {
+    max-width: 100% !important;
+}
+
+.main .block-container {
+    padding-bottom: 120px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ---- Chat UI ----
 # Display chat messages
 for message in st.session_state.messages:
@@ -360,20 +384,30 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Chat input with file attachment
-col1, col2 = st.columns([1, 20])
+# Chat input with file attachment - FIXED POSITION
+st.markdown("---")
 
-with col1:
-    uploaded_image = st.file_uploader(
-        "", 
-        type=["png", "jpg", "jpeg", "webp"], 
-        key="image_upload", 
-        help="Attach image",
-        label_visibility="collapsed"
-    )
+# Create a container for the input area
+input_container = st.container()
 
-with col2:
-    prompt = st.chat_input("Ask me anything about HBS systems...")
+with input_container:
+    col1, col2, col3 = st.columns([1, 20, 1])
+    
+    with col1:
+        uploaded_image = st.file_uploader(
+            "📎", 
+            type=["png", "jpg", "jpeg", "webp"], 
+            key="image_upload", 
+            help="Attach image",
+            label_visibility="collapsed"
+        )
+    
+    with col2:
+        prompt = st.chat_input("Ask me anything about HBS systems...")
+    
+    with col3:
+        if uploaded_image:
+            st.markdown(f"📎 {uploaded_image.name}")
 
 if prompt:
     # Add user message to chat history
@@ -471,10 +505,6 @@ if prompt:
                 error_msg = f"Sorry, I encountered an error: {str(e)}"
                 st.markdown(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-# Clear the uploaded image after processing
-if uploaded_image:
-    st.rerun()
 
 # ---- Sidebar for admin functions ----
 with st.sidebar:
