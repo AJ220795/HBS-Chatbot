@@ -360,21 +360,23 @@ for message in st.session_state.messages:
                     snippet = h["chunk"]["text"][:240].replace("\n", " ")
                     st.markdown(f"- {src} (score {h['score']:.3f}): {snippet}...")
 
-# Simple working input with file attachment
+# Custom input area with inline file attachment
 st.markdown("---")
 
-# File upload in sidebar
-with st.sidebar:
-    st.subheader("Attach Image")
+# Create columns for input and attach button
+col1, col2 = st.columns([20, 1])
+
+with col1:
+    prompt = st.chat_input("Ask me anything about HBS systems...")
+
+with col2:
     uploaded_image = st.file_uploader(
-        "Choose an image", 
+        "��", 
         type=["png", "jpg", "jpeg", "webp"], 
         key="image_upload",
-        help="Upload an image to ask questions about it"
+        help="Attach image",
+        label_visibility="collapsed"
     )
-
-# Chat input - this works with Enter key
-prompt = st.chat_input("Ask me anything about HBS systems...")
 
 if prompt:
     # Add user message to chat history
@@ -422,15 +424,22 @@ if prompt:
                             f"Question: {prompt}"
                         )
                         
-                        # Prepare image
-                        image_bytes = uploaded_image.read()
-                        image_obj = Image.load_from_file(io.BytesIO(image_bytes))
+                        # FIXED: Save image to temp file first
+                        temp_image_path = f"/tmp/{uploaded_image.name}"
+                        with open(temp_image_path, "wb") as f:
+                            f.write(uploaded_image.getvalue())
+                        
+                        # Load image from file path
+                        image_obj = Image.load_from_file(temp_image_path)
                         img_part = Part.from_image(image_obj)
                         
                         model = GenerativeModel(st.session_state.gemini_model)
                         resp = model.generate_content([user_message, img_part], generation_config=gen_config)
                         response = resp.text or "I'm sorry, I couldn't generate a response."
                         citations = hits
+                        
+                        # Clean up temp file
+                        os.remove(temp_image_path)
                         
                     else:
                         # Text-only question
