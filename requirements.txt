@@ -1,0 +1,14 @@
+# requirements.txt
+streamlit>=1.36.0
+google-cloud-aiplatform>=1.66.0
+google-auth==2.38.0
+vertexai>=1.66.0
+python-docx>=1.1.2
+pypdf>=4.3.1
+opencv-python-headless>=4.10.0.84
+pytesseract>=0.3.13
+faiss-cpu>=1.7.4
+numpy>=1.26.0
+Pillow>=10.3.0
+protobuf>=4.25.3
+requests>=2.32.3
