@@ -99,6 +99,274 @@ def extract_text_from_image_bytes(b: bytes) -> str:
     except Exception:
         return ""
 
+def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse OCR text to extract structured report data"""
+    structured_data = []
+    
+    # Clean up OCR text
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+    
+    # Look for report patterns
+    if "overdue" in filename.lower() or "overdue" in ocr_text.lower():
+        # Parse Overdue Equipment Report
+        structured_data.extend(parse_overdue_report(ocr_text, filename))
+    elif "outbound" in filename.lower() or "outbound" in ocr_text.lower():
+        # Parse Outbound Report
+        structured_data.extend(parse_outbound_report(ocr_text, filename))
+    elif "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
+        # Parse Equipment List Report
+        structured_data.extend(parse_equipment_list_report(ocr_text, filename))
+    
+    return structured_data
+
+def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse Overdue Equipment Report data"""
+    data = []
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+    
+    # Look for customer data patterns
+    for i, line in enumerate(lines):
+        # Pattern: Customer name, Contract, Phone, Stock, Make, Model, Type, Year, Serial, Date Out, Expected, Days Over
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:  # Customer name pattern
+            # Look for the next lines that contain the data
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                # Extract contract number (C followed by digits and R)
+                contract_match = re.search(r'C\d+R', next_line)
+                if contract_match:
+                    customer_name = line
+                    contract = contract_match.group()
+                    
+                    # Try to extract other data from surrounding lines
+                    phone = ""
+                    stock = ""
+                    make = ""
+                    model = ""
+                    equipment_type = ""
+                    year = ""
+                    serial = ""
+                    date_out = ""
+                    expected = ""
+                    days_over = ""
+                    
+                    # Look in the next few lines for data
+                    for j in range(i, min(i + 5, len(lines))):
+                        current_line = lines[j]
+                        
+                        # Extract phone number
+                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
+                        if phone_match:
+                            phone = phone_match.group()
+                        
+                        # Extract stock number (5 digits)
+                        stock_match = re.search(r'\b\d{5}\b', current_line)
+                        if stock_match:
+                            stock = stock_match.group()
+                        
+                        # Extract make (BOB, KUB, etc.)
+                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
+                        if make_match:
+                            make = make_match.group()
+                        
+                        # Extract model
+                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
+                        if model_match:
+                            model = model_match.group()
+                        
+                        # Extract equipment type
+                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
+                        if type_match:
+                            equipment_type = type_match.group()
+                        
+                        # Extract year
+                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
+                        if year_match:
+                            year = year_match.group()
+                        
+                        # Extract serial number
+                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
+                        if serial_match and len(serial_match.group()) > 6:
+                            serial = serial_match.group()
+                        
+                        # Extract dates
+                        date_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', current_line)
+                        if date_match:
+                            if not date_out:
+                                date_out = date_match.group()
+                            else:
+                                expected = date_match.group()
+                        
+                        # Extract days overdue
+                        days_match = re.search(r'\b\d{1,4}\b', current_line)
+                        if days_match and days_match.group().isdigit():
+                            days_over = days_match.group()
+                    
+                    # Create structured data entry
+                    if customer_name and contract:
+                        data.append({
+                            "customer_name": customer_name,
+                            "contract": contract,
+                            "phone": phone,
+                            "stock_number": stock,
+                            "make": make,
+                            "model": model,
+                            "equipment_type": equipment_type,
+                            "year": year,
+                            "serial": serial,
+                            "date_out": date_out,
+                            "expected_due": expected,
+                            "days_overdue": days_over,
+                            "source": filename,
+                            "report_type": "Overdue Equipment Report"
+                        })
+    
+    return data
+
+def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse Outbound Report data"""
+    data = []
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+    
+    # Look for customer data patterns
+    for i, line in enumerate(lines):
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:  # Customer name pattern
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                contract_match = re.search(r'C\d+R', next_line)
+                if contract_match:
+                    customer_name = line
+                    contract = contract_match.group()
+                    
+                    # Extract other data from surrounding lines
+                    phone = ""
+                    stock = ""
+                    make = ""
+                    model = ""
+                    equipment_type = ""
+                    year = ""
+                    serial = ""
+                    date_time_out = ""
+                    
+                    for j in range(i, min(i + 5, len(lines))):
+                        current_line = lines[j]
+                        
+                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
+                        if phone_match:
+                            phone = phone_match.group()
+                        
+                        stock_match = re.search(r'\b\d{5}\b', current_line)
+                        if stock_match:
+                            stock = stock_match.group()
+                        
+                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
+                        if make_match:
+                            make = make_match.group()
+                        
+                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
+                        if model_match:
+                            model = model_match.group()
+                        
+                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
+                        if type_match:
+                            equipment_type = type_match.group()
+                        
+                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
+                        if year_match:
+                            year = year_match.group()
+                        
+                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
+                        if serial_match and len(serial_match.group()) > 6:
+                            serial = serial_match.group()
+                        
+                        # Extract date/time
+                        datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
+                        if datetime_match:
+                            date_time_out = datetime_match.group()
+                    
+                    if customer_name and contract:
+                        data.append({
+                            "customer_name": customer_name,
+                            "contract": contract,
+                            "phone": phone,
+                            "stock_number": stock,
+                            "make": make,
+                            "model": model,
+                            "equipment_type": equipment_type,
+                            "year": year,
+                            "serial": serial,
+                            "date_time_out": date_time_out,
+                            "source": filename,
+                            "report_type": "Rental Outbound Report"
+                        })
+    
+    return data
+
+def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse Equipment List Report data"""
+    data = []
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+    
+    # Look for equipment data patterns
+    for i, line in enumerate(lines):
+        # Look for stock number patterns
+        stock_match = re.search(r'\b\d{5}\b', line)
+        if stock_match:
+            stock = stock_match.group()
+            
+            # Extract other data from the same line or nearby lines
+            make = ""
+            model = ""
+            equipment_type = ""
+            year = ""
+            serial = ""
+            location = ""
+            meter = ""
+            
+            # Look for make
+            make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', line)
+            if make_match:
+                make = make_match.group()
+            
+            # Look for model
+            model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', line)
+            if model_match:
+                model = model_match.group()
+            
+            # Look for equipment type
+            type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', line)
+            if type_match:
+                equipment_type = type_match.group()
+            
+            # Look for year
+            year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', line)
+            if year_match:
+                year = year_match.group()
+            
+            # Look for serial
+            serial_match = re.search(r'\b[A-Z0-9]{6,}\b', line)
+            if serial_match and len(serial_match.group()) > 6:
+                serial = serial_match.group()
+            
+            # Look for meter reading
+            meter_match = re.search(r'\b\d+\b', line)
+            if meter_match:
+                meter = meter_match.group()
+            
+            data.append({
+                "stock_number": stock,
+                "make": make,
+                "model": model,
+                "equipment_type": equipment_type,
+                "year": year,
+                "serial": serial,
+                "location": location,
+                "meter": meter,
+                "source": filename,
+                "report_type": "Rental Equipment List"
+            })
+    
+    return data
+
 def embed_texts(texts: List[str], project_id: str, location: str, credentials) -> np.ndarray:
     """Generate embeddings for texts"""
     try:
@@ -184,7 +452,7 @@ def save_index_and_corpus(index, corpus: List[Dict]):
         st.error(f"Error saving index: {e}")
 
 def process_kb_files() -> List[Dict]:
-    """Process all KB files and create corpus"""
+    """Process all KB files and create corpus with image data extraction"""
     corpus = []
     
     if not KB_DIR.exists():
@@ -195,22 +463,88 @@ def process_kb_files() -> List[Dict]:
             try:
                 if file_path.suffix.lower() == '.docx':
                     text = extract_text_from_docx_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
                 elif file_path.suffix.lower() == '.pdf':
                     text = extract_text_from_pdf_bytes(file_path.read_bytes())
-                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-                    text = extract_text_from_image_bytes(file_path.read_bytes())
-                else:
-                    continue
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
                 
-                if text.strip():
-                    chunks = chunk_text(text)
-                    for i, chunk in enumerate(chunks):
-                        corpus.append({
-                            "text": chunk,
-                            "source": file_path.name,
-                            "chunk_id": i,
-                            "file_type": file_path.suffix.lower()
-                        })
+                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
+                    # Extract OCR text
+                    ocr_text = extract_text_from_image_bytes(file_path.read_bytes())
+                    if ocr_text.strip():
+                        # Add raw OCR text as chunks
+                        chunks = chunk_text(ocr_text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower(),
+                                "content_type": "ocr_text"
+                            })
+                        
+                        # Parse structured data from OCR
+                        structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
+                        for data_item in structured_data:
+                            # Create searchable text from structured data
+                            searchable_text = f"Report: {data_item.get('report_type', 'Unknown')} "
+                            if 'customer_name' in data_item:
+                                searchable_text += f"Customer: {data_item['customer_name']} "
+                            if 'contract' in data_item:
+                                searchable_text += f"Contract: {data_item['contract']} "
+                            if 'stock_number' in data_item:
+                                searchable_text += f"Stock: {data_item['stock_number']} "
+                            if 'make' in data_item:
+                                searchable_text += f"Make: {data_item['make']} "
+                            if 'model' in data_item:
+                                searchable_text += f"Model: {data_item['model']} "
+                            if 'equipment_type' in data_item:
+                                searchable_text += f"Type: {data_item['equipment_type']} "
+                            if 'year' in data_item:
+                                searchable_text += f"Year: {data_item['year']} "
+                            if 'serial' in data_item:
+                                searchable_text += f"Serial: {data_item['serial']} "
+                            if 'days_overdue' in data_item:
+                                searchable_text += f"Days Overdue: {data_item['days_overdue']} "
+                            if 'date_out' in data_item:
+                                searchable_text += f"Date Out: {data_item['date_out']} "
+                            if 'expected_due' in data_item:
+                                searchable_text += f"Expected Due: {data_item['expected_due']} "
+                            if 'date_time_out' in data_item:
+                                searchable_text += f"Date/Time Out: {data_item['date_time_out']} "
+                            if 'phone' in data_item:
+                                searchable_text += f"Phone: {data_item['phone']} "
+                            if 'location' in data_item:
+                                searchable_text += f"Location: {data_item['location']} "
+                            if 'meter' in data_item:
+                                searchable_text += f"Meter: {data_item['meter']} "
+                            
+                            corpus.append({
+                                "text": searchable_text,
+                                "source": file_path.name,
+                                "chunk_id": len(corpus),
+                                "file_type": file_path.suffix.lower(),
+                                "content_type": "structured_data",
+                                "structured_data": data_item
+                            })
+                
             except Exception as e:
                 st.error(f"Error processing {file_path.name}: {e}")
     
@@ -251,6 +585,25 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
         f"Source: {chunk['source']}\nContent: {chunk['text']}"
         for chunk in context_chunks
     ])
+    
+    # Check if we have structured data that can answer the question directly
+    structured_answers = []
+    for chunk in context_chunks:
+        if chunk.get('content_type') == 'structured_data' and 'structured_data' in chunk:
+            data = chunk['structured_data']
+            # Check if this structured data can answer the query
+            query_lower = query.lower()
+            if any(field in query_lower for field in ['stock', 'contract', 'customer', 'days overdue', 'serial', 'make', 'model']):
+                if 'customer_name' in data and 'customer' in query_lower:
+                    if data['customer_name'].lower() in query_lower:
+                        structured_answers.append(f"Customer: {data['customer_name']}, Contract: {data.get('contract', 'N/A')}, Stock: {data.get('stock_number', 'N/A')}, Make: {data.get('make', 'N/A')}, Model: {data.get('model', 'N/A')}, Days Overdue: {data.get('days_overdue', 'N/A')}, Serial: {data.get('serial', 'N/A')}")
+                elif 'stock_number' in data and 'stock' in query_lower:
+                    if data['stock_number'] in query:
+                        structured_answers.append(f"Stock: {data['stock_number']}, Make: {data.get('make', 'N/A')}, Model: {data.get('model', 'N/A')}, Customer: {data.get('customer_name', 'N/A')}, Contract: {data.get('contract', 'N/A')}, Days Overdue: {data.get('days_overdue', 'N/A')}")
+    
+    # If we have direct structured answers, use them
+    if structured_answers:
+        return "\n\n".join(structured_answers)
     
     # Improved system prompt
     system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
