@@ -1,4 +1,3 @@
-# app.py
 import os
 import io
 import json
@@ -400,30 +399,55 @@ def build_faiss_index(corpus: List[Dict], project_id: str, location: str, creden
     
     return index, corpus
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 2) -> List[Dict]:
-    """Search FAISS index for relevant chunks - limited to 2 sources"""
+def expand_query(query: str) -> str:
+    """Expand query with related terms for better search"""
+    query_lower = query.lower()
+    
+    # Add related terms based on common HBS topics
+    if "overdue" in query_lower:
+        return f"{query} overdue equipment report rental"
+    elif "outbound" in query_lower:
+        return f"{query} outbound report rental equipment"
+    elif "equipment" in query_lower:
+        return f"{query} equipment list rental"
+    elif "customer" in query_lower:
+        return f"{query} customer contract phone"
+    elif "stock" in query_lower:
+        return f"{query} stock number equipment"
+    elif "serial" in query_lower:
+        return f"{query} serial number equipment"
+    else:
+        return query
+
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 2, min_similarity: float = 0.5) -> List[Dict]:
+    """Search FAISS index with query expansion and relevance threshold"""
     if index is None or not corpus:
         return []
     
     try:
+        # Expand query for better search
+        expanded_query = expand_query(query)
+        
         # Generate query embedding
-        query_embeddings = embed_texts([query], project_id, location, credentials)
+        query_embeddings = embed_texts([expanded_query], project_id, location, credentials)
         if query_embeddings.size == 0:
             return []
         
         # Normalize query embedding
         faiss.normalize_L2(query_embeddings)
         
-        # Search - limit to 2 results
-        scores, indices = index.search(query_embeddings, min(2, len(corpus)))
+        # Search - get more results to filter
+        scores, indices = index.search(query_embeddings, min(10, len(corpus)))
         
         results = []
         for score, idx in zip(scores[0], indices[0]):
-            if idx < len(corpus):
+            if idx < len(corpus) and score >= min_similarity:  # Only include relevant results
                 results.append({
                     **corpus[idx],
                     "similarity_score": float(score)
                 })
+                if len(results) >= k:  # Stop when we have enough good results
+                    break
         
         return results
     except Exception as e:
@@ -453,27 +477,20 @@ def save_index_and_corpus(index, corpus: List[Dict]):
         st.error(f"Error saving index: {e}")
 
 def process_kb_files() -> List[Dict]:
-    """Process all KB files and create corpus with image data extraction - DEBUG VERSION"""
+    """Process all KB files and create corpus with image data extraction"""
     corpus = []
     
     if not KB_DIR.exists():
         st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
     
-    st.write(f"🔍 DEBUG: KB_DIR exists: {KB_DIR}")
-    
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
-    st.write(f" DEBUG: Found {len(files)} files in KB directory:")
-    for f in files:
-        st.write(f"  - {f.name} ({f.suffix})")
     
     for file_path in files:
         if file_path.is_file():
-            st.write(f"🔍 DEBUG: Processing {file_path.name}")
             try:
                 if file_path.suffix.lower() == '.docx':
-                    st.write(f"  Processing DOCX: {file_path.name}")
                     text = extract_text_from_docx_bytes(file_path.read_bytes())
                     if text.strip():
                         chunks = chunk_text(text)
@@ -484,12 +501,8 @@ def process_kb_files() -> List[Dict]:
                                 "chunk_id": i,
                                 "file_type": file_path.suffix.lower()
                             })
-                        st.write(f"  ✅ Added {len(chunks)} chunks from DOCX")
-                    else:
-                        st.write(f"  ⚠️ No text extracted from DOCX")
                 
                 elif file_path.suffix.lower() == '.pdf':
-                    st.write(f"  📄 Processing PDF: {file_path.name}")
                     text = extract_text_from_pdf_bytes(file_path.read_bytes())
                     if text.strip():
                         chunks = chunk_text(text)
@@ -500,26 +513,16 @@ def process_kb_files() -> List[Dict]:
                                 "chunk_id": i,
                                 "file_type": file_path.suffix.lower()
                             })
-                        st.write(f"  ✅ Added {len(chunks)} chunks from PDF")
-                    else:
-                        st.write(f"  ⚠️ No text extracted from PDF")
                 
                 elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-                    st.write(f"  🖼️ Processing IMAGE: {file_path.name}")
-                    
                     # Check file size
                     file_size = file_path.stat().st_size
-                    st.write(f"  📊 File size: {file_size} bytes")
-                    
                     if file_size == 0:
-                        st.write(f"  ❌ Image file is empty")
                         continue
                     
                     # Extract OCR text
                     try:
                         ocr_text = extract_text_from_image_bytes(file_path.read_bytes())
-                        st.write(f"  🔤 OCR extracted {len(ocr_text)} characters")
-                        st.write(f"  📝 First 200 chars: {ocr_text[:200]}...")
                         
                         if ocr_text.strip():
                             # Add raw OCR text as chunks
@@ -532,12 +535,10 @@ def process_kb_files() -> List[Dict]:
                                     "file_type": file_path.suffix.lower(),
                                     "content_type": "ocr_text"
                                 })
-                            st.write(f"  ✅ Added {len(chunks)} OCR chunks")
                             
                             # Parse structured data from OCR
                             try:
                                 structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
-                                st.write(f"  🔍 Parsed {len(structured_data)} structured data entries")
                                 
                                 for data_item in structured_data:
                                     # Create searchable text from structured data
@@ -582,37 +583,26 @@ def process_kb_files() -> List[Dict]:
                                         "structured_data": data_item
                                     })
                                 
-                                st.write(f"  ✅ Added {len(structured_data)} structured data entries")
-                                
                             except Exception as e:
-                                st.write(f"  ❌ Error parsing structured data: {e}")
-                        else:
-                            st.write(f"  ⚠️ No OCR text extracted from image")
-                            
+                                pass
+                                
                     except Exception as e:
-                        st.write(f"  ❌ Error extracting OCR: {e}")
-                        import traceback
-                        st.write(f"  📋 Traceback: {traceback.format_exc()}")
-                
-                else:
-                    st.write(f"  ⚠️ Skipping unsupported file type: {file_path.suffix}")
+                        pass
                 
             except Exception as e:
-                st.error(f"❌ Error processing {file_path.name}: {e}")
-                import traceback
-                st.write(f" Traceback: {traceback.format_exc()}")
+                st.error(f"Error processing {file_path.name}: {e}")
     
-    st.write(f"🔍 DEBUG: Total corpus entries created: {len(corpus)}")
     return corpus
 
 def get_conversational_response(query: str) -> str:
     """Handle simple conversational queries"""
     query_lower = query.lower().strip()
     
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    farewells = ["bye", "goodbye", "see you", "farewell", "thanks", "thank you"]
-    casual = ["what's up", "how are you", "how's it going", "what's new"]
-    vague_responses = ["sure", "ok", "okay", "yes", "yep", "yeah", "alright"]
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "greetings"]
+    farewells = ["bye", "goodbye", "see you", "farewell", "thanks", "thank you", "ttyl", "talk to you later"]
+    casual = ["what's up", "how are you", "how's it going", "what's new", "how do you do"]
+    vague_responses = ["sure", "ok", "okay", "yes", "yep", "yeah", "alright", "fine", "good"]
+    compliments = ["good job", "well done", "excellent", "great", "awesome", "amazing"]
     
     if any(greeting in query_lower for greeting in greetings):
         return "Hi! How can I help you?"
@@ -626,15 +616,13 @@ def get_conversational_response(query: str) -> str:
     if any(vague in query_lower for vague in vague_responses):
         return "I'm ready to help! What can I assist you with regarding the HBS system? Please let me know what you need."
     
+    if any(compliment in query_lower for compliment in compliments):
+        return "Thank you! I'm here to help with any HBS system questions you might have."
+    
     return None
 
 def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> str:
     """Generate response using Gemini with improved prompting"""
-    
-    # Check for conversational responses first
-    conversational = get_conversational_response(query)
-    if conversational:
-        return conversational
     
     if not context_chunks:
         return "I don't have information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
@@ -664,7 +652,7 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
     if structured_answers:
         return "\n\n".join(structured_answers)
     
-    # Improved system prompt with better fallback handling
+    # Improved system prompt with relevance checking
     system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
 
 CONTEXT FROM KNOWLEDGE BASE:
@@ -673,16 +661,16 @@ CONTEXT FROM KNOWLEDGE BASE:
 USER QUESTION: {query}
 
 INSTRUCTIONS:
-1. Answer the user's question using ONLY the information provided in the context above
-2. Be specific and detailed in your response
-3. If the context contains step-by-step procedures, provide them clearly
-4. If the context mentions specific options, fields, or settings, list them exactly
-5. If you need to make assumptions, state them clearly
-6. If the context doesn't contain enough information to fully answer the question, say "I don't have enough information to answer that question based on my resources" and suggest what additional information might be needed
-7. If the question is unclear or ambiguous, ask clarifying questions
-8. Always be helpful and professional
-9. For vague requests like "concise version" or "short version", ask what specifically they want to be more concise about
-10. For requests like "in pts" or unclear abbreviations, ask for clarification about what they mean
+1. **FIRST**: Check if the context above is actually relevant to the user's question
+2. If the context is NOT relevant to the question, say "I don't have specific information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
+3. If the context IS relevant, answer the user's question using ONLY the information provided
+4. Be specific and detailed in your response
+5. If the context contains step-by-step procedures, provide them clearly
+6. If the context mentions specific options, fields, or settings, list them exactly
+7. If you need to make assumptions, state them clearly
+8. If the context doesn't contain enough information to fully answer the question, say "I don't have enough information to answer that question based on my resources" and suggest what additional information might be needed
+9. If the question is unclear or ambiguous, ask clarifying questions
+10. Always be helpful and professional
 
 RESPONSE:"""
 
@@ -879,72 +867,85 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # Search for relevant context - limit to 2 sources
-                context_chunks = search_index(
-                    prompt, 
-                    st.session_state.index, 
-                    st.session_state.corpus,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds,
-                    k=2  # Limit to 2 sources
-                )
-                
-                # Generate response
-                response = generate_response(
-                    prompt,
-                    context_chunks,
-                    st.session_state.model_name,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds
-                )
-                
-                st.markdown(response)
-                
-                # Show sources if available - limit to 2
-                if context_chunks:
-                    with st.expander("Sources"):
-                        for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
-                            # Create clickable source link
-                            source_name = chunk['source']
-                            similarity = chunk['similarity_score']
-                            content_preview = chunk['text'][:200] + "..."
-                            
-                            # Try to create a clickable link to the source file
-                            try:
-                                # Check if source file exists in KB directory
-                                source_path = KB_DIR / source_name
-                                if source_path.exists():
-                                    # Create a download link
-                                    with open(source_path, 'rb') as f:
-                                        file_data = f.read()
-                                    
-                                    st.download_button(
-                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
-                                        data=file_data,
-                                        file_name=source_name,
-                                        mime="application/octet-stream",
-                                        key=f"download_{i}_{len(st.session_state.messages)}"
-                                    )
-                                else:
-                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                            except Exception:
-                                st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                            
-                            st.write(content_preview)
-                            st.write("---")
+        # Check if this is a conversational query first
+        conversational_response = get_conversational_response(prompt)
         
-        # Add assistant message
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": response,
-            "sources": context_chunks,
-            "timestamp": len(st.session_state.messages)
-        })
+        with st.chat_message("assistant"):
+            if conversational_response:
+                # For conversational queries, don't search KB or show sources
+                st.markdown(conversational_response)
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": conversational_response,
+                    "timestamp": len(st.session_state.messages)
+                })
+            else:
+                # Only search KB for non-conversational queries
+                with st.spinner("Thinking..."):
+                    # Search for relevant context - limit to 2 sources with relevance threshold
+                    context_chunks = search_index(
+                        prompt, 
+                        st.session_state.index, 
+                        st.session_state.corpus,
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds,
+                        k=2,  # Limit to 2 sources
+                        min_similarity=0.5  # Increased threshold to 0.5
+                    )
+                    
+                    # Generate response
+                    response = generate_response(
+                        prompt,
+                        context_chunks,
+                        st.session_state.model_name,
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds
+                    )
+                    
+                    st.markdown(response)
+                    
+                    # Show sources if available - limit to 2
+                    if context_chunks:
+                        with st.expander("Sources"):
+                            for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
+                                # Create clickable source link
+                                source_name = chunk['source']
+                                similarity = chunk['similarity_score']
+                                content_preview = chunk['text'][:200] + "..."
+                                
+                                # Try to create a clickable link to the source file
+                                try:
+                                    # Check if source file exists in KB directory
+                                    source_path = KB_DIR / source_name
+                                    if source_path.exists():
+                                        # Create a download link
+                                        with open(source_path, 'rb') as f:
+                                            file_data = f.read()
+                                        
+                                        st.download_button(
+                                            label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                            data=file_data,
+                                            file_name=source_name,
+                                            mime="application/octet-stream",
+                                            key=f"download_{i}_{len(st.session_state.messages)}"
+                                        )
+                                    else:
+                                        st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                                except Exception:
+                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                                
+                                st.write(content_preview)
+                                st.write("---")
+                    
+                    # Add assistant message with sources
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "sources": context_chunks,
+                        "timestamp": len(st.session_state.messages)
+                    })
 
     # Image upload (simplified)
     if st.session_state.uploaded_image:
