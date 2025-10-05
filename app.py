@@ -330,15 +330,16 @@ def get_conversation_context(messages: List[Dict]) -> str:
     return " | ".join(context_parts)
 
 def classify_user_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
-    """Use LLM to classify user intent"""
+    """Use LLM to classify user intent with improved error handling"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
         
-        prompt = f"""Classify the user's intent based on their query and conversation context.
+        # Simplified prompt for better reliability
+        prompt = f"""Analyze this user query and conversation context to determine the user's intent.
 
-Query: "{query}"
-Context: "{conversation_context}"
+User Query: "{query}"
+Conversation Context: "{conversation_context}"
 
 Classify the intent as one of these categories:
 - "greeting": Hello, hi, hey, good morning, etc.
@@ -349,25 +350,32 @@ Classify the intent as one of these categories:
 - "new_question": A completely new question or topic
 
 Respond with ONLY a JSON object in this exact format:
-{{"intent": "category", "confidence": 0.8, "reasoning": "brief explanation"}}
-
-Do not include any other text, just the JSON object.""
+{{"intent": "category", "confidence": 0.8, "reasoning": "brief explanation"}}"""
 
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         
+        # Clean up the response text
+        response_text = response_text.replace('```json', '').replace('```', '').strip()
+        
         # Try to parse JSON
         try:
             result = json.loads(response_text)
-            return result
-        except json.JSONDecodeError:
-            # If JSON parsing fails, try to extract JSON from response
-            json_match = re.search(r'\{[^}]*\}', response_text)
-            if json_match:
-                result = json.loads(json_match.group())
+            # Validate the result
+            if 'intent' in result and result['intent'] in ['greeting', 'farewell', 'clarification', 'troubleshooting', 'alternative', 'new_question']:
                 return result
             else:
-                return {"intent": "new_question", "confidence": 0.5, "reasoning": "Failed to parse classification response"}
+                return {"intent": "new_question", "confidence": 0.5, "reasoning": "Invalid intent category"}
+        except json.JSONDecodeError:
+            # Try to extract intent from text
+            if 'clarification' in response_text.lower() or 'understand' in response_text.lower():
+                return {"intent": "clarification", "confidence": 0.7, "reasoning": "Extracted from text"}
+            elif 'troubleshooting' in response_text.lower() or 'working' in response_text.lower():
+                return {"intent": "troubleshooting", "confidence": 0.7, "reasoning": "Extracted from text"}
+            elif 'alternative' in response_text.lower() or 'other' in response_text.lower():
+                return {"intent": "alternative", "confidence": 0.7, "reasoning": "Extracted from text"}
+            else:
+                return {"intent": "new_question", "confidence": 0.5, "reasoning": "Failed to parse, defaulting to new_question"}
                 
     except Exception as e:
         st.error(f"Error in intent classification: {e}")
@@ -391,8 +399,8 @@ def get_conversational_response(query: str) -> str:
     
     return None
 
-def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response using Gemini with context"""
+def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, intent: str = "new_question") -> str:
+    """Generate response using Gemini with context and intent awareness"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
@@ -410,6 +418,15 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
         if structured_data:
             structured_text = f"\n\nStructured Data Found:\n{json.dumps(structured_data, indent=2)}"
         
+        # Intent-aware system prompt
+        intent_guidance = ""
+        if intent == "clarification":
+            intent_guidance = "The user is asking for clarification. Provide a clear, detailed explanation of the previous topic discussed."
+        elif intent == "troubleshooting":
+            intent_guidance = "The user is having trouble with something. Provide specific troubleshooting steps and ask for more details about what's not working."
+        elif intent == "alternative":
+            intent_guidance = "The user is asking for alternative methods. Acknowledge what you've shared and explain if you don't have information about other approaches."
+        
         system_prompt = f"""You are a helpful HBS (Heavy Business Systems) support assistant. You help users with HBS software, reports, and procedures.
 
 Context from Knowledge Base:
@@ -421,7 +438,7 @@ Instructions:
 3. If the context doesn't contain enough information, say so clearly
 4. Use the structured data to provide specific examples (stock numbers, dates, etc.)
 5. Be helpful and professional
-6. If asked about alternatives or other methods, acknowledge what you've shared and explain if you don't have information about other approaches
+6. {intent_guidance}
 
 User Question: {query}
 
@@ -611,8 +628,9 @@ def main():
             context_chunks = search_index(prompt, index, corpus, project_id, location, credentials)
             
             if context_chunks:
-                # Generate response with context
-                response = generate_response(prompt, context_chunks, model_name, project_id, location, credentials)
+                # Generate response with context and intent
+                intent = intent_result.get('intent', 'new_question')
+                response = generate_response(prompt, context_chunks, model_name, project_id, location, credentials, intent)
                 
                 with st.chat_message("assistant"):
                     st.markdown(response)
@@ -657,7 +675,7 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
             else:
-                # No relevant context found
+                # No relevant context found - use intent-aware responses
                 intent = intent_result.get('intent', 'new_question')
                 
                 if intent == 'clarification':
