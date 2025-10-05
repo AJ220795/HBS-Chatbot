@@ -25,7 +25,7 @@ from PIL import Image as PILImage
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
-KB_DIR = DATA_DIR / "kb"
+KB_DIR = APP_DIR / "kb"
 EXTRACT_DIR = DATA_DIR / "kb_extracted"
 INDEX_PATH = DATA_DIR / "faiss.index"
 CORPUS_PATH = DATA_DIR / "corpus.json"
