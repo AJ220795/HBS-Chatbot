@@ -681,12 +681,10 @@ Be precise and consider the semantic meaning, not just keywords."""
         )
         
         if response.text:
-            # Try to parse JSON response
             try:
                 result = json.loads(response.text.strip())
                 return result
             except json.JSONDecodeError:
-                # Fallback if JSON parsing fails
                 return {
                     "intent": "new_question",
                     "confidence": 0.5,
@@ -1060,8 +1058,6 @@ def main():
                                         # Create a download link
                                         with open(source_path, 'rb') as f:
                                             file_data = f.read()
-                                        
-                                        # ... (all the previous code remains the same until line ~1060) ...
 
                                         st.download_button(
                                             label=f"📄 {source_name} (similarity: {similarity:.3f})",
