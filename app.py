@@ -621,10 +621,108 @@ def get_conversational_response(query: str) -> str:
     
     return None
 
-def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response using Gemini with improved prompting"""
+def get_conversation_context(messages: List[Dict], max_context: int = 3) -> str:
+    """Extract conversation context from recent messages"""
+    if len(messages) < 2:
+        return ""
+    
+    # Get the last few exchanges (excluding the current question)
+    recent_messages = messages[-max_context*2:]  # Get last 6 messages (3 exchanges)
+    
+    context_parts = []
+    for msg in recent_messages:
+        if msg["role"] == "user":
+            context_parts.append(f"User: {msg['content']}")
+        elif msg["role"] == "assistant":
+            # Only include the first part of assistant responses (before sources)
+            content = msg['content'].split('\n\n')[0]  # Get first paragraph
+            context_parts.append(f"Assistant: {content}")
+    
+    return "\n".join(context_parts)
+
+def classify_user_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
+    """Use LLM to classify user intent semantically"""
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        classification_prompt = f"""Analyze the user's query and classify their intent. Consider the conversation context.
+
+CONVERSATION CONTEXT:
+{conversation_context}
+
+USER QUERY: {query}
+
+Classify the user's intent into one of these categories:
+
+1. "troubleshooting" - User is having problems following previous instructions, things aren't working, can't find something, getting errors, etc.
+2. "clarification" - User wants more explanation, doesn't understand something, wants simpler terms, more details, etc.
+3. "alternative" - User is asking for other methods, alternatives, different approaches, etc.
+4. "new_question" - User is asking a completely new question unrelated to previous conversation
+5. "conversational" - Simple greetings, farewells, casual chat
+
+Respond with ONLY a JSON object in this exact format:
+{{
+    "intent": "one_of_the_categories_above",
+    "confidence": 0.95,
+    "reasoning": "brief explanation of why this classification was chosen"
+}}
+
+Be precise and consider the semantic meaning, not just keywords."""
+
+        response = model.generate_content(
+            classification_prompt,
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+                top_p=0.8,
+                top_k=40
+            )
+        )
+        
+        if response.text:
+            # Try to parse JSON response
+            try:
+                result = json.loads(response.text.strip())
+                return result
+            except json.JSONDecodeError:
+                # Fallback if JSON parsing fails
+                return {
+                    "intent": "new_question",
+                    "confidence": 0.5,
+                    "reasoning": "Failed to parse classification response"
+                }
+        else:
+            return {
+                "intent": "new_question", 
+                "confidence": 0.5,
+                "reasoning": "No response from classification model"
+            }
+    
+    except Exception as e:
+        return {
+            "intent": "new_question",
+            "confidence": 0.3,
+            "reasoning": f"Classification error: {str(e)}"
+        }
+
+def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, conversation_context: str = "", user_intent: Dict = None) -> str:
+    """Generate response using Gemini with improved prompting and conversation context"""
     
     if not context_chunks:
+        # Handle different intents when no relevant context is found
+        if user_intent and user_intent.get("intent") in ["troubleshooting", "clarification", "alternative"]:
+            intent = user_intent["intent"]
+            
+            if intent == "troubleshooting":
+                return "I understand you're having trouble with the steps I provided. Let me help troubleshoot this. Can you tell me:\n\n1. Which specific step are you stuck on?\n2. What exactly happens when you try to follow the instructions?\n3. Are you seeing any error messages?\n\nThis will help me provide more targeted assistance."
+            
+            elif intent == "clarification":
+                return "I'd be happy to clarify! Based on our previous conversation, could you let me know which specific part you'd like me to explain in more detail? I can break it down step by step or use simpler terms."
+            
+            elif intent == "alternative":
+                return "I don't have information about alternative methods for that topic in my knowledge base. Based on what I've shared, the main approach is what I described earlier. If you have a specific aspect you'd like to explore further, please let me know!"
+        
         return "I don't have information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
     
     # Build context from retrieved chunks
@@ -652,10 +750,28 @@ def generate_response(query: str, context_chunks: List[Dict], model_name: str, p
     if structured_answers:
         return "\n\n".join(structured_answers)
     
-    # Improved system prompt with relevance checking
+    # Build conversation context for the prompt
+    context_section = ""
+    if conversation_context:
+        context_section = f"""
+RECENT CONVERSATION CONTEXT:
+{conversation_context}
+
+"""
+    
+    # Add intent information to the prompt
+    intent_section = ""
+    if user_intent and user_intent.get("intent") in ["troubleshooting", "clarification", "alternative"]:
+        intent_section = f"""
+USER INTENT: {user_intent['intent']} (confidence: {user_intent.get('confidence', 0):.2f})
+REASONING: {user_intent.get('reasoning', '')}
+
+"""
+    
+    # Improved system prompt with conversation context and intent awareness
     system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
 
-CONTEXT FROM KNOWLEDGE BASE:
+{context_section}{intent_section}CONTEXT FROM KNOWLEDGE BASE:
 {context_text}
 
 USER QUESTION: {query}
@@ -664,13 +780,17 @@ INSTRUCTIONS:
 1. **FIRST**: Check if the context above is actually relevant to the user's question
 2. If the context is NOT relevant to the question, say "I don't have specific information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
 3. If the context IS relevant, answer the user's question using ONLY the information provided
-4. Be specific and detailed in your response
-5. If the context contains step-by-step procedures, provide them clearly
-6. If the context mentions specific options, fields, or settings, list them exactly
-7. If you need to make assumptions, state them clearly
-8. If the context doesn't contain enough information to fully answer the question, say "I don't have enough information to answer that question based on my resources" and suggest what additional information might be needed
-9. If the question is unclear or ambiguous, ask clarifying questions
-10. Always be helpful and professional
+4. **IMPORTANT**: Consider the user's intent:
+   - If intent is "troubleshooting": Provide step-by-step troubleshooting guidance
+   - If intent is "clarification": Explain in simpler terms with more detail
+   - If intent is "alternative": Acknowledge the request and explain limitations
+5. Be specific and detailed in your response
+6. If the context contains step-by-step procedures, provide them clearly
+7. If the context mentions specific options, fields, or settings, list them exactly
+8. If you need to make assumptions, state them clearly
+9. If the context doesn't contain enough information to fully answer the question, say "I don't have enough information to answer that question based on my resources" and suggest what additional information might be needed
+10. If the question is unclear or ambiguous, ask clarifying questions
+11. Always be helpful and professional
 
 RESPONSE:"""
 
@@ -880,9 +1000,24 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
             else:
-                # Only search KB for non-conversational queries
+                # Get conversation context
+                conversation_context = get_conversation_context(st.session_state.messages)
+                
+                # Classify user intent using LLM
+                user_intent = None
+                if conversation_context:  # Only classify if there's conversation context
+                    with st.spinner("Understanding your request..."):
+                        user_intent = classify_user_intent(
+                            prompt,
+                            conversation_context,
+                            st.session_state.model_name,
+                            st.session_state.project_id,
+                            st.session_state.location,
+                            st.session_state.creds
+                        )
+                
+                # Search for relevant context
                 with st.spinner("Thinking..."):
-                    # Search for relevant context - limit to 2 sources with relevance threshold
                     context_chunks = search_index(
                         prompt, 
                         st.session_state.index, 
@@ -894,14 +1029,16 @@ def main():
                         min_similarity=0.5  # Increased threshold to 0.5
                     )
                     
-                    # Generate response
+                    # Generate response with conversation context and intent
                     response = generate_response(
                         prompt,
                         context_chunks,
                         st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
-                        st.session_state.creds
+                        st.session_state.creds,
+                        conversation_context,
+                        user_intent
                     )
                     
                     st.markdown(response)
@@ -925,46 +1062,4 @@ def main():
                                             file_data = f.read()
                                         
                                         st.download_button(
-                                            label=f"📄 {source_name} (similarity: {similarity:.3f})",
-                                            data=file_data,
-                                            file_name=source_name,
-                                            mime="application/octet-stream",
-                                            key=f"download_{i}_{len(st.session_state.messages)}"
-                                        )
-                                    else:
-                                        st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                                except Exception:
-                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                                
-                                st.write(content_preview)
-                                st.write("---")
-                    
-                    # Add assistant message with sources
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": response,
-                        "sources": context_chunks,
-                        "timestamp": len(st.session_state.messages)
-                    })
-
-    # Image upload (simplified)
-    if st.session_state.uploaded_image:
-        st.image(st.session_state.uploaded_image, caption="Uploaded Image", use_column_width=True)
-        
-        if st.button("Ask about this image", key="ask_image_btn"):
-            with st.spinner("Analyzing image..."):
-                image_bytes = st.session_state.uploaded_image.getvalue()
-                response = generate_image_response(
-                    "What do you see in this image?",
-                    image_bytes,
-                    st.session_state.model_name,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds
-                )
-                st.write(response)
-                st.session_state.uploaded_image = None
-                st.rerun()
-
-if __name__ == "__main__":
-    main()
+                                            label=f"📄 {source_name} (s
