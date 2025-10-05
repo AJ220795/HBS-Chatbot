@@ -1061,5 +1061,49 @@ def main():
                                         with open(source_path, 'rb') as f:
                                             file_data = f.read()
                                         
+                                        # ... (all the previous code remains the same until line ~1060) ...
+
                                         st.download_button(
-                                            label=f"📄 {source_name} (s
+                                            label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                            data=file_data,
+                                            file_name=source_name,
+                                            mime="application/octet-stream",
+                                            key=f"download_{i}_{len(st.session_state.messages)}"
+                                        )
+                                    else:
+                                        st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                                except Exception:
+                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                                
+                                st.write(content_preview)
+                                st.write("---")
+                    
+                    # Add assistant message with sources
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "sources": context_chunks,
+                        "timestamp": len(st.session_state.messages)
+                    })
+
+    # Image upload (simplified)
+    if st.session_state.uploaded_image:
+        st.image(st.session_state.uploaded_image, caption="Uploaded Image", use_column_width=True)
+        
+        if st.button("Ask about this image", key="ask_image_btn"):
+            with st.spinner("Analyzing image..."):
+                image_bytes = st.session_state.uploaded_image.getvalue()
+                response = generate_image_response(
+                    "What do you see in this image?",
+                    image_bytes,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                st.write(response)
+                st.session_state.uploaded_image = None
+                st.rerun()
+
+if __name__ == "__main__":
+    main()
