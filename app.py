@@ -987,10 +987,7 @@ def main():
         
         # Check if this is a conversational query first
         conversational_response = get_conversational_response(prompt)
-        # Add these debug lines right after it:
-        st.write(f"🔍 DEBUG: Conversation context: '{conversation_context}'")
-        st.write(f"🔍 DEBUG: Messages count: {len(st.session_state.messages)}")
-        st.write(f"🔍 DEBUG: Last few messages: {st.session_state.messages[-3:] if len(st.session_state.messages) >= 3 else st.session_state.messages}")
+        
         with st.chat_message("assistant"):
             if conversational_response:
                 # For conversational queries, don't search KB or show sources
@@ -1004,6 +1001,11 @@ def main():
                 # Get conversation context
                 conversation_context = get_conversation_context(st.session_state.messages)
                 
+                # DEBUG: Add these lines here
+                st.write(f"🔍 DEBUG: Conversation context: '{conversation_context}'")
+                st.write(f"🔍 DEBUG: Messages count: {len(st.session_state.messages)}")
+                st.write(f"🔍 DEBUG: Last few messages: {st.session_state.messages[-3:] if len(st.session_state.messages) >= 3 else st.session_state.messages}")
+                
                 # Classify user intent using LLM
                 user_intent = None
                 if conversation_context:  # Only classify if there's conversation context
@@ -1016,6 +1018,7 @@ def main():
                             st.session_state.location,
                             st.session_state.creds
                         )
+                        st.write(f"🔍 DEBUG: Intent detected: {user_intent}")
                 
                 # Search for relevant context
                 with st.spinner("Thinking..."):
@@ -1052,8 +1055,7 @@ def main():
                                 source_name = chunk['source']
                                 similarity = chunk['similarity_score']
                                 content_preview = chunk['text'][:200] + "..."
-                                
-                                # Try to create a clickable link to the source file
+                                 # Try to create a clickable link to the source file
                                 try:
                                     # Check if source file exists in KB directory
                                     source_path = KB_DIR / source_name
@@ -1061,7 +1063,7 @@ def main():
                                         # Create a download link
                                         with open(source_path, 'rb') as f:
                                             file_data = f.read()
-
+                                        
                                         st.download_button(
                                             label=f"📄 {source_name} (similarity: {similarity:.3f})",
                                             data=file_data,
