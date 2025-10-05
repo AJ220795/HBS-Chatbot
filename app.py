@@ -350,7 +350,7 @@ Classify the intent as one of these categories:
 - "new_question": A completely new question or topic
 
 Respond with ONLY a JSON object in this exact format:
-{{"intent": "category", "confidence": 0.8, "reasoning": "brief explanation"}}"""
+{{"intent": "category", "confidence": 0.8, "reasoning": "brief explanation"}}""
 
         response = model.generate_content(prompt)
         response_text = response.text.strip()
