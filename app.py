@@ -478,20 +478,15 @@ Be specific and reference actual data from the image when possible."""
         st.error(f"Error analyzing image: {e}")
         return "I apologize, but I encountered an error while analyzing the image. Please try again."
 
-@st.cache_resource
 def initialize_app():
-    """Initialize the app and load/build index"""
-    if not st.session_state.get('kb_loaded', False):
+    """Initialize the app and load/build index - FIXED VERSION"""
+    try:
         # Load credentials
-        try:
-            credentials = service_account.Credentials.from_service_account_info(
-                st.secrets["vertex_ai_credentials"]
-            )
-            project_id = st.secrets["project_id"]
-            location = st.secrets.get("location", DEFAULT_LOCATION)
-        except Exception as e:
-            st.error(f"Error loading credentials: {e}")
-            return None, None, None, None
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["vertex_ai_credentials"]
+        )
+        project_id = st.secrets["project_id"]
+        location = st.secrets.get("location", DEFAULT_LOCATION)
         
         # Try to load existing index
         index, corpus = load_index_and_corpus()
@@ -508,10 +503,11 @@ def initialize_app():
                 st.error("❌ No files found in knowledge base directory")
                 return None, None, None, None
         
-        st.session_state.kb_loaded = True
         return index, corpus, project_id, location, credentials
-    
-    return None, None, None, None
+        
+    except Exception as e:
+        st.error(f"Error initializing app: {e}")
+        return None, None, None, None
 
 def main():
     st.set_page_config(
@@ -526,12 +522,15 @@ def main():
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
     
-    # Initialize app
+    # Initialize app - FIXED: Removed @st.cache_resource decorator
     index, corpus, project_id, location, credentials = initialize_app()
     
     if index is None:
         st.error("Failed to initialize app. Please check your configuration.")
         return
+    
+    # Set KB loaded status
+    st.session_state.kb_loaded = True
     
     # Sidebar
     with st.sidebar:
@@ -555,7 +554,11 @@ def main():
         # Rebuild index button
         if st.button("🔄 Rebuild Index", key="rebuild_btn"):
             st.session_state.kb_loaded = False
-            st.cache_resource.clear()
+            # Clear any cached data
+            if 'index' in st.session_state:
+                del st.session_state['index']
+            if 'corpus' in st.session_state:
+                del st.session_state['corpus']
             st.rerun()
     
     # Main chat interface
