@@ -21,7 +21,7 @@ import cv2
 import pytesseract
 from PIL import Image as PILImage
 
-# LangChain imports - corrected for newer versions
+# LangChain imports 
 try:
     from langchain_community.llms import VertexAI
     from langchain.memory import ConversationBufferWindowMemory
