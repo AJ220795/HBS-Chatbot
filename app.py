@@ -993,12 +993,22 @@ def main():
                         st.write(content_preview)
                         st.write("---")
 
-    # Chat input
-    if prompt := st.chat_input("Ask me anything about HBS systems..."):
-        # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+     # Chat input with image upload
+    col1, col2 = st.columns([6, 1])
+    
+    with col1:
+        prompt = st.chat_input("Ask me anything about HBS systems...")
+    
+    with col2:
+        uploaded_image = st.file_uploader(
+            "📷",
+            type=['png', 'jpg', 'jpeg'],
+            key="image_upload",
+            help="Upload an image to ask questions about it"
+        )
+
+    # Process user input
+    if prompt:
         
         # Check if this is a conversational query first
         conversational_response = get_conversational_response(prompt)
@@ -1082,7 +1092,7 @@ def main():
                             except Exception as e:
                                 st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
                     
-                    # Handle image upload
+                     # Handle image upload
                     if uploaded_image:
                         try:
                             image_bytes = uploaded_image.read()
@@ -1108,3 +1118,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+ # Handle image upload separately (outside the prompt processing)
+    if uploaded_image:
+        try:
+            image_bytes = uploaded_image.read()
+            with st.spinner("Analyzing image..."):
+                image_response = generate_image_response(
+                    "Please analyze this image and provide relevant information.", 
+                    image_bytes, 
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": f"**Image Analysis:**\n\n{image_response}",
+                    "timestamp": len(st.session_state.messages)
+                })
+        except Exception as e:
+            st.error(f"Error processing image: {str(e)}")
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": "Sorry, I couldn't process the image. Please try again.",
+                "timestamp": len(st.session_state.messages)
+            })
+        
+        # Clear the uploaded image after processing
+        st.session_state.uploaded_image = None
+        st.rerun()
