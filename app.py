@@ -1234,8 +1234,6 @@ def main():
         
         # Get conversation context
         conversation_context = ""
-        if len(st.session_state.messages) > 1:
-            conversation_context = get_conversation_context(st.session_state.messages)
         
         # Analyze user sentiment and intent semantically
         with st.spinner("Understanding your request..."):
