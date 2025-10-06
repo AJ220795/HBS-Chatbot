@@ -1115,7 +1115,7 @@ def main():
                         save_index_and_corpus(index, corpus)
                         st.session_state.index = index
                         st.session_state.corpus = corpus
-                                                st.session_state.kb_loaded = True
+                        st.session_state.kb_loaded = True
                         st.success("Index rebuilt successfully!")
                         st.rerun()
                     else:
