@@ -673,25 +673,13 @@ def kb_has_files() -> bool:
 
 # ---- Streamlit App ----
 def main():
-    st.set_page_config(page_title="HBS Help Chatbot", page_icon="🤖", layout="wide")
-
-    if not LANGCHAIN_AVAILABLE:
-        st.info("LangChain not available. Using fallback conversation handling.")
-
-    # CSS
-    st.markdown("""
-    <style>
-    .main .block-container { padding-top: 1rem; padding-bottom: 0rem; max-width: 100%; }
-    .chat-message { margin: 10px 0; padding: 12px 16px; border-radius: 18px; max-width: 80%; word-wrap: break-word; }
-    .message-user { background-color: #007bff; color: white; margin-left: auto; border-radius: 18px 18px 5px 18px; }
-    .message-assistant { background-color: #f1f3f4; color: #333; margin-right: auto; border-radius: 18px 18px 18px 5px; }
-    .sources-box { background-color: #e3f2fd; padding: 8px 12px; border-radius: 8px; margin-top: 8px; font-size: 0.9em; border-left: 3px solid #2196f3; }
-    .intent-box { background-color: #fff3cd; padding: 6px 10px; border-radius: 8px; margin-top: 6px; font-size: 0.9em; border-left: 3px solid #ffca2c; }
-    .stChatInput > div > div > input { border-radius: 25px; border: 2px solid #e0e0e0; padding: 12px 20px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Session state
+    st.set_page_config(
+        page_title="HBS Help Chatbot",
+        page_icon="🤖",
+        layout="wide"
+    )
+    
+    # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "index" not in st.session_state:
@@ -708,18 +696,12 @@ def main():
         st.session_state.model_name = CANDIDATE_MODELS[0]
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
-    if "telemetry" not in st.session_state:
-        st.session_state.telemetry = {}
+    if "uploaded_image" not in st.session_state:
+        st.session_state.uploaded_image = None
+    if "pending_message" not in st.session_state:
+        st.session_state.pending_message = None
 
-    # Seed a welcome message so it stays above the user's first message
-    if not st.session_state.messages:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "Hi! How can I help you?",
-            "welcome": True,
-        })
-
-    # Credentials
+    # Initialize credentials
     try:
         sa_info = json.loads(st.secrets["google"]["credentials_json"])
         st.session_state.creds = service_account.Credentials.from_service_account_info(sa_info)
@@ -729,222 +711,331 @@ def main():
         st.error(f"Error loading credentials: {e}")
         st.stop()
 
-    # Load prior meta & cache
-    prev_meta = read_json(META_PATH, {})
-    emb_cache = read_json(EMB_CACHE_PATH, {})
+    # Initialize app
+    @st.cache_resource
+    def initialize_app():
+        """Initialize the app - load index or build from KB files"""
+        # Try to load existing index first
+        index, corpus = load_index_and_corpus()
+        if index is not None and corpus:
+            return index, corpus, True
+        
+        # Build index from KB files
+        corpus = process_kb_files()
+        if not corpus:
+            return None, [], False
+        
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+        if index is not None:
+            save_index_and_corpus(index, corpus)
+            return index, corpus, True
+        
+        return None, [], False
 
-    # --- Auto-heal KB state each run ---
-    if st.session_state.index is None or not st.session_state.corpus:
-        idx, corp = load_saved_index_and_corpus()
-        if idx is not None and corp:
-            st.session_state.index = idx
-            st.session_state.corpus = corp
-
-    if (st.session_state.index is None or not st.session_state.corpus) and kb_has_files():
-        with st.spinner("Initializing knowledge base..."):
-            new_corpus, new_meta, telemetry = process_kb_files_incremental([], prev_meta)
-            idx = build_faiss_index_with_cache(
-                new_corpus,
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.creds,
-                emb_cache
-            )
-            if idx is not None and new_corpus:
-                faiss.write_index(idx, str(INDEX_PATH))
-                write_json(CORPUS_PATH, new_corpus)
-                write_json(META_PATH, new_meta)
-                write_json(EMB_CACHE_PATH, emb_cache)
-                st.session_state.index = idx
-                st.session_state.corpus = new_corpus
-                st.session_state.telemetry = telemetry
-
-    # Derive kb_loaded from actual state
-    st.session_state.kb_loaded = bool(st.session_state.index) and bool(st.session_state.corpus)
+    # Initialize
+    if not st.session_state.kb_loaded:
+        with st.spinner("Loading knowledge base..."):
+            index, corpus, loaded = initialize_app()
+            st.session_state.index = index
+            st.session_state.corpus = corpus
+            st.session_state.kb_loaded = loaded
 
     # Sidebar
     with st.sidebar:
         st.header("HBS Help Chatbot")
-
+        
+        # Status
         if st.session_state.kb_loaded:
             st.success(f"✅ Knowledge base loaded ({len(st.session_state.corpus)} chunks)")
         else:
             st.error("❌ Knowledge base not loaded")
-
+        
+        # Model selection
         st.subheader("Model Settings")
-        st.session_state.model_name = st.selectbox("Select Model", CANDIDATE_MODELS, index=0, key="model_select")
-
-        st.subheader("Display")
-        show_intent = st.checkbox("Show detected intent", value=False, key="show_intent")
-
-        # Rebuild index (incremental)
-        if st.button("🔄 Rebuild Index (Incremental)", key="rebuild_btn"):
-            with st.spinner("Rebuilding index (incremental)..."):
-                # reload meta to ensure latest snapshot
-                latest_meta = read_json(META_PATH, {})
-                new_corpus, new_meta, telemetry = process_kb_files_incremental(st.session_state.corpus, latest_meta)
-                idx = build_faiss_index_with_cache(
-                    new_corpus,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds,
-                    emb_cache
-                )
-                if idx is not None and len(new_corpus) > 0:
-                    faiss.write_index(idx, str(INDEX_PATH))
-                    write_json(CORPUS_PATH, new_corpus)
-                    write_json(META_PATH, new_meta)
-                    write_json(EMB_CACHE_PATH, emb_cache)
-                    st.session_state.index = idx
-                    st.session_state.corpus = new_corpus
-                    st.session_state.kb_loaded = True
-                    st.session_state.telemetry = telemetry
-                    st.success("Index rebuilt successfully!")
-                    st.rerun()
+        st.session_state.model_name = st.selectbox(
+            "Select Model",
+            CANDIDATE_MODELS,
+            index=0,
+            key="model_select"
+        )
+        
+        # Rebuild index button
+        if st.button("🔄 Rebuild Index", key="rebuild_btn"):
+            with st.spinner("Rebuilding index..."):
+                corpus = process_kb_files()
+                if corpus:
+                    index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+                    if index is not None:
+                        save_index_and_corpus(index, corpus)
+                        st.session_state.index = index
+                        st.session_state.corpus = corpus
+                        st.session_state.kb_loaded = True
+                        st.success("Index rebuilt successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to build index")
                 else:
-                    st.error("Failed to build index")
-
-        # Telemetry
-        with st.expander("📈 Telemetry / Logs"):
-            tel = st.session_state.telemetry or {}
-            st.write("- Files: total **{files_total}**, new **{files_new}**, modified **{files_modified}**, "
-                     "unchanged **{files_unchanged}**, deleted **{files_deleted}**"
-                     .format(**{k: tel.get(k, 0) for k in ["files_total","files_new","files_modified","files_unchanged","files_deleted"]}))
-            st.write(f"- Chunks total: **{tel.get('chunks_total', 0)}**")
-            st.write(f"- OCR failures: **{tel.get('ocr_failures', 0)}**, Structured parse failures: **{tel.get('structured_parse_failures', 0)}**")
-            # KB folder health
-            try:
-                items = [p.name for p in KB_DIR.iterdir() if p.is_file()]
-                st.write(f"- KB_DIR: `{KB_DIR.resolve()}` — {len(items)} file(s)")
-                if items:
-                    st.code("\n".join(items[:20]), language="text")
-            except Exception as e:
-                st.write(f"- KB_DIR not readable: {e}")
-
+                    st.error("No KB files found")
+        
+        # Clear conversation button
         if st.button("🗑️ Clear Conversation", key="clear_btn"):
-            st.session_state.messages = [{
-                "role": "assistant",
-                "content": "Hi! How can I help you?",
-                "welcome": True,
-            }]
+            st.session_state.messages = []
             st.rerun()
 
-    # Render helpers
-    def render_sources(sources: List[Dict], key_prefix: str = ""):
-        if not sources:
-            return
-        with st.expander("Sources"):
-            for i, src in enumerate(sources[:2]):  # limit 2
-                source_name = src.get("source", "Unknown")
-                similarity = float(src.get("similarity_score", 0.0))
-                st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
-                try:
-                    sp = KB_DIR / source_name
-                    if sp.exists():
-                        st.download_button(
-                            label=f"Download {source_name}",
-                            data=sp.read_bytes(),
-                            file_name=source_name,
-                            mime="application/octet-stream",
-                            key=f"{key_prefix}dl_{i}_{len(st.session_state.messages)}"
-                        )
-                except Exception:
-                    pass
-                preview = src.get("text", "")
-                if preview:
-                    st.caption(preview[:300] + ("..." if len(preview) > 300 else ""))
-                st.write("---")
-
-    # Title
-    st.title("HBS Help Chatbot")
-
-    # Display chat messages
-    for idx, message in enumerate(st.session_state.messages):
+    # Create custom HTML chat interface
+    chat_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{
+                margin: 0;
+                padding: 0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                height: 100vh;
+                overflow: hidden;
+            }}
+            
+            .chat-container {{
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+                background: #f8f9fa;
+            }}
+            
+            .chat-header {{
+                background: white;
+                padding: 1rem;
+                border-bottom: 1px solid #e0e0e0;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                z-index: 1000;
+            }}
+            
+            .chat-messages {{
+                flex: 1;
+                overflow-y: auto;
+                padding: 1rem;
+                display: flex;
+                flex-direction: column;
+                gap: 1rem;
+            }}
+            
+            .message {{
+                max-width: 70%;
+                padding: 12px 16px;
+                border-radius: 18px;
+                word-wrap: break-word;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            
+            .message-user {{
+                background: #007bff;
+                color: white;
+                margin-left: auto;
+                border-radius: 18px 18px 5px 18px;
+            }}
+            
+            .message-assistant {{
+                background: white;
+                color: #333;
+                margin-right: auto;
+                border-radius: 18px 18px 18px 5px;
+                border: 1px solid #e0e0e0;
+            }}
+            
+            .sources {{
+                background: #e3f2fd;
+                padding: 8px 12px;
+                border-radius: 8px;
+                margin-top: 8px;
+                font-size: 0.9em;
+                border-left: 3px solid #2196f3;
+            }}
+            
+            .chat-input-container {{
+                background: white;
+                padding: 1rem;
+                border-top: 1px solid #e0e0e0;
+                display: flex;
+                gap: 1rem;
+                align-items: center;
+            }}
+            
+            .chat-input {{
+                flex: 1;
+                padding: 12px 20px;
+                border: 2px solid #e0e0e0;
+                border-radius: 25px;
+                font-size: 16px;
+                outline: none;
+            }}
+            
+            .chat-input:focus {{
+                border-color: #007bff;
+                box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
+            }}
+            
+            .send-button {{
+                background: #007bff;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 25px;
+                cursor: pointer;
+                font-size: 16px;
+            }}
+            
+            .send-button:hover {{
+                background: #0056b3;
+            }}
+            
+            .upload-button {{
+                background: #6c757d;
+                color: white;
+                border: none;
+                padding: 12px;
+                border-radius: 50%;
+                cursor: pointer;
+                width: 48px;
+                height: 48px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="chat-container">
+            <div class="chat-header">
+                <h1>HBS Help Chatbot</h1>
+            </div>
+            
+            <div class="chat-messages" id="chatMessages">
+                <div class="message message-assistant">Hi! How can I help you?</div>
+    """
+    
+    # Add existing messages
+    for message in st.session_state.messages:
         if message["role"] == "user":
-            st.markdown(f'<div class="chat-message message-user">{message["content"]}</div>', unsafe_allow_html=True)
+            chat_html += f'<div class="message message-user">{message["content"]}</div>'
         else:
-            st.markdown(f'<div class="chat-message message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
+            chat_html += f'<div class="message message-assistant">{message["content"]}</div>'
             if "sources" in message and message["sources"]:
-                render_sources(message["sources"], key_prefix=f"h_{idx}_")
-            if st.session_state.get("show_intent") and message.get("intent"):
-                intent = message["intent"]
-                try:
-                    intent_name = intent.get("intent", "unknown")
-                    conf = float(intent.get("confidence", 0))
-                    reason = intent.get("reasoning", "")
-                except Exception:
-                    intent_name, conf, reason = "unknown", 0.0, ""
-                st.markdown(
-                    f'<div class="intent-box"><b>Detected intent:</b> {intent_name} '
-                    f'(<code>{conf:.2f}</code>)<br>{reason}</div>',
-                    unsafe_allow_html=True
-                )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Input row
-    col1, col2 = st.columns([6, 1])
-    with col1:
-        prompt = st.chat_input("Ask me anything about HBS systems...", key="main_chat_input")
-    with col2:
-        uploaded_image = st.file_uploader(
-            "📷",
-            type=['png', 'jpg', 'jpeg', 'webp', 'tiff'],
-            key="image_upload",
-            help="Upload an image to ask questions about it"
-        )
-
-    # Process prompt
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        conversational_response = get_conversational_response(prompt)
-
-        # Avoid echoing the same greeting right after the seeded welcome
-        if (conversational_response and
-            st.session_state.messages and
-            st.session_state.messages[0].get("welcome") and
-            conversational_response.startswith("Hi! How can I help")):
-            conversational_response = "Hey again! What would you like to do in HBS?"
-
+                chat_html += '<div class="sources"><strong>Sources:</strong><br>'
+                for source in message["sources"][:2]:
+                    source_name = source['source']
+                    similarity = source['similarity_score']
+                    chat_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
+                chat_html += '</div>'
+    
+    chat_html += """
+            </div>
+            
+            <div class="chat-input-container">
+                <input type="text" class="chat-input" id="chatInput" placeholder="Ask me anything about HBS systems..." />
+                <button class="upload-button" onclick="document.getElementById('fileInput').click()">📷</button>
+                <button class="send-button" onclick="sendMessage()">Send</button>
+                <input type="file" id="fileInput" style="display: none" accept="image/*" />
+            </div>
+        </div>
+        
+        <script>
+            function sendMessage() {
+                const input = document.getElementById('chatInput');
+                const message = input.value.trim();
+                if (message) {
+                    // Add user message to chat
+                    addMessage(message, 'user');
+                    input.value = '';
+                    
+                    // Send to Streamlit using the correct method
+                    window.parent.postMessage({
+                        type: 'streamlit:setComponentValue',
+                        value: message
+                    }, '*');
+                }
+            }
+            
+            function addMessage(text, role) {
+                const chatMessages = document.getElementById('chatMessages');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message message-${role}`;
+                messageDiv.textContent = text;
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            
+            // Handle Enter key
+            document.getElementById('chatInput').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    sendMessage();
+                }
+            });
+            
+            // Auto-scroll to bottom
+            function scrollToBottom() {
+                const chatMessages = document.getElementById('chatMessages');
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            
+            // Scroll to bottom when page loads
+            window.addEventListener('load', scrollToBottom);
+        </script>
+    </body>
+    </html>
+    """
+    
+    # Display the custom chat interface and get user input
+    user_input = st.components.v1.html(chat_html, height=600, key="chat_interface")
+    
+    # Process user input when received
+    if user_input:
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        
+        # Check if this is a conversational query first
+        conversational_response = get_conversational_response(user_input)
+        
         if conversational_response:
+            # For conversational queries, don't search KB or show sources
             st.session_state.messages.append({
-                "role": "assistant",
+                "role": "assistant", 
                 "content": conversational_response,
                 "timestamp": len(st.session_state.messages)
             })
         else:
+            # Get conversation context
             conversation_context = get_conversation_context(st.session_state.messages)
-
+            
+            # Classify user intent using LLM
             user_intent = None
             if conversation_context:
                 with st.spinner("Understanding your request..."):
                     user_intent = classify_user_intent(
-                        prompt,
+                        user_input,
                         conversation_context,
                         st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds
                     )
-
+            
+            # Search for relevant context
             with st.spinner("Thinking..."):
-                if st.session_state.index is None or not st.session_state.corpus:
-                    context_chunks = []
-                else:
-                    context_chunks = search_index(
-                        prompt,
-                        st.session_state.index,
-                        st.session_state.corpus,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds,
-                        k=2,
-                        min_similarity=0.4
-                    )
-
+                context_chunks = search_index(
+                    user_input, 
+                    st.session_state.index, 
+                    st.session_state.corpus,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    k=2,
+                    min_similarity=0.5
+                )
+                
+                # Generate response
                 response = generate_response(
-                    prompt,
+                    user_input,
                     context_chunks,
                     st.session_state.model_name,
                     st.session_state.project_id,
@@ -953,86 +1044,16 @@ def main():
                     conversation_context,
                     user_intent
                 )
-
+                
+                # Add assistant response to messages
                 st.session_state.messages.append({
-                    "role": "assistant",
+                    "role": "assistant", 
                     "content": response,
-                    "sources": context_chunks[:2] if context_chunks else [],
-                    "intent": user_intent,
+                    "sources": context_chunks,
                     "timestamp": len(st.session_state.messages)
                 })
-
+        
+        # Rerun to update the chat display
         st.rerun()
-
-    # Process image
-    if uploaded_image:
-        try:
-            image_bytes = uploaded_image.getvalue()
-            mime = getattr(uploaded_image, "type", None) or "image/jpeg"
-            with st.spinner("Analyzing image..."):
-                image_response = generate_image_response(
-                    "Please analyze this image and provide relevant information.",
-                    image_bytes,
-                    st.session_state.model_name,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds,
-                    mime_type=mime
-                )
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"**Image Analysis:**\n\n{image_response}",
-                    "timestamp": len(st.session_state.messages)
-                })
-        except Exception as e:
-            st.error(f"Error processing image: {str(e)}")
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "Sorry, I couldn't process the image. Please try again.",
-                "timestamp": len(st.session_state.messages)
-            })
-
-        st.session_state["image_upload"] = None
-        st.rerun()
-
-# ---- Lightweight search wrapper ----
-def expand_query(query: str) -> str:
-    ql = query.lower()
-    if "overdue" in ql:
-        return f"{query} overdue equipment report rental"
-    elif "outbound" in ql:
-        return f"{query} outbound report rental equipment"
-    elif "equipment" in ql:
-        return f"{query} equipment list rental"
-    elif "customer" in ql:
-        return f"{query} customer contract phone"
-    elif "stock" in ql:
-        return f"{query} stock number equipment"
-    elif "serial" in ql:
-        return f"{query} serial number equipment"
-    else:
-        return query
-
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 2, min_similarity: float = 0.4) -> List[Dict]:
-    if index is None or not corpus:
-        return []
-    try:
-        expanded_query = expand_query(query)
-        qemb = embed_texts([expanded_query], project_id, location, credentials)
-        if qemb.size == 0:
-            return []
-        faiss.normalize_L2(qemb)
-        scores, indices = index.search(qemb, min(10, len(corpus)))
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if 0 <= idx < len(corpus) and score >= min_similarity:
-                results.append({**corpus[idx], "similarity_score": float(score)})
-                if len(results) >= k:
-                    break
-        return results
-    except Exception as e:
-        st.error(f"Search error: {e}")
-        return []
-
 if __name__ == "__main__":
     main()
