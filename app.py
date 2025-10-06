@@ -1058,5 +1058,55 @@ def main():
                     
                     st.markdown(response)
                     
-                    # Show sources if available - limit to 2
+                   # Show sources if available - limit to 2
                     if context_chunks:
+                        st.markdown("**Sources:**")
+                        for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
+                            source_name = chunk.get('source', 'Unknown')
+                            similarity = chunk.get('similarity', 0.0)
+                            
+                            # Try to read the source file for download
+                            try:
+                                source_path = KB_DIR / source_name
+                                if source_path.exists():
+                                    with open(source_path, 'rb') as f:
+                                        file_data = f.read()
+                                    
+                                    st.download_button(
+                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                        data=file_data,
+                                        file_name=source_name,
+                                        mime="application/octet-stream",
+                                        key=f"download_{i}_{len(st.session_state.messages)}"
+                                    )
+                                else:
+                                    st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
+                            except Exception as e:
+                                st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
+                    
+                    # Handle image upload
+                    if uploaded_image:
+                        try:
+                            image_bytes = uploaded_image.read()
+                            with st.spinner("Analyzing image..."):
+                                image_response = generate_image_response(
+                                    prompt, image_bytes, model_name, project_id, location, credentials
+                                )
+                                st.session_state.messages.append({
+                                    "role": "assistant", 
+                                    "content": f"**Image Analysis:**\n\n{image_response}"
+                                })
+                        except Exception as e:
+                            st.error(f"Error processing image: {str(e)}")
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": "Sorry, I couldn't process the image. Please try again."
+                            })
+                    
+                    # Clear the uploaded image after processing
+                    if uploaded_image:
+                        st.session_state.uploaded_image = None
+                        st.rerun()
+
+if __name__ == "__main__":
+    main()
