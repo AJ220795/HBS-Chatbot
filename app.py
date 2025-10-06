@@ -1123,7 +1123,7 @@ def main():
                     st.write(f"**Query:** {req['query']}")
                     st.write(f"**Intent:** {req['user_analysis'].get('intent', 'unknown') if req['user_analysis'] else 'unknown'}")
                     st.write(f"**Sentiment:** {req['user_analysis'].get('sentiment', 'unknown') if req['user_analysis'] else 'unknown'}")
-                                        st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
+                    st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
         
         # Rebuild index button
         if st.button("🔄 Rebuild Index", key="rebuild_btn"):
