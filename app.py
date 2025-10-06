@@ -1089,27 +1089,27 @@ def main():
         layout="wide"
     )
     
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "index" not in st.session_state:
-        st.session_state.index = None
-    if "corpus" not in st.session_state:
-        st.session_state.corpus = []
-    if "creds" not in st.session_state:
-        st.session_state.creds = None
-    if "project_id" not in st.session_state:
-        st.session_state.project_id = None
-    if "location" not in st.session_state:
-        st.session_state.location = None
-    if "model_name" not in st.session_state:
-        st.session_state.model_name = CANDIDATE_MODELS[0]
-    if "kb_loaded" not in st.session_state:
-        st.session_state.kb_loaded = False
-    if "use_langchain" not in st.session_state:
-        st.session_state.use_langchain = LANGCHAIN_AVAILABLE
-    if "escalation_requests" not in st.session_state:
-        st.session_state.escalation_requests = []
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "corpus" not in st.session_state:
+    st.session_state.corpus = []
+if "creds" not in st.session_state:
+    st.session_state.creds = None
+if "project_id" not in st.session_state:
+    st.session_state.project_id = None
+if "location" not in st.session_state:
+    st.session_state.location = None
+if "model_name" not in st.session_state:
+    st.session_state.model_name = CANDIDATE_MODELS[0]
+if "kb_loaded" not in st.session_state:
+    st.session_state.kb_loaded = False
+if "use_langchain" not in st.session_state:
+    st.session_state.use_langchain = LANGCHAIN_AVAILABLE
+if "escalation_requests" not in st.session_state:
+    st.session_state.escalation_requests = []
 
     # Initialize credentials
     try:
