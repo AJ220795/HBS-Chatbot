@@ -2,8 +2,8 @@ import os
 import io
 import json
 import re
-import signal
 import time
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict
@@ -56,23 +56,31 @@ CANDIDATE_MODELS = [
 DEFAULT_LOCATION = "us-central1"
 DEBUG_MODE = False
 
-# ---- Timeout Context Manager ----
+# ---- Timeout Context Manager (Thread-safe) ----
 @contextmanager
 def timeout(duration):
-    """Context manager for timeout"""
-    def timeout_handler(signum, frame):
+    """Context manager for timeout using threading"""
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = yield
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(duration)
+    
+    if thread.is_alive():
         raise TimeoutError(f"Operation timed out after {duration} seconds")
     
-    # Set the signal handler
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
+    if exception[0]:
+        raise exception[0]
     
-    try:
-        yield
-    finally:
-        # Restore the old signal handler
-        signal.signal(signal.SIGALRM, old_handler)
-        signal.alarm(0)
+    return result[0]
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -1035,28 +1043,30 @@ def generate_response_with_langchain(query: str, context_chunks: List[Dict], use
         return None
     
     try:
-        # Add timeout to prevent hanging
-        with timeout(30):  # 30 second timeout
-            chain = get_conversation_chain(project_id, location, _credentials, model_name)
-            if not chain:
-                return None
-            
-            # Build context from retrieved chunks
-            context_text = "\n\n".join([
-                f"Source: {chunk['source']}\nContent: {chunk['text']}"
-                for chunk in context_chunks
-            ]) if context_chunks else "No relevant information found in knowledge base."
-            
-            # Format user analysis for prompt
-            analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
+        # Use a simpler timeout approach - just set a time limit
+        start_time = time.time()
+        timeout_duration = 30  # 30 seconds
+        
+        chain = get_conversation_chain(project_id, location, _credentials, model_name)
+        if not chain:
+            return None
+        
+        # Build context from retrieved chunks
+        context_text = "\n\n".join([
+            f"Source: {chunk['source']}\nContent: {chunk['text']}"
+            for chunk in context_chunks
+        ]) if context_chunks else "No relevant information found in knowledge base."
+        
+        # Format user analysis for prompt
+        analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
 Sentiment: {user_analysis.get('sentiment', 'neutral')}
 Context Relevance: {user_analysis.get('context_relevance', 'new_topic')}
 Escalation Needed: {user_analysis.get('escalation_needed', False)}
 Confidence: {user_analysis.get('confidence', 0):.2f}
 Reasoning: {user_analysis.get('reasoning', 'N/A')}"""
-            
-            # Create enhanced prompt with context and analysis
-            enhanced_query = f"""CONTEXT FROM KNOWLEDGE BASE:
+        
+        # Create enhanced prompt with context and analysis
+        enhanced_query = f"""CONTEXT FROM KNOWLEDGE BASE:
 {context_text}
 
 USER ANALYSIS:
@@ -1065,18 +1075,19 @@ USER ANALYSIS:
 USER QUESTION: {query}
 
 Please provide a helpful response based on the context and user analysis above."""
-            
-            # Generate response using LangChain with timeout
-            start_time = time.time()
-            response = chain.predict(input=enhanced_query)
-            end_time = time.time()
-            
-            st.write(f"LangChain response time: {end_time - start_time:.2f} seconds")
-            return response
-            
-    except TimeoutError:
-        st.error("LangChain request timed out after 30 seconds")
-        return None
+        
+        # Generate response using LangChain
+        response = chain.predict(input=enhanced_query)
+        end_time = time.time()
+        
+        # Check if we exceeded timeout
+        if end_time - start_time > timeout_duration:
+            st.error(f"LangChain request timed out after {timeout_duration} seconds")
+            return None
+        
+        st.write(f"LangChain response time: {end_time - start_time:.2f} seconds")
+        return response
+        
     except Exception as e:
         st.error(f"Error generating response with LangChain: {e}")
         return None
@@ -1089,27 +1100,27 @@ def main():
         layout="wide"
     )
     
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "index" not in st.session_state:
-    st.session_state.index = None
-if "corpus" not in st.session_state:
-    st.session_state.corpus = []
-if "creds" not in st.session_state:
-    st.session_state.creds = None
-if "project_id" not in st.session_state:
-    st.session_state.project_id = None
-if "location" not in st.session_state:
-    st.session_state.location = None
-if "model_name" not in st.session_state:
-    st.session_state.model_name = CANDIDATE_MODELS[0]
-if "kb_loaded" not in st.session_state:
-    st.session_state.kb_loaded = False
-if "use_langchain" not in st.session_state:
-    st.session_state.use_langchain = LANGCHAIN_AVAILABLE
-if "escalation_requests" not in st.session_state:
-    st.session_state.escalation_requests = []
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "index" not in st.session_state:
+        st.session_state.index = None
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = []
+    if "creds" not in st.session_state:
+        st.session_state.creds = None
+    if "project_id" not in st.session_state:
+        st.session_state.project_id = None
+    if "location" not in st.session_state:
+        st.session_state.location = None
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = CANDIDATE_MODELS[0]
+    if "kb_loaded" not in st.session_state:
+        st.session_state.kb_loaded = False
+    if "use_langchain" not in st.session_state:
+        st.session_state.use_langchain = LANGCHAIN_AVAILABLE
+    if "escalation_requests" not in st.session_state:
+        st.session_state.escalation_requests = []
 
     # Initialize credentials
     try:
@@ -1121,7 +1132,7 @@ if "escalation_requests" not in st.session_state:
         st.error(f"Error loading credentials: {e}")
         st.stop()
 
-   # Initialize app
+    # Initialize app
 @st.cache_resource
 def initialize_app():
     """Initialize the app - load index or build from KB files"""
