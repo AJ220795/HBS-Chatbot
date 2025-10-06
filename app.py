@@ -493,7 +493,45 @@ def process_kb_files() -> List[Dict]:
     if not KB_DIR.exists():
         st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
+# Add these functions after your existing functions like parse_equipment_list_report()
+
+def display_image_in_response(response_text: str, context_chunks: List[Dict]) -> str:
+    """Check if response should include images and display them"""
+    # Look for image references in the response or context
+    image_sources = []
     
+    # Check context chunks for image files
+    for chunk in context_chunks:
+        if chunk.get('file_type') in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
+            image_sources.append(chunk['source'])
+    
+    # Display images if found
+    if image_sources:
+        st.subheader("📷 Related Images")
+        for image_source in image_sources[:2]:  # Limit to 2 images
+            try:
+                image_path = KB_DIR / image_source
+                if image_path.exists():
+                    image = PILImage.open(image_path)
+                    st.image(image, caption=f"Source: {image_source}", use_column_width=True)
+            except Exception as e:
+                st.error(f"Error displaying image {image_source}: {e}")
+    
+    return response_text
+
+def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str, project_id: str, location: str, credentials) -> str:
+    """Process user uploaded image and generate response"""
+    try:
+        # Display the uploaded image
+        st.subheader("📷 Uploaded Image")
+        image = PILImage.open(io.BytesIO(image_bytes))
+        st.image(image, caption="Your uploaded image", use_column_width=True)
+        
+        # Generate response using the image
+        response = generate_image_response(query, image_bytes, model_name, project_id, location, credentials)
+        return response
+    except Exception as e:
+        return f"Error processing uploaded image: {str(e)}"    
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
     st.write(f"DEBUG: Found {len(files)} files in KB directory: {[f.name for f in files]}")
@@ -1148,7 +1186,7 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Main chat interface
+        # Main chat interface
     st.title("HBS Help Chatbot")
     
     # Display welcome message if no messages yet
@@ -1167,9 +1205,30 @@ def main():
                         source_name = source['source']
                         similarity = source['similarity_score']
                         st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
+            
+            # Display images if available
+            if "images" in message and message["images"]:
+                st.subheader("📷 Related Images")
+                for image_info in message["images"]:
+                    try:
+                        image_path = KB_DIR / image_info['source']
+                        if image_path.exists():
+                            image = PILImage.open(image_path)
+                            st.image(image, caption=f"Source: {image_info['source']}", use_column_width=True)
+                    except Exception as e:
+                        st.error(f"Error displaying image {image_info['source']}: {e}")
+    
+    # Image upload section
+    st.subheader("📷 Upload Image for Analysis")
+    uploaded_image = st.file_uploader(
+        "Choose an image file",
+        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
+        key="image_uploader"
+    )
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
+        
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
