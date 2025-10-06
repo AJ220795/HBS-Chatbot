@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import hashlib
 from pathlib import Path
 from typing import List, Dict
 
@@ -10,7 +11,6 @@ import numpy as np
 import faiss
 
 from google.oauth2 import service_account
-from google.cloud import aiplatform
 from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part
@@ -25,9 +25,8 @@ from PIL import Image as PILImage
 try:
     from langchain_google_vertexai import ChatVertexAI
     from langchain.memory import ConversationBufferWindowMemory
-    from langchain.chains import ConversationChain
+    from langchain.chains import LLMChain
     from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain.schema import BaseMessage, HumanMessage, AIMessage
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
@@ -52,6 +51,48 @@ CANDIDATE_MODELS = [
 
 DEFAULT_LOCATION = "us-central1"
 DEBUG_MODE = False
+
+# Model ID mapping for consistency
+MODEL_ID_MAP = {
+    "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+    "gemini-2.5-pro": "gemini-2.5-pro",
+}
+
+def get_model_id(name: str) -> str:
+    return MODEL_ID_MAP.get(name, name)
+
+def make_key(*parts) -> str:
+    """Stable, deterministic key from any tuple of parts"""
+    data = "||".join(str(p) for p in parts)
+    return "k_" + hashlib.md5(data.encode("utf-8")).hexdigest()
+
+def guess_mime_from_bytes(b: bytes) -> str:
+    """Infer MIME type from image bytes"""
+    try:
+        img = PILImage.open(io.BytesIO(b))
+        fmt = (img.format or "").lower()
+        return {
+            "jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png",
+            "webp": "image/webp", "bmp": "image/bmp", "tiff": "image/tiff"
+        }.get(fmt, "image/jpeg")
+    except Exception:
+        return "image/jpeg"
+
+def is_injection_like(s: str) -> bool:
+    """Detect potential prompt injection attempts"""
+    bad = ["ignore previous instructions", "forget everything", "you are now",
+           "pretend to be", "act as if", "system prompt", "show me your instructions"]
+    q = s.lower()
+    return any(p in q for p in bad)
+
+def quick_smalltalk(s: str) -> str | None:
+    """Fast-path for common smalltalk"""
+    q = s.strip().lower()
+    if q in {"hi", "hello", "hey"}:
+        return "Hi! How can I help you with HBS today?"
+    if q in {"thanks", "thank you"}:
+        return "You're welcome! What else can I help with in HBS?"
+    return None
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -607,62 +648,28 @@ def process_kb_files() -> List[Dict]:
     
     return corpus
 
-def get_conversation_context(messages: List[Dict]) -> str:
-    """Extract conversation context from recent messages"""
+def get_conversation_context(messages: List[Dict], max_chars: int = 1200) -> str:
+    """Extract conversation context from recent messages with size limits"""
     if not messages or len(messages) < 2:
         return ""
     
-    # Get last few messages for context
-    recent_messages = messages[-6:]  # Last 3 exchanges
+    parts = []
+    for msg in messages[-6:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        txt = (msg["content"] or "").strip()
+        if len(txt) > 400:  # hard cap per message
+            txt = txt[:400] + "…"
+        parts.append(f"{role}: {txt}")
     
-    context_parts = []
-    for msg in recent_messages:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "user":
-            context_parts.append(f"User: {content}")
-        elif role == "assistant":
-            context_parts.append(f"Assistant: {content}")
-    
-    return "\n".join(context_parts)
-
-def display_document_content(source_name: str, chunk_text: str):
-    """Display document content in an expandable section"""
-    with st.expander(f"📄 {source_name}", expanded=False):
-        st.text_area(
-            "Document Content:",
-            value=chunk_text,
-            height=300,
-            disabled=True,
-            key=f"doc_content_{source_name}_{hash(chunk_text)}"
-        )
-
-def sanitize_user_input(user_input: str) -> str:
-    """Basic input sanitization"""
-    # Remove potential prompt injection attempts
-    dangerous_patterns = [
-        "ignore previous instructions",
-        "forget everything",
-        "you are now",
-        "pretend to be",
-        "act as if",
-        "system prompt",
-        "show me your instructions"
-    ]
-    
-    user_input_lower = user_input.lower()
-    for pattern in dangerous_patterns:
-        if pattern in user_input_lower:
-            return "I can only help with HBS system questions. Please ask about HBS reports, procedures, or system features."
-    
-    return user_input
+    context = "\n".join(parts)
+    return context if len(context) <= max_chars else context[-max_chars:]
 
 # ---- Semantic Analysis Functions ----
 def analyze_user_sentiment_and_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
     """Use LLM to semantically analyze user sentiment and intent"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
+        model = GenerativeModel(get_model_id(model_name))
         
         analysis_prompt = f"""Analyze the user's query semantically and provide comprehensive analysis.
 
@@ -823,7 +830,7 @@ RESPONSE:"""
 
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
+        model = GenerativeModel(get_model_id(model_name))
         
         response = model.generate_content(
             system_prompt,
@@ -904,10 +911,11 @@ def generate_image_response(query: str, image_bytes: bytes, model_name: str, pro
     """Generate response for image-based queries"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
+        model = GenerativeModel(get_model_id(model_name))
         
-        # Create image part
-        image_part = Part.from_data(image_bytes, mime_type="image/jpeg")
+        # Create image part with correct MIME type
+        mime = guess_mime_from_bytes(image_bytes)
+        image_part = Part.from_data(image_bytes, mime_type=mime)
         
         prompt = f"""Analyze this image and answer the user's question: {query}
 
@@ -948,7 +956,7 @@ def get_langchain_llm(project_id: str, location: str, _credentials, model_name: 
         
         # Create LangChain ChatVertexAI instance (for Gemini chat models)
         llm = ChatVertexAI(
-            model_name=model_name,
+            model_name=get_model_id(model_name),
             project=project_id,
             location=location,
             temperature=0.1,
@@ -971,7 +979,7 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
         vertexai_init(project=project_id, location=location, credentials=_credentials)
         
         llm = ChatVertexAI(
-            model_name=model_name,
+            model_name=get_model_id(model_name),
             project=project_id,
             location=location,
             temperature=0.1,
@@ -1014,11 +1022,11 @@ INSTRUCTIONS:
             ("human", "{input}")
         ])
         
-        # Create conversation chain
-        chain = ConversationChain(
+        # Create LLMChain (allows extra variables)
+        chain = LLMChain(
             llm=llm,
-            memory=memory,
             prompt=prompt,
+            memory=memory,
             verbose=False
         )
         
@@ -1093,7 +1101,7 @@ def main():
     if "escalation_requests" not in st.session_state:
         st.session_state.escalation_requests = []
 
-    # Initialize credentials
+        # Initialize credentials
     try:
         sa_info = json.loads(st.secrets["google"]["credentials_json"])
         st.session_state.creds = service_account.Credentials.from_service_account_info(sa_info)
@@ -1124,7 +1132,7 @@ def main():
         
         return None, [], False
 
-       # Initialize
+    # Initialize
     if not st.session_state.kb_loaded:
         with st.spinner("Loading knowledge base..."):
             index, corpus, loaded = initialize_app()
@@ -1150,7 +1158,17 @@ def main():
             index=0,
             key="model_select"
         )
-
+        
+        # LangChain toggle
+        if LANGCHAIN_AVAILABLE:
+            st.session_state.use_langchain = st.checkbox(
+                "Use LangChain memory",
+                value=st.session_state.use_langchain,
+                key="langchain_toggle"
+            )
+        else:
+            st.info("LangChain not available")
+        
         # Show escalation requests
         if st.session_state.escalation_requests:
             st.subheader("📞 Live Agent Requests")
@@ -1173,6 +1191,7 @@ def main():
                         st.session_state.corpus = corpus
                         st.session_state.kb_loaded = True
                         st.success("Index rebuilt successfully!")
+                        st.cache_resource.clear()  # Clear cache after rebuilding
                         st.rerun()
                     else:
                         st.error("Failed to build index")
@@ -1184,7 +1203,7 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-        # Main chat interface
+    # Main chat interface
     st.title("HBS Help Chatbot")
     
     # Display welcome message if no messages yet
@@ -1192,20 +1211,30 @@ def main():
         st.info("Hi! How can I help you?")
     
     # Display chat messages
-    for message in st.session_state.messages:
+    for mi, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.write(message["content"])
             
             # Display sources if available
             if "sources" in message and message["sources"]:
-                with st.expander("📄 Sources"):
-                    for source in message["sources"][:2]:
-                        source_name = source['source']
-                        similarity = source['similarity_score']
-                        
-                        # Make sources clickable
-                        if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=f"source_{source_name}_{hash(source['text'])}"):
-                            display_document_content(source_name, source['text'])
+                with st.expander("📄 Sources", expanded=False):
+                    for si, source in enumerate(message["sources"][:2]):
+                        source_name = source.get("source", "unknown")
+                        similarity = source.get("similarity_score", 0.0)
+                        chunk_id = source.get("chunk_id", si)
+                        chunk_text = source.get("text", "")
+
+                        st.markdown(f"**{source_name}** (similarity: {similarity:.3f})")
+
+                        # Unique, stable key per message+source
+                        ta_key = make_key("doc", mi, si, chunk_id, source_name)
+                        st.text_area(
+                            "Content",
+                            value=chunk_text,
+                            height=220,
+                            disabled=True,
+                            key=ta_key
+                        )
     
     # Image upload section - moved right above chat input
     uploaded_image = st.file_uploader(
@@ -1216,8 +1245,19 @@ def main():
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
-        # Sanitize input
-        prompt = sanitize_user_input(prompt)
+        # Check for smalltalk first
+        st_reply = quick_smalltalk(prompt)
+        if st_reply:
+            st.session_state.messages.append({"role": "assistant", "content": st_reply})
+            st.rerun()
+        
+        # Check for injection attempts
+        if is_injection_like(prompt):
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "I can only help with HBS topics like reports, procedures, and features. Ask me about those and I'll jump in."
+            })
+            st.rerun()
         
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -1329,6 +1369,6 @@ def main():
         
         # Rerun to update the chat display
         st.rerun()
-        
+
 if __name__ == "__main__":
     main()
