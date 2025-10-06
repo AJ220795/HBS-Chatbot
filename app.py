@@ -926,15 +926,9 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
             input_key="input"
         )
         
-        # Create chat prompt template
+        # Create chat prompt template - simplified to only use standard ConversationChain variables
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are an expert HBS (Help Business System) assistant.
-
-CONTEXT FROM KNOWLEDGE BASE:
-{context}
-
-USER ANALYSIS:
-{user_analysis}
 
 INSTRUCTIONS:
 - Be helpful and professional
@@ -944,6 +938,19 @@ INSTRUCTIONS:
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}")
         ])
+        
+        # Create conversation chain
+        chain = ConversationChain(
+            llm=llm,
+            memory=memory,
+            prompt=prompt,
+            verbose=False
+        )
+        
+        return chain
+    except Exception as e:
+        st.error(f"Error creating conversation chain: {e}")
+        return None
         
         # Create conversation chain
         chain = ConversationChain(
