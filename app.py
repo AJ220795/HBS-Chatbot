@@ -717,6 +717,9 @@ Be precise and consider the semantic meaning, not just keywords."""
 def escalate_to_live_agent(query: str, conversation_context: str, user_intent: Dict = None) -> str:
     """Escalate to live agent when bot cannot help"""
     
+    # Get confidence value safely
+    confidence = user_intent.get('confidence', 0) if user_intent else 0
+    
     # Create a summary of the conversation for the live agent
     conversation_summary = f"""
 CONVERSATION SUMMARY FOR LIVE AGENT:
@@ -728,7 +731,7 @@ CONVERSATION CONTEXT:
 {conversation_context}
 
 USER INTENT: {user_intent.get('intent', 'unknown') if user_intent else 'unknown'}
-CONFIDENCE: {user_intent.get('confidence', 0):.2f if user_intent else 0}
+CONFIDENCE: {confidence:.2f}
 REASONING: {user_intent.get('reasoning', 'N/A') if user_intent else 'N/A'}
 
 ESCALATION REASON: Bot was unable to provide a satisfactory answer to the user's question.
@@ -751,7 +754,7 @@ ESCALATION REASON: Bot was unable to provide a satisfactory answer to the user's
 
 **Live Agent Escalation Request Submitted**
 
-Your question: "{query}"
+Your question: '{query}'
 
 A live agent will review your request and respond within 24 hours. In the meantime, you can:
 
@@ -761,7 +764,7 @@ A live agent will review your request and respond within 24 hours. In the meanti
 
 **Reference ID:** ESC-{len(st.session_state.messages):04d}
 
-"""Thank you for using the HBS Help Chatbot!"""
+Thank you for using the HBS Help Chatbot!"""
 
 def should_escalate_to_agent(query: str, context_chunks: List[Dict], user_intent: Dict = None, conversation_context: str = "") -> bool:
     """Determine if the query should be escalated to a live agent"""
