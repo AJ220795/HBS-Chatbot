@@ -762,7 +762,7 @@ USER ANALYSIS:
 """
     
     # Create semantic system prompt
-    system_prompt = f"""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
+    system_prompt = f"""You are an expert HBS assistant with deep understanding of user intent and sentiment.
 
 {context_section}{analysis_section}KNOWLEDGE BASE CONTEXT:
 {context_text}
@@ -928,7 +928,7 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
         
         # Create chat prompt template - simplified to only use standard ConversationChain variables
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert HBS (Help Business System) assistant.
+            ("system", """You are an expert HBS assistant.
 
 INSTRUCTIONS:
 - Be helpful and professional
