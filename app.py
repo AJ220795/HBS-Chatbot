@@ -1082,16 +1082,6 @@ def main():
             key="model_select"
         )
         
-        # LangChain toggle
-        if LANGCHAIN_AVAILABLE:
-            st.session_state.use_langchain = st.checkbox(
-                "Use LangChain (Better Memory)",
-                value=st.session_state.use_langchain,
-                key="langchain_toggle"
-            )
-        else:
-            st.info("LangChain not available")
-        
         # Show escalation requests
         if st.session_state.escalation_requests:
             st.subheader("📞 Live Agent Requests")
