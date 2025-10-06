@@ -848,6 +848,62 @@ def main():
         layout="wide"
     )
     
+    # Add custom CSS for fixed chat layout
+    st.markdown("""
+    <style>
+    .main .block-container {
+        padding-top: 1rem;
+        padding-bottom: 0rem;
+        max-width: 100%;
+    }
+    
+    .chat-container {
+        height: 70vh;
+        overflow-y: auto;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        background-color: #fafafa;
+    }
+    
+    .chat-input-container {
+        position: sticky;
+        bottom: 0;
+        background-color: white;
+        padding: 1rem;
+        border-top: 1px solid #e0e0e0;
+        border-radius: 10px;
+        margin-top: 1rem;
+    }
+    
+    .stChatInput > div > div > input {
+        border-radius: 25px;
+    }
+    
+    .message-user {
+        background-color: #007bff;
+        color: white;
+        padding: 10px 15px;
+        border-radius: 18px 18px 5px 18px;
+        margin: 5px 0;
+        max-width: 80%;
+        margin-left: auto;
+        text-align: right;
+    }
+    
+    .message-assistant {
+        background-color: #e9ecef;
+        color: black;
+        padding: 10px 15px;
+        border-radius: 18px 18px 18px 5px;
+        margin: 5px 0;
+        max-width: 80%;
+        margin-right: auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -862,7 +918,7 @@ def main():
     if "location" not in st.session_state:
         st.session_state.location = None
     if "model_name" not in st.session_state:
-        st.session_state.model_name = CANDIDATE_MODELS[0]  # Now defaults to gemini-2.5-flash-lite
+        st.session_state.model_name = CANDIDATE_MODELS[0]
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
     if "uploaded_image" not in st.session_state:
@@ -952,57 +1008,38 @@ def main():
     # Main chat interface
     st.title("HBS Help Chatbot")
     
-    # Create a container for chat messages with fixed height
-    chat_container = st.container()
+    # Create chat container
+    chat_html = '<div class="chat-container">'
     
     # Show initial greeting if no messages
     if not st.session_state.messages:
-        with chat_container:
-            with st.chat_message("assistant"):
-                st.markdown("Hi! How can I help you?")
+        chat_html += '<div class="message-assistant">Hi! How can I help you?</div>'
     
-    # Display chat messages in the container
-    with chat_container:
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                if "sources" in message and message["sources"]:
-                    with st.expander("Sources"):
-                        for i, source in enumerate(message["sources"][:2]):  # Limit to 2 sources
-                            # Create clickable source link
-                            source_name = source['source']
-                            similarity = source['similarity_score']
-                            content_preview = source['text'][:200] + "..."
-                            
-                            # Try to create a clickable link to the source file
-                            try:
-                                # Check if source file exists in KB directory
-                                source_path = KB_DIR / source_name
-                                if source_path.exists():
-                                    # Create a download link
-                                    with open(source_path, 'rb') as f:
-                                        file_data = f.read()
-                                    
-                                    st.download_button(
-                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
-                                        data=file_data,
-                                        file_name=source_name,
-                                        mime="application/octet-stream",
-                                        key=f"download_{i}_{message.get('timestamp', 0)}"
-                                    )
-                                else:
-                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                            except Exception:
-                                st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                            
-                            st.write(content_preview)
-                            st.write("---")
-
-    # Fixed chat input at the bottom
-    st.markdown("---")  # Separator line
+    # Display chat messages
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            chat_html += f'<div class="message-user">{message["content"]}</div>'
+        else:
+            chat_html += f'<div class="message-assistant">{message["content"]}</div>'
+            # Add sources if available
+            if "sources" in message and message["sources"]:
+                chat_html += '<div class="message-assistant"><strong>Sources:</strong><br>'
+                for i, source in enumerate(message["sources"][:2]):
+                    source_name = source['source']
+                    similarity = source['similarity_score']
+                    chat_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
+                chat_html += '</div>'
     
-    # Chat input with image upload - fixed at bottom
-    col1, col2 = st.columns([3, 1])
+    chat_html += '</div>'
+    
+    # Display chat container
+    st.markdown(chat_html, unsafe_allow_html=True)
+    
+    # Chat input container
+    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
+    
+    # Chat input with image upload
+    col1, col2 = st.columns([6, 1])
     
     with col1:
         prompt = st.chat_input("Ask me anything about HBS systems...", key="main_chat_input")
@@ -1014,6 +1051,8 @@ def main():
             key="image_upload",
             help="Upload an image to ask questions about it"
         )
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # Process user input
     if prompt:
