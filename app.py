@@ -21,6 +21,13 @@ import cv2
 import pytesseract
 from PIL import Image as PILImage
 
+# LangChain imports
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.llms import VertexAI
+from langchain.chains import ConversationChain
+from langchain.prompts import PromptTemplate
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
+
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
@@ -621,167 +628,47 @@ def get_conversational_response(query: str) -> str:
     
     return None
 
-def get_conversation_context(messages: List[Dict], max_context: int = 3) -> str:
-    """Extract conversation context from recent messages"""
-    if len(messages) < 2:
-        return ""
-    
-    # Get the last few exchanges (excluding the current question)
-    recent_messages = messages[-max_context*2:]  # Get last 6 messages (3 exchanges)
-    
-    context_parts = []
-    for msg in recent_messages:
-        if msg["role"] == "user":
-            context_parts.append(f"User: {msg['content']}")
-        elif msg["role"] == "assistant":
-            # Only include the first part of assistant responses (before sources)
-            content = msg['content'].split('\n\n')[0]  # Get first paragraph
-            context_parts.append(f"Assistant: {content}")
-    
-    return "\n".join(context_parts)
-
-def classify_user_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
-    """Use LLM to classify user intent semantically"""
+def initialize_langchain_components(project_id: str, location: str, credentials, model_name: str):
+    """Initialize LangChain components"""
     try:
+        # Initialize Vertex AI
         vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
         
-        classification_prompt = f"""Analyze the user's query and classify their intent. Consider the conversation context.
-
-CONVERSATION CONTEXT:
-{conversation_context}
-
-USER QUERY: {query}
-
-Classify the user's intent into one of these categories:
-
-1. "troubleshooting" - User is having problems following previous instructions, things aren't working, can't find something, getting errors, etc.
-2. "clarification" - User wants more explanation, doesn't understand something, wants simpler terms, more details, etc.
-3. "alternative" - User is asking for other methods, alternatives, different approaches, etc.
-4. "new_question" - User is asking a completely new question unrelated to previous conversation
-5. "conversational" - Simple greetings, farewells, casual chat
-
-Respond with ONLY a JSON object in this exact format:
-{{
-    "intent": "one_of_the_categories_above",
-    "confidence": 0.95,
-    "reasoning": "brief explanation of why this classification was chosen"
-}}
-
-Be precise and consider the semantic meaning, not just keywords."""
-
-        response = model.generate_content(
-            classification_prompt,
-            generation_config=GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=200,
-                top_p=0.8,
-                top_k=40
-            )
+        # Initialize LangChain LLM
+        llm = VertexAI(
+            model_name=model_name,
+            temperature=0.1,
+            max_output_tokens=2048,
+            top_p=0.8,
+            top_k=40
         )
         
-        if response.text:
-            try:
-                result = json.loads(response.text.strip())
-                return result
-            except json.JSONDecodeError:
-                return {
-                    "intent": "new_question",
-                    "confidence": 0.5,
-                    "reasoning": "Failed to parse classification response"
-                }
-        else:
-            return {
-                "intent": "new_question", 
-                "confidence": 0.5,
-                "reasoning": "No response from classification model"
-            }
-    
-    except Exception as e:
-        return {
-            "intent": "new_question",
-            "confidence": 0.3,
-            "reasoning": f"Classification error: {str(e)}"
-        }
-
-def generate_response(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, conversation_context: str = "", user_intent: Dict = None) -> str:
-    """Generate response using Gemini with improved prompting and conversation context"""
-    
-    if not context_chunks:
-        # Handle different intents when no relevant context is found
-        if user_intent and user_intent.get("intent") in ["troubleshooting", "clarification", "alternative"]:
-            intent = user_intent["intent"]
-            
-            if intent == "troubleshooting":
-                return "I understand you're having trouble with the steps I provided. Let me help troubleshoot this. Can you tell me:\n\n1. Which specific step are you stuck on?\n2. What exactly happens when you try to follow the instructions?\n3. Are you seeing any error messages?\n\nThis will help me provide more targeted assistance."
-            
-            elif intent == "clarification":
-                return "I'd be happy to clarify! Based on our previous conversation, could you let me know which specific part you'd like me to explain in more detail? I can break it down step by step or use simpler terms."
-            
-            elif intent == "alternative":
-                return "I don't have information about alternative methods for that topic in my knowledge base. Based on what I've shared, the main approach is what I described earlier. If you have a specific aspect you'd like to explore further, please let me know!"
+        # Initialize conversation memory
+        memory = ConversationBufferWindowMemory(
+            k=3,  # Keep last 3 exchanges
+            return_messages=True,
+            memory_key="chat_history"
+        )
         
-        return "I don't have information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
-    
-    # Build context from retrieved chunks
-    context_text = "\n\n".join([
-        f"Source: {chunk['source']}\nContent: {chunk['text']}"
-        for chunk in context_chunks
-    ])
-    
-    # Check if we have structured data that can answer the question directly
-    structured_answers = []
-    for chunk in context_chunks:
-        if chunk.get('content_type') == 'structured_data' and 'structured_data' in chunk:
-            data = chunk['structured_data']
-            # Check if this structured data can answer the query
-            query_lower = query.lower()
-            if any(field in query_lower for field in ['stock', 'contract', 'customer', 'days overdue', 'serial', 'make', 'model']):
-                if 'customer_name' in data and 'customer' in query_lower:
-                    if data['customer_name'].lower() in query_lower:
-                        structured_answers.append(f"Customer: {data['customer_name']}, Contract: {data.get('contract', 'N/A')}, Stock: {data.get('stock_number', 'N/A')}, Make: {data.get('make', 'N/A')}, Model: {data.get('model', 'N/A')}, Days Overdue: {data.get('days_overdue', 'N/A')}, Serial: {data.get('serial', 'N/A')}")
-                elif 'stock_number' in data and 'stock' in query_lower:
-                    if data['stock_number'] in query:
-                        structured_answers.append(f"Stock: {data['stock_number']}, Make: {data.get('make', 'N/A')}, Model: {data.get('model', 'N/A')}, Customer: {data.get('customer_name', 'N/A')}, Contract: {data.get('contract', 'N/A')}, Days Overdue: {data.get('days_overdue', 'N/A')}")
-    
-    # If we have direct structured answers, use them
-    if structured_answers:
-        return "\n\n".join(structured_answers)
-    
-    # Build conversation context for the prompt
-    context_section = ""
-    if conversation_context:
-        context_section = f"""
-RECENT CONVERSATION CONTEXT:
-{conversation_context}
+        # Create conversation chain with custom prompt
+        prompt_template = """You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
 
-"""
-    
-    # Add intent information to the prompt
-    intent_section = ""
-    if user_intent and user_intent.get("intent") in ["troubleshooting", "clarification", "alternative"]:
-        intent_section = f"""
-USER INTENT: {user_intent['intent']} (confidence: {user_intent.get('confidence', 0):.2f})
-REASONING: {user_intent.get('reasoning', '')}
+CONTEXT FROM KNOWLEDGE BASE:
+{context}
 
-"""
-    
-    # Improved system prompt with conversation context and intent awareness
-    system_prompt = f"""You are an expert HBS (Help Business System) assistant. You have access to detailed documentation about HBS systems, reports, and procedures.
+CHAT HISTORY:
+{chat_history}
 
-{context_section}{intent_section}CONTEXT FROM KNOWLEDGE BASE:
-{context_text}
-
-USER QUESTION: {query}
+USER QUESTION: {input}
 
 INSTRUCTIONS:
 1. **FIRST**: Check if the context above is actually relevant to the user's question
 2. If the context is NOT relevant to the question, say "I don't have specific information about that topic in my knowledge base. Could you please rephrase your question or ask about HBS reports, procedures, or system features?"
 3. If the context IS relevant, answer the user's question using ONLY the information provided
-4. **IMPORTANT**: Consider the user's intent:
-   - If intent is "troubleshooting": Provide step-by-step troubleshooting guidance
-   - If intent is "clarification": Explain in simpler terms with more detail
-   - If intent is "alternative": Acknowledge the request and explain limitations
+4. **IMPORTANT**: Consider the conversation history and user's intent:
+   - If the user is having trouble following previous instructions, provide step-by-step troubleshooting guidance
+   - If the user wants clarification, explain in simpler terms with more detail
+   - If the user is asking for alternatives, acknowledge the request and explain limitations
 5. Be specific and detailed in your response
 6. If the context contains step-by-step procedures, provide them clearly
 7. If the context mentions specific options, fields, or settings, list them exactly
@@ -792,21 +679,42 @@ INSTRUCTIONS:
 
 RESPONSE:"""
 
-    try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
-        
-        response = model.generate_content(
-            system_prompt,
-            generation_config=GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=2048,
-                top_p=0.8,
-                top_k=40
-            )
+        prompt = PromptTemplate(
+            input_variables=["context", "chat_history", "input"],
+            template=prompt_template
         )
         
-        return response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
+        conversation = ConversationChain(
+            llm=llm,
+            memory=memory,
+            prompt=prompt,
+            verbose=True
+        )
+        
+        return conversation, memory
+        
+    except Exception as e:
+        st.error(f"Error initializing LangChain components: {e}")
+        return None, None
+
+def generate_response_with_langchain(query: str, context_chunks: List[Dict], conversation, memory) -> str:
+    """Generate response using LangChain with conversation memory"""
+    try:
+        # Build context from retrieved chunks
+        context_text = ""
+        if context_chunks:
+            context_text = "\n\n".join([
+                f"Source: {chunk['source']}\nContent: {chunk['text']}"
+                for chunk in context_chunks
+            ])
+        
+        # Use LangChain conversation chain
+        response = conversation.predict(
+            context=context_text,
+            input=query
+        )
+        
+        return response if response else "I couldn't generate a response. Please try rephrasing your question."
     
     except Exception as e:
         return f"Error generating response: {str(e)}"
@@ -857,6 +765,10 @@ def main():
         st.session_state.kb_loaded = False
     if "uploaded_image" not in st.session_state:
         st.session_state.uploaded_image = None
+    if "conversation" not in st.session_state:
+        st.session_state.conversation = None
+    if "memory" not in st.session_state:
+        st.session_state.memory = None
 
     # Initialize credentials
     try:
@@ -867,6 +779,18 @@ def main():
     except Exception as e:
         st.error(f"Error loading credentials: {e}")
         st.stop()
+
+    # Initialize LangChain components
+    if st.session_state.conversation is None:
+        with st.spinner("Initializing LangChain components..."):
+            conversation, memory = initialize_langchain_components(
+                st.session_state.project_id,
+                st.session_state.location,
+                st.session_state.creds,
+                st.session_state.model_name
+            )
+            st.session_state.conversation = conversation
+            st.session_state.memory = memory
 
     # Initialize app
     @st.cache_resource
@@ -909,12 +833,26 @@ def main():
         
         # Model selection
         st.subheader("Model Settings")
-        st.session_state.model_name = st.selectbox(
+        new_model = st.selectbox(
             "Select Model",
             CANDIDATE_MODELS,
             index=0,
             key="model_select"
         )
+        
+        # Reinitialize LangChain if model changed
+        if new_model != st.session_state.model_name:
+            st.session_state.model_name = new_model
+            with st.spinner("Reinitializing with new model..."):
+                conversation, memory = initialize_langchain_components(
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    st.session_state.model_name
+                )
+                st.session_state.conversation = conversation
+                st.session_state.memory = memory
+                st.rerun()
         
         # Rebuild index button
         if st.button("🔄 Rebuild Index", key="rebuild_btn"):
@@ -933,6 +871,13 @@ def main():
                         st.error("Failed to build index")
                 else:
                     st.error("No KB files found")
+        
+        # Clear conversation button
+        if st.button("🗑️ Clear Conversation", key="clear_btn"):
+            st.session_state.messages = []
+            if st.session_state.memory:
+                st.session_state.memory.clear()
+            st.rerun()
 
     # Main chat interface
     st.title("HBS Help Chatbot")
@@ -997,23 +942,12 @@ def main():
                     "content": conversational_response,
                     "timestamp": len(st.session_state.messages)
                 })
+                
+                # Add to LangChain memory
+                if st.session_state.memory:
+                    st.session_state.memory.chat_memory.add_user_message(prompt)
+                    st.session_state.memory.chat_memory.add_ai_message(conversational_response)
             else:
-                # Get conversation context
-                conversation_context = get_conversation_context(st.session_state.messages)
-                
-                # Classify user intent using LLM
-                user_intent = None
-                if conversation_context:  # Only classify if there's conversation context
-                    with st.spinner("Understanding your request..."):
-                        user_intent = classify_user_intent(
-                            prompt,
-                            conversation_context,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds
-                        )
-                
                 # Search for relevant context
                 with st.spinner("Thinking..."):
                     context_chunks = search_index(
@@ -1027,16 +961,12 @@ def main():
                         min_similarity=0.5  # Increased threshold to 0.5
                     )
                     
-                    # Generate response with conversation context and intent
-                    response = generate_response(
+                    # Generate response with LangChain
+                    response = generate_response_with_langchain(
                         prompt,
                         context_chunks,
-                        st.session_state.model_name,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds,
-                        conversation_context,
-                        user_intent
+                        st.session_state.conversation,
+                        st.session_state.memory
                     )
                     
                     st.markdown(response)
@@ -1058,7 +988,7 @@ def main():
                                         # Create a download link
                                         with open(source_path, 'rb') as f:
                                             file_data = f.read()
-
+                                        
                                         st.download_button(
                                             label=f"📄 {source_name} (similarity: {similarity:.3f})",
                                             data=file_data,
