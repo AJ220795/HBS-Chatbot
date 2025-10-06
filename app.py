@@ -1123,7 +1123,7 @@ def main():
             save_index_and_corpus(index, corpus)
             return index, corpus, True
         
-                return None, [], False
+        return None, [], False
 
     # Initialize
     if not st.session_state.kb_loaded:
