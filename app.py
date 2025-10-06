@@ -889,221 +889,120 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Create custom HTML chat interface
-    chat_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{
-                margin: 0;
-                padding: 0;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                height: 100vh;
-                overflow: hidden;
-            }}
-            
-            .chat-container {{
-                display: flex;
-                flex-direction: column;
-                height: 100vh;
-                background: #f8f9fa;
-            }}
-            
-            .chat-header {{
-                background: white;
-                padding: 1rem;
-                border-bottom: 1px solid #e0e0e0;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                z-index: 1000;
-            }}
-            
-            .chat-messages {{
-                flex: 1;
-                overflow-y: auto;
-                padding: 1rem;
-                display: flex;
-                flex-direction: column;
-                gap: 1rem;
-            }}
-            
-            .message {{
-                max-width: 70%;
-                padding: 12px 16px;
-                border-radius: 18px;
-                word-wrap: break-word;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }}
-            
-            .message-user {{
-                background: #007bff;
-                color: white;
-                margin-left: auto;
-                border-radius: 18px 18px 5px 18px;
-            }}
-            
-            .message-assistant {{
-                background: white;
-                color: #333;
-                margin-right: auto;
-                border-radius: 18px 18px 18px 5px;
-                border: 1px solid #e0e0e0;
-            }}
-            
-            .sources {{
-                background: #e3f2fd;
-                padding: 8px 12px;
-                border-radius: 8px;
-                margin-top: 8px;
-                font-size: 0.9em;
-                border-left: 3px solid #2196f3;
-            }}
-            
-            .chat-input-container {{
-                background: white;
-                padding: 1rem;
-                border-top: 1px solid #e0e0e0;
-                display: flex;
-                gap: 1rem;
-                align-items: center;
-            }}
-            
-            .chat-input {{
-                flex: 1;
-                padding: 12px 20px;
-                border: 2px solid #e0e0e0;
-                border-radius: 25px;
-                font-size: 16px;
-                outline: none;
-            }}
-            
-            .chat-input:focus {{
-                border-color: #007bff;
-                box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
-            }}
-            
-            .send-button {{
-                background: #007bff;
-                color: white;
-                border: none;
-                padding: 12px 24px;
-                border-radius: 25px;
-                cursor: pointer;
-                font-size: 16px;
-            }}
-            
-            .send-button:hover {{
-                background: #0056b3;
-            }}
-            
-            .upload-button {{
-                background: #6c757d;
-                color: white;
-                border: none;
-                padding: 12px;
-                border-radius: 50%;
-                cursor: pointer;
-                width: 48px;
-                height: 48px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="chat-container">
-            <div class="chat-header">
-                <h1>HBS Help Chatbot</h1>
-            </div>
-            
-            <div class="chat-messages" id="chatMessages">
-                <div class="message message-assistant">Hi! How can I help you?</div>
-    """
+    # Main chat interface with better CSS
+    st.markdown("""
+    <style>
+    .main .block-container {
+        padding-top: 1rem;
+        padding-bottom: 0rem;
+        max-width: 100%;
+    }
     
-    # Add existing messages
+    .chat-message {
+        margin: 10px 0;
+        padding: 12px 16px;
+        border-radius: 18px;
+        max-width: 80%;
+        word-wrap: break-word;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .message-user {
+        background-color: #007bff;
+        color: white;
+        margin-left: auto;
+        border-radius: 18px 18px 5px 18px;
+    }
+    
+    .message-assistant {
+        background-color: #f1f3f4;
+        color: #333;
+        margin-right: auto;
+        border-radius: 18px 18px 18px 5px;
+        border: 1px solid #e0e0e0;
+    }
+    
+    .sources-box {
+        background-color: #e3f2fd;
+        padding: 8px 12px;
+        border-radius: 8px;
+        margin-top: 8px;
+        font-size: 0.9em;
+        border-left: 3px solid #2196f3;
+    }
+    
+    .stChatInput > div > div > input {
+        border-radius: 25px;
+        border: 2px solid #e0e0e0;
+        padding: 12px 20px;
+        font-size: 16px;
+    }
+    
+    .stChatInput > div > div > input:focus {
+        border-color: #007bff;
+        box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
+    }
+    
+    /* Try to keep input at bottom */
+    .stChatInput {
+        position: sticky;
+        bottom: 0;
+        background: white;
+        z-index: 100;
+        padding: 1rem;
+        border-top: 1px solid #e0e0e0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Main chat interface
+    st.title("HBS Help Chatbot")
+    
+    # Show initial greeting if no messages
+    if not st.session_state.messages:
+        st.markdown('<div class="chat-message message-assistant">Hi! How can I help you?</div>', unsafe_allow_html=True)
+    
+    # Display chat messages
     for message in st.session_state.messages:
         if message["role"] == "user":
-            chat_html += f'<div class="message message-user">{message["content"]}</div>'
+            st.markdown(f'<div class="chat-message message-user">{message["content"]}</div>', unsafe_allow_html=True)
         else:
-            chat_html += f'<div class="message message-assistant">{message["content"]}</div>'
+            st.markdown(f'<div class="chat-message message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
+            
+            # Add sources if available
             if "sources" in message and message["sources"]:
-                chat_html += '<div class="sources"><strong>Sources:</strong><br>'
-                for source in message["sources"][:2]:
+                sources_html = '<div class="sources-box"><strong>Sources:</strong><br>'
+                for i, source in enumerate(message["sources"][:2]):
                     source_name = source['source']
                     similarity = source['similarity_score']
-                    chat_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
-                chat_html += '</div>'
+                    sources_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
+                sources_html += '</div>'
+                st.markdown(sources_html, unsafe_allow_html=True)
     
-    chat_html += """
-            </div>
-            
-            <div class="chat-input-container">
-                <input type="text" class="chat-input" id="chatInput" placeholder="Ask me anything about HBS systems..." />
-                <button class="upload-button" onclick="document.getElementById('fileInput').click()">📷</button>
-                <button class="send-button" onclick="sendMessage()">Send</button>
-                <input type="file" id="fileInput" style="display: none" accept="image/*" />
-            </div>
-        </div>
-        
-        <script>
-            function sendMessage() {
-                const input = document.getElementById('chatInput');
-                const message = input.value.trim();
-                if (message) {
-                    // Add user message to chat
-                    addMessage(message, 'user');
-                    input.value = '';
-                    
-                    // Send to Streamlit
-                    window.parent.postMessage({
-                        type: 'streamlit:setComponentValue',
-                        value: message
-                    }, '*');
-                }
-            }
-            
-            function addMessage(text, role) {
-                const chatMessages = document.getElementById('chatMessages');
-                const messageDiv = document.createElement('div');
-                messageDiv.className = `message message-${role}`;
-                messageDiv.textContent = text;
-                chatMessages.appendChild(messageDiv);
-                chatMessages.scrollTop = chatMessages.scrollHeight;
-            }
-            
-            // Handle Enter key
-            document.getElementById('chatInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    sendMessage();
-                }
-            });
-            
-            // Auto-scroll to bottom
-            function scrollToBottom() {
-                const chatMessages = document.getElementById('chatMessages');
-                chatMessages.scrollTop = chatMessages.scrollHeight;
-            }
-            
-            // Scroll to bottom when page loads
-            window.addEventListener('load', scrollToBottom);
-        </script>
-    </body>
-    </html>
-    """
+    # Add some spacing
+    st.markdown("<br><br>", unsafe_allow_html=True)
     
-    # Display the custom chat interface
-    st.components.v1.html(chat_html, height=600)
+    # Chat input with image upload
+    col1, col2 = st.columns([6, 1])
     
-    # Handle messages from the custom interface
-    if st.session_state.get('user_message'):
-        user_message = st.session_state.user_message
-        
+    with col1:
+        prompt = st.chat_input("Ask me anything about HBS systems...", key="main_chat_input")
+    
+    with col2:
+        uploaded_image = st.file_uploader(
+            "📷",
+            type=['png', 'jpg', 'jpeg'],
+            key="image_upload",
+            help="Upload an image to ask questions about it"
+        )
+
+    # Process user input
+    if prompt:
         # Add user message
-        st.session_state.messages.append({"role": "user", "content": user_message})
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
         # Check if this is a conversational query first
-        conversational_response = get_conversational_response(user_message)
+        conversational_response = get_conversational_response(prompt)
         
         if conversational_response:
             # For conversational queries, don't search KB or show sources
@@ -1118,10 +1017,10 @@ def main():
             
             # Classify user intent using LLM
             user_intent = None
-            if conversation_context:
+            if conversation_context:  # Only classify if there's conversation context
                 with st.spinner("Understanding your request..."):
                     user_intent = classify_user_intent(
-                        user_message,
+                        prompt,
                         conversation_context,
                         st.session_state.model_name,
                         st.session_state.project_id,
@@ -1132,19 +1031,19 @@ def main():
             # Search for relevant context
             with st.spinner("Thinking..."):
                 context_chunks = search_index(
-                    user_message, 
+                    prompt, 
                     st.session_state.index, 
                     st.session_state.corpus,
                     st.session_state.project_id,
                     st.session_state.location,
                     st.session_state.creds,
-                    k=2,
-                    min_similarity=0.5
+                    k=2,  # Limit to 2 sources
+                    min_similarity=0.5  # Increased threshold to 0.5
                 )
                 
-                # Generate response
+                # Generate response with conversation context and intent
                 response = generate_response(
-                    user_message,
+                    prompt,
                     context_chunks,
                     st.session_state.model_name,
                     st.session_state.project_id,
@@ -1162,8 +1061,37 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
         
-        # Clear the user message
-        st.session_state.user_message = None
+        # Rerun to update the chat display
+        st.rerun()
+
+    # Handle image upload separately (outside the prompt processing)
+    if uploaded_image:
+        try:
+            image_bytes = uploaded_image.read()
+            with st.spinner("Analyzing image..."):
+                image_response = generate_image_response(
+                    "Please analyze this image and provide relevant information.", 
+                    image_bytes, 
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": f"**Image Analysis:**\n\n{image_response}",
+                    "timestamp": len(st.session_state.messages)
+                })
+        except Exception as e:
+            st.error(f"Error processing image: {str(e)}")
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": "Sorry, I couldn't process the image. Please try again.",
+                "timestamp": len(st.session_state.messages)
+            })
+        
+        # Clear the uploaded image after processing
+        st.session_state.uploaded_image = None
         st.rerun()
         
 if __name__ == "__main__":
