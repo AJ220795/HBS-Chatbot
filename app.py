@@ -1,5 +1,5 @@
-# HBS Help Chatbot - Enhanced Version with All Improvements
-# Implements comprehensive enhancements based on analysis
+# HBS Help Chatbot - Complete Enhanced Version
+# All improvements implemented with LangChain hanging fix
 
 import os
 import io
