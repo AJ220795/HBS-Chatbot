@@ -952,52 +952,60 @@ def main():
     # Main chat interface
     st.title("HBS Help Chatbot")
     
+    # Create a container for chat messages with fixed height
+    chat_container = st.container()
+    
     # Show initial greeting if no messages
     if not st.session_state.messages:
-        with st.chat_message("assistant"):
-            st.markdown("Hi! How can I help you?")
+        with chat_container:
+            with st.chat_message("assistant"):
+                st.markdown("Hi! How can I help you?")
     
-    # Chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if "sources" in message and message["sources"]:
-                with st.expander("Sources"):
-                    for i, source in enumerate(message["sources"][:2]):  # Limit to 2 sources
-                        # Create clickable source link
-                        source_name = source['source']
-                        similarity = source['similarity_score']
-                        content_preview = source['text'][:200] + "..."
-                        
-                        # Try to create a clickable link to the source file
-                        try:
-                            # Check if source file exists in KB directory
-                            source_path = KB_DIR / source_name
-                            if source_path.exists():
-                                # Create a download link
-                                with open(source_path, 'rb') as f:
-                                    file_data = f.read()
-                                
-                                st.download_button(
-                                    label=f"📄 {source_name} (similarity: {similarity:.3f})",
-                                    data=file_data,
-                                    file_name=source_name,
-                                    mime="application/octet-stream",
-                                    key=f"download_{i}_{message.get('timestamp', 0)}"
-                                )
-                            else:
+    # Display chat messages in the container
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if "sources" in message and message["sources"]:
+                    with st.expander("Sources"):
+                        for i, source in enumerate(message["sources"][:2]):  # Limit to 2 sources
+                            # Create clickable source link
+                            source_name = source['source']
+                            similarity = source['similarity_score']
+                            content_preview = source['text'][:200] + "..."
+                            
+                            # Try to create a clickable link to the source file
+                            try:
+                                # Check if source file exists in KB directory
+                                source_path = KB_DIR / source_name
+                                if source_path.exists():
+                                    # Create a download link
+                                    with open(source_path, 'rb') as f:
+                                        file_data = f.read()
+                                    
+                                    st.download_button(
+                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
+                                        data=file_data,
+                                        file_name=source_name,
+                                        mime="application/octet-stream",
+                                        key=f"download_{i}_{message.get('timestamp', 0)}"
+                                    )
+                                else:
+                                    st.write(f"**{source_name}** (similarity: {similarity:.3f})")
+                            except Exception:
                                 st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                        except Exception:
-                            st.write(f"**{source_name}** (similarity: {similarity:.3f})")
-                        
-                        st.write(content_preview)
-                        st.write("---")
+                            
+                            st.write(content_preview)
+                            st.write("---")
 
-    # Chat input with image upload
+    # Fixed chat input at the bottom
+    st.markdown("---")  # Separator line
+    
+    # Chat input with image upload - fixed at bottom
     col1, col2 = st.columns([6, 1])
     
     with col1:
-        prompt = st.chat_input("Ask me anything about HBS systems...")
+        prompt = st.chat_input("Ask me anything about HBS systems...", key="main_chat_input")
     
     with col2:
         uploaded_image = st.file_uploader(
@@ -1011,98 +1019,69 @@ def main():
     if prompt:
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
         
         # Check if this is a conversational query first
         conversational_response = get_conversational_response(prompt)
         
-        with st.chat_message("assistant"):
-            if conversational_response:
-                # For conversational queries, don't search KB or show sources
-                st.markdown(conversational_response)
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": conversational_response,
-                    "timestamp": len(st.session_state.messages)
-                })
-            else:
-                # Get conversation context
-                conversation_context = get_conversation_context(st.session_state.messages)
-                
-                # Classify user intent using LLM
-                user_intent = None
-                if conversation_context:  # Only classify if there's conversation context
-                    with st.spinner("Understanding your request..."):
-                        user_intent = classify_user_intent(
-                            prompt,
-                            conversation_context,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds
-                        )
-                
-                # Search for relevant context
-                with st.spinner("Thinking..."):
-                    context_chunks = search_index(
-                        prompt, 
-                        st.session_state.index, 
-                        st.session_state.corpus,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds,
-                        k=2,  # Limit to 2 sources
-                        min_similarity=0.5  # Increased threshold to 0.5
-                    )
-                    
-                                        # Generate response with conversation context and intent
-                    response = generate_response(
+        if conversational_response:
+            # For conversational queries, don't search KB or show sources
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": conversational_response,
+                "timestamp": len(st.session_state.messages)
+            })
+        else:
+            # Get conversation context
+            conversation_context = get_conversation_context(st.session_state.messages)
+            
+            # Classify user intent using LLM
+            user_intent = None
+            if conversation_context:  # Only classify if there's conversation context
+                with st.spinner("Understanding your request..."):
+                    user_intent = classify_user_intent(
                         prompt,
-                        context_chunks,
+                        conversation_context,
                         st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
-                        st.session_state.creds,
-                        conversation_context,
-                        user_intent
+                        st.session_state.creds
                     )
-                    
-                    st.markdown(response)
-                    
-                    # Show sources if available - limit to 2
-                    if context_chunks:
-                        st.markdown("**Sources:**")
-                        for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
-                            source_name = chunk.get('source', 'Unknown')
-                            similarity = chunk.get('similarity_score', 0.0)
-                            
-                            # Try to read the source file for download
-                            try:
-                                source_path = KB_DIR / source_name
-                                if source_path.exists():
-                                    with open(source_path, 'rb') as f:
-                                        file_data = f.read()
-                                    
-                                    st.download_button(
-                                        label=f"📄 {source_name} (similarity: {similarity:.3f})",
-                                        data=file_data,
-                                        file_name=source_name,
-                                        mime="application/octet-stream",
-                                        key=f"download_{i}_{len(st.session_state.messages)}"
-                                    )
-                                else:
-                                    st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
-                            except Exception as e:
-                                st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
-                    
-                    # Add assistant response to messages
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": response,
-                        "sources": context_chunks,
-                        "timestamp": len(st.session_state.messages)
-                    })
+            
+            # Search for relevant context
+            with st.spinner("Thinking..."):
+                context_chunks = search_index(
+                    prompt, 
+                    st.session_state.index, 
+                    st.session_state.corpus,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    k=2,  # Limit to 2 sources
+                    min_similarity=0.5  # Increased threshold to 0.5
+                )
+                
+                # Generate response with conversation context and intent
+                response = generate_response(
+                    prompt,
+                    context_chunks,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    conversation_context,
+                    user_intent
+                )
+                
+                # Add assistant response to messages
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "sources": context_chunks,
+                    "timestamp": len(st.session_state.messages)
+                })
+        
+        # Rerun to update the chat display
+        st.rerun()
 
     # Handle image upload separately (outside the prompt processing)
     if uploaded_image:
