@@ -863,18 +863,18 @@ If this appears to be a screenshot or document related to HBS systems, provide d
 
 # ---- LangChain Integration ----
 @st.cache_resource
-def get_langchain_llm(project_id: str, location: str, credentials, model_name: str):
+def get_langchain_llm(project_id: str, location: str, _credentials, model_name: str):
     """Get LangChain LLM instance"""
     if not LANGCHAIN_AVAILABLE:
         return None
     
     try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
+        vertexai_init(project=project_id, location=location, credentials=_credentials)
         llm = VertexAI(
             model_name=model_name,
             project=project_id,
             location=location,
-            credentials=credentials,
+            credentials=_credentials,
             temperature=0.1,
             max_output_tokens=2048,
             top_p=0.8,
@@ -886,13 +886,13 @@ def get_langchain_llm(project_id: str, location: str, credentials, model_name: s
         return None
 
 @st.cache_resource
-def get_conversation_chain(project_id: str, location: str, credentials, model_name: str):
+def get_conversation_chain(project_id: str, location: str, _credentials, model_name: str):
     """Get LangChain conversation chain with memory"""
     if not LANGCHAIN_AVAILABLE:
         return None
     
     try:
-        llm = get_langchain_llm(project_id, location, credentials, model_name)
+        llm = get_langchain_llm(project_id, location, _credentials, model_name)
         if not llm:
             return None
         
@@ -957,13 +957,13 @@ RESPONSE:"""
         st.error(f"Error creating conversation chain: {e}")
         return None
 
-def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, project_id: str, location: str, credentials, model_name: str) -> str:
+def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, project_id: str, location: str, _credentials, model_name: str) -> str:
     """Generate response using LangChain with conversation memory"""
     if not LANGCHAIN_AVAILABLE:
         return None
     
     try:
-        chain = get_conversation_chain(project_id, location, credentials, model_name)
+        chain = get_conversation_chain(project_id, location, _credentials, model_name)
         if not chain:
             return None
         
