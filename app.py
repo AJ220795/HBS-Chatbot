@@ -848,58 +848,113 @@ def main():
         layout="wide"
     )
     
-    # Add custom CSS for fixed chat layout
+    # Add custom CSS for fixed chat layout - more aggressive override
     st.markdown("""
     <style>
+    /* Override Streamlit's default behavior */
     .main .block-container {
         padding-top: 1rem;
         padding-bottom: 0rem;
         max-width: 100%;
+        height: 100vh;
+        overflow: hidden;
     }
     
-    .chat-container {
-        height: 70vh;
-        overflow-y: auto;
-        border: 1px solid #e0e0e0;
-        border-radius: 10px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-        background-color: #fafafa;
+    /* Hide Streamlit's default scrolling */
+    .main {
+        overflow: hidden !important;
     }
     
-    .chat-input-container {
-        position: sticky;
+    /* Create fixed chat layout */
+    .chat-layout {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
         bottom: 0;
-        background-color: white;
+        background: white;
+        z-index: 1000;
+    }
+    
+    .chat-header {
+        padding: 1rem;
+        border-bottom: 1px solid #e0e0e0;
+        background: white;
+        flex-shrink: 0;
+    }
+    
+    .chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 1rem;
+        background: #f8f9fa;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+    
+    .chat-input-area {
         padding: 1rem;
         border-top: 1px solid #e0e0e0;
-        border-radius: 10px;
-        margin-top: 1rem;
-    }
-    
-    .stChatInput > div > div > input {
-        border-radius: 25px;
+        background: white;
+        flex-shrink: 0;
     }
     
     .message-user {
         background-color: #007bff;
         color: white;
-        padding: 10px 15px;
+        padding: 12px 16px;
         border-radius: 18px 18px 5px 18px;
-        margin: 5px 0;
-        max-width: 80%;
+        max-width: 70%;
         margin-left: auto;
-        text-align: right;
+        word-wrap: break-word;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     
     .message-assistant {
-        background-color: #e9ecef;
-        color: black;
-        padding: 10px 15px;
+        background-color: white;
+        color: #333;
+        padding: 12px 16px;
         border-radius: 18px 18px 18px 5px;
-        margin: 5px 0;
-        max-width: 80%;
+        max-width: 70%;
         margin-right: auto;
+        word-wrap: break-word;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border: 1px solid #e0e0e0;
+    }
+    
+    .sources {
+        background-color: #f8f9fa;
+        padding: 8px 12px;
+        border-radius: 8px;
+        margin-top: 8px;
+        font-size: 0.9em;
+        border-left: 3px solid #007bff;
+    }
+    
+    /* Hide Streamlit elements we don't want */
+    .stApp > header {
+        display: none;
+    }
+    
+    .stApp > div:first-child {
+        display: none;
+    }
+    
+    /* Custom input styling */
+    .stChatInput > div > div > input {
+        border-radius: 25px;
+        border: 2px solid #e0e0e0;
+        padding: 12px 20px;
+        font-size: 16px;
+    }
+    
+    .stChatInput > div > div > input:focus {
+        border-color: #007bff;
+        box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1005,11 +1060,14 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Main chat interface
-    st.title("HBS Help Chatbot")
-    
-    # Create chat container
-    chat_html = '<div class="chat-container">'
+    # Create the fixed chat layout using HTML
+    chat_html = '''
+    <div class="chat-layout">
+        <div class="chat-header">
+            <h1>HBS Help Chatbot</h1>
+        </div>
+        <div class="chat-messages" id="chatMessages">
+    '''
     
     # Show initial greeting if no messages
     if not st.session_state.messages:
@@ -1023,20 +1081,20 @@ def main():
             chat_html += f'<div class="message-assistant">{message["content"]}</div>'
             # Add sources if available
             if "sources" in message and message["sources"]:
-                chat_html += '<div class="message-assistant"><strong>Sources:</strong><br>'
+                chat_html += '<div class="sources"><strong>Sources:</strong><br>'
                 for i, source in enumerate(message["sources"][:2]):
                     source_name = source['source']
                     similarity = source['similarity_score']
                     chat_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
                 chat_html += '</div>'
     
-    chat_html += '</div>'
+    chat_html += '''
+        </div>
+        <div class="chat-input-area">
+    '''
     
-    # Display chat container
+    # Display the chat layout
     st.markdown(chat_html, unsafe_allow_html=True)
-    
-    # Chat input container
-    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
     
     # Chat input with image upload
     col1, col2 = st.columns([6, 1])
@@ -1052,7 +1110,30 @@ def main():
             help="Upload an image to ask questions about it"
         )
     
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Close the chat layout HTML
+    st.markdown('</div></div>', unsafe_allow_html=True)
+    
+    # Add JavaScript to auto-scroll to bottom
+    st.markdown("""
+    <script>
+    function scrollToBottom() {
+        const chatMessages = document.getElementById('chatMessages');
+        if (chatMessages) {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    }
+    
+    // Scroll to bottom when page loads
+    window.addEventListener('load', scrollToBottom);
+    
+    // Scroll to bottom when new messages are added
+    const observer = new MutationObserver(scrollToBottom);
+    const chatMessages = document.getElementById('chatMessages');
+    if (chatMessages) {
+        observer.observe(chatMessages, { childList: true });
+    }
+    </script>
+    """, unsafe_allow_html=True)
 
     # Process user input
     if prompt:
@@ -1151,6 +1232,6 @@ def main():
         # Clear the uploaded image after processing
         st.session_state.uploaded_image = None
         st.rerun()
-
+        
 if __name__ == "__main__":
     main()
