@@ -993,7 +993,7 @@ def main():
                         st.write(content_preview)
                         st.write("---")
 
-     # Chat input with image upload
+    # Chat input with image upload
     col1, col2 = st.columns([6, 1])
     
     with col1:
@@ -1009,6 +1009,10 @@ def main():
 
     # Process user input
     if prompt:
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
         
         # Check if this is a conversational query first
         conversational_response = get_conversational_response(prompt)
@@ -1052,7 +1056,7 @@ def main():
                         min_similarity=0.5  # Increased threshold to 0.5
                     )
                     
-                    # Generate response with conversation context and intent
+                                        # Generate response with conversation context and intent
                     response = generate_response(
                         prompt,
                         context_chunks,
@@ -1066,12 +1070,12 @@ def main():
                     
                     st.markdown(response)
                     
-                   # Show sources if available - limit to 2
+                    # Show sources if available - limit to 2
                     if context_chunks:
                         st.markdown("**Sources:**")
                         for i, chunk in enumerate(context_chunks[:2]):  # Limit to 2 sources
                             source_name = chunk.get('source', 'Unknown')
-                            similarity = chunk.get('similarity', 0.0)
+                            similarity = chunk.get('similarity_score', 0.0)
                             
                             # Try to read the source file for download
                             try:
@@ -1092,34 +1096,15 @@ def main():
                             except Exception as e:
                                 st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
                     
-                     # Handle image upload
-                    if uploaded_image:
-                        try:
-                            image_bytes = uploaded_image.read()
-                            with st.spinner("Analyzing image..."):
-                                image_response = generate_image_response(
-                                    prompt, image_bytes, model_name, project_id, location, credentials
-                                )
-                                st.session_state.messages.append({
-                                    "role": "assistant", 
-                                    "content": f"**Image Analysis:**\n\n{image_response}"
-                                })
-                        except Exception as e:
-                            st.error(f"Error processing image: {str(e)}")
-                            st.session_state.messages.append({
-                                "role": "assistant", 
-                                "content": "Sorry, I couldn't process the image. Please try again."
-                            })
-                    
-                    # Clear the uploaded image after processing
-                    if uploaded_image:
-                        st.session_state.uploaded_image = None
-                        st.rerun()
+                    # Add assistant response to messages
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "sources": context_chunks,
+                        "timestamp": len(st.session_state.messages)
+                    })
 
-if __name__ == "__main__":
-    main()
-
- # Handle image upload separately (outside the prompt processing)
+    # Handle image upload separately (outside the prompt processing)
     if uploaded_image:
         try:
             image_bytes = uploaded_image.read()
@@ -1148,3 +1133,6 @@ if __name__ == "__main__":
         # Clear the uploaded image after processing
         st.session_state.uploaded_image = None
         st.rerun()
+
+if __name__ == "__main__":
+    main()
