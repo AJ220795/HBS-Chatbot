@@ -848,113 +848,50 @@ def main():
         layout="wide"
     )
     
-    # Add custom CSS for fixed chat layout - more aggressive override
+    # Add minimal CSS for better chat layout
     st.markdown("""
     <style>
-    /* Override Streamlit's default behavior */
     .main .block-container {
         padding-top: 1rem;
         padding-bottom: 0rem;
         max-width: 100%;
-        height: 100vh;
-        overflow: hidden;
     }
     
-    /* Hide Streamlit's default scrolling */
-    .main {
-        overflow: hidden !important;
-    }
-    
-    /* Create fixed chat layout */
-    .chat-layout {
-        display: flex;
-        flex-direction: column;
-        height: 100vh;
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: white;
-        z-index: 1000;
-    }
-    
-    .chat-header {
-        padding: 1rem;
-        border-bottom: 1px solid #e0e0e0;
-        background: white;
-        flex-shrink: 0;
-    }
-    
-    .chat-messages {
-        flex: 1;
-        overflow-y: auto;
-        padding: 1rem;
-        background: #f8f9fa;
-        display: flex;
-        flex-direction: column;
-        gap: 1rem;
-    }
-    
-    .chat-input-area {
-        padding: 1rem;
-        border-top: 1px solid #e0e0e0;
-        background: white;
-        flex-shrink: 0;
+    .chat-message {
+        margin: 10px 0;
+        padding: 12px 16px;
+        border-radius: 18px;
+        max-width: 80%;
+        word-wrap: break-word;
     }
     
     .message-user {
         background-color: #007bff;
         color: white;
-        padding: 12px 16px;
-        border-radius: 18px 18px 5px 18px;
-        max-width: 70%;
         margin-left: auto;
-        word-wrap: break-word;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border-radius: 18px 18px 5px 18px;
     }
     
     .message-assistant {
-        background-color: white;
+        background-color: #f1f3f4;
         color: #333;
-        padding: 12px 16px;
-        border-radius: 18px 18px 18px 5px;
-        max-width: 70%;
         margin-right: auto;
-        word-wrap: break-word;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        border: 1px solid #e0e0e0;
+        border-radius: 18px 18px 18px 5px;
     }
     
-    .sources {
-        background-color: #f8f9fa;
+    .sources-box {
+        background-color: #e3f2fd;
         padding: 8px 12px;
         border-radius: 8px;
         margin-top: 8px;
         font-size: 0.9em;
-        border-left: 3px solid #007bff;
+        border-left: 3px solid #2196f3;
     }
     
-    /* Hide Streamlit elements we don't want */
-    .stApp > header {
-        display: none;
-    }
-    
-    .stApp > div:first-child {
-        display: none;
-    }
-    
-    /* Custom input styling */
     .stChatInput > div > div > input {
         border-radius: 25px;
         border: 2px solid #e0e0e0;
         padding: 12px 20px;
-        font-size: 16px;
-    }
-    
-    .stChatInput > div > div > input:focus {
-        border-color: #007bff;
-        box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1060,41 +997,32 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Create the fixed chat layout using HTML
-    chat_html = '''
-    <div class="chat-layout">
-        <div class="chat-header">
-            <h1>HBS Help Chatbot</h1>
-        </div>
-        <div class="chat-messages" id="chatMessages">
-    '''
+    # Main chat interface
+    st.title("HBS Help Chatbot")
     
     # Show initial greeting if no messages
     if not st.session_state.messages:
-        chat_html += '<div class="message-assistant">Hi! How can I help you?</div>'
+        st.markdown('<div class="chat-message message-assistant">Hi! How can I help you?</div>', unsafe_allow_html=True)
     
     # Display chat messages
     for message in st.session_state.messages:
         if message["role"] == "user":
-            chat_html += f'<div class="message-user">{message["content"]}</div>'
+            st.markdown(f'<div class="chat-message message-user">{message["content"]}</div>', unsafe_allow_html=True)
         else:
-            chat_html += f'<div class="message-assistant">{message["content"]}</div>'
+            st.markdown(f'<div class="chat-message message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
+            
             # Add sources if available
             if "sources" in message and message["sources"]:
-                chat_html += '<div class="sources"><strong>Sources:</strong><br>'
+                sources_html = '<div class="sources-box"><strong>Sources:</strong><br>'
                 for i, source in enumerate(message["sources"][:2]):
                     source_name = source['source']
                     similarity = source['similarity_score']
-                    chat_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
-                chat_html += '</div>'
+                    sources_html += f'📄 {source_name} (similarity: {similarity:.3f})<br>'
+                sources_html += '</div>'
+                st.markdown(sources_html, unsafe_allow_html=True)
     
-    chat_html += '''
-        </div>
-        <div class="chat-input-area">
-    '''
-    
-    # Display the chat layout
-    st.markdown(chat_html, unsafe_allow_html=True)
+    # Add some spacing before the input
+    st.markdown("<br>", unsafe_allow_html=True)
     
     # Chat input with image upload
     col1, col2 = st.columns([6, 1])
@@ -1109,31 +1037,6 @@ def main():
             key="image_upload",
             help="Upload an image to ask questions about it"
         )
-    
-    # Close the chat layout HTML
-    st.markdown('</div></div>', unsafe_allow_html=True)
-    
-    # Add JavaScript to auto-scroll to bottom
-    st.markdown("""
-    <script>
-    function scrollToBottom() {
-        const chatMessages = document.getElementById('chatMessages');
-        if (chatMessages) {
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-    }
-    
-    // Scroll to bottom when page loads
-    window.addEventListener('load', scrollToBottom);
-    
-    // Scroll to bottom when new messages are added
-    const observer = new MutationObserver(scrollToBottom);
-    const chatMessages = document.getElementById('chatMessages');
-    if (chatMessages) {
-        observer.observe(chatMessages, { childList: true });
-    }
-    </script>
-    """, unsafe_allow_html=True)
 
     # Process user input
     if prompt:
