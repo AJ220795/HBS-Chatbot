@@ -1219,7 +1219,7 @@ def main():
                         st.error(f"Error displaying image {image_info['source']}: {e}")
     
     # Image upload section
-    st.subheader("📷 Upload Image for Analysis")
+    
     uploaded_image = st.file_uploader(
         "Choose an image file",
         type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
