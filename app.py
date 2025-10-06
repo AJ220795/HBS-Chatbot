@@ -1194,7 +1194,7 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Main chat interface
+        # Main chat interface
     st.title("HBS Help Chatbot")
     
     # Display welcome message if no messages yet
@@ -1217,10 +1217,9 @@ def main():
                         if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=f"source_{source_name}_{hash(source['text'])}"):
                             display_document_content(source_name, source['text'])
     
-    # Image upload section
-    st.subheader("📷 Upload Image for Analysis")
+    # Image upload section - moved right above chat input
     uploaded_image = st.file_uploader(
-        "Choose an image file",
+        "📷 Upload Image for Analysis",
         type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
         key="image_uploader"
     )
@@ -1340,6 +1339,6 @@ def main():
         
         # Rerun to update the chat display
         st.rerun()
-
+        
 if __name__ == "__main__":
     main()
