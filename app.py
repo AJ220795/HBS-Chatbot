@@ -93,13 +93,9 @@ def extract_text_from_image_bytes(b: bytes) -> str:
         return ""
 
 # -----------------------
-# OCR report parsing (kept minimal)
+# OCR report parsing (minimal example hooks)
 # -----------------------
 def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
-    """
-    Very light example: recognize 'overdue' or 'outbound' as hints.
-    Extend as needed with your full parsing rules.
-    """
     data = []
     txt = ocr_text.lower()
     if "overdue" in txt:
@@ -246,7 +242,9 @@ def get_conversation_context(messages: List[Dict], max_context: int = 3) -> str:
         if m["role"] == "user":
             parts.append(f"User: {m['content']}")
         elif m["role"] == "assistant":
-            parts.append(f"Assistant: {m['content'].split('\\n\\n')[0]}")
+            # Avoid backslashes in f-string expression: precompute split
+            first_para = m["content"].split("\n\n", 1)[0]
+            parts.append(f"Assistant: {first_para}")
     return "\n".join(parts)
 
 def classify_user_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
@@ -326,7 +324,7 @@ def main():
 
     # Session state
     if "messages" not in st.session_state:
-        st.session_state.messages = []  # We'll render the first greeting directly in HTML, not in state
+        st.session_state.messages = []  # fixed greeting is rendered in HTML, not stored
     if "index" not in st.session_state:
         st.session_state.index = None
     if "corpus" not in st.session_state:
@@ -394,7 +392,6 @@ def main():
                         save_index_and_corpus(idx, corp)
                         st.session_state.index = idx
                         st.session_state.corpus = corp
-                        st.session_state.kb_loaded = True
                         st.success("Index rebuilt successfully!")
                         st.rerun()
                     else:
@@ -406,10 +403,9 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # -------- Build custom HTML (UI you requested) --------
-    # Render existing messages inside the HTML thread
+    # -------- Build custom HTML (UI) --------
     msgs_html = []
-    # fixed greeting at top (not stored in session to avoid ordering weirdness)
+    # fixed assistant greeting (not in session to keep ordering)
     msgs_html.append('<div class="message message-assistant">Hi! How can I help you?</div>')
     for m in st.session_state.messages:
         role_class = "message-user" if m["role"] == "user" else "message-assistant"
@@ -527,7 +523,6 @@ def main():
     if evt:
         try:
             if isinstance(evt, str):
-                # Backward-compat if only a raw string is sent
                 user_message = evt
                 st.session_state.messages.append({"role": "user", "content": user_message})
             elif isinstance(evt, dict):
@@ -568,13 +563,11 @@ def main():
                         st.rerun()
 
                 elif kind == "image":
-                    # evt["data"] is a data URL: "data:<mime>;base64,<payload>"
                     data_url = evt.get("data", "")
                     if data_url.startswith("data:") and ";base64," in data_url:
                         header, b64 = data_url.split(",", 1)
                         mime = header[5:].split(";")[0] or "image/jpeg"
                         raw = base64.b64decode(b64)
-                        # Analyze
                         resp = generate_image_response(
                             "Please analyze this image and provide relevant information.",
                             raw, st.session_state.model_name,
