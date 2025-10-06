@@ -23,7 +23,7 @@ from PIL import Image as PILImage
 
 # LangChain imports 
 try:
-    from langchain_community.llms import VertexAI
+    from langchain_google_vertexai import VertexAI
     from langchain.memory import ConversationBufferWindowMemory
     from langchain.chains import ConversationChain
     from langchain.prompts import PromptTemplate
@@ -46,8 +46,8 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro"
 ]
 
 DEFAULT_LOCATION = "us-central1"
@@ -496,6 +496,7 @@ def process_kb_files() -> List[Dict]:
     
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
+    st.write(f"DEBUG: Found {len(files)} files in KB directory: {[f.name for f in files]}")
     
     for file_path in files:
         if file_path.is_file():
@@ -603,6 +604,25 @@ def process_kb_files() -> List[Dict]:
                 st.error(f"Error processing {file_path.name}: {e}")
     
     return corpus
+
+def get_conversation_context(messages: List[Dict]) -> str:
+    """Extract conversation context from recent messages"""
+    if not messages or len(messages) < 2:
+        return ""
+    
+    # Get last few messages for context
+    recent_messages = messages[-6:]  # Last 3 exchanges
+    
+    context_parts = []
+    for msg in recent_messages:
+        role = msg["role"]
+        content = msg["content"]
+        if role == "user":
+            context_parts.append(f"User: {content}")
+        elif role == "assistant":
+            context_parts.append(f"Assistant: {content}")
+    
+    return "\n".join(context_parts)
 
 # ---- Semantic Analysis Functions ----
 def analyze_user_sentiment_and_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
@@ -759,8 +779,6 @@ INSTRUCTIONS:
    - Always be helpful and professional
    - Use appropriate tone based on user sentiment
 
-5. **ESCALATION**: If escalation is needed, offer human support options
-
 RESPONSE:"""
 
     try:
@@ -869,12 +887,14 @@ def get_langchain_llm(project_id: str, location: str, _credentials, model_name: 
         return None
     
     try:
+        # Initialize Vertex AI
         vertexai_init(project=project_id, location=location, credentials=_credentials)
+        
+        # Create LangChain VertexAI instance
         llm = VertexAI(
             model_name=model_name,
             project=project_id,
             location=location,
-            credentials=_credentials,
             temperature=0.1,
             max_output_tokens=2048,
             top_p=0.8,
@@ -1103,7 +1123,7 @@ def main():
                     st.write(f"**Query:** {req['query']}")
                     st.write(f"**Intent:** {req['user_analysis'].get('intent', 'unknown') if req['user_analysis'] else 'unknown'}")
                     st.write(f"**Sentiment:** {req['user_analysis'].get('sentiment', 'unknown') if req['user_analysis'] else 'unknown'}")
-                    st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
+                                        st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
         
         # Rebuild index button
         if st.button("🔄 Rebuild Index", key="rebuild_btn"):
