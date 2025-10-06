@@ -1219,7 +1219,6 @@ def main():
                             display_document_content(source_name, source['text'])
     
     # Image upload section
-    st.subheader("📷 Upload Image for Analysis")
     uploaded_image = st.file_uploader(
         "Choose an image file",
         type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
