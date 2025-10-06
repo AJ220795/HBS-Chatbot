@@ -1002,7 +1002,7 @@ def main():
     st.markdown("---")  # Separator line
     
     # Chat input with image upload - fixed at bottom
-    col1, col2 = st.columns([1, 0.5])
+    col1, col2 = st.columns([10, 1])
     
     with col1:
         prompt = st.chat_input("Ask me anything about HBS systems...", key="main_chat_input")
