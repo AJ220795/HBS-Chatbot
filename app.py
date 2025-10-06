@@ -1122,8 +1122,8 @@ def main():
         st.stop()
 
    # Initialize app
-    @st.cache_resource
-    def initialize_app():
+@st.cache_resource
+def initialize_app():
     """Initialize the app - load index or build from KB files"""
     # Try to load existing index first
     index, corpus = load_index_and_corpus()
