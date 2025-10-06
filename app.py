@@ -46,10 +46,7 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash-001",
-    "gemini-1.5-pro-001",
+    "gemini-2.5-pro"
 ]
 
 DEFAULT_LOCATION = "us-central1"
