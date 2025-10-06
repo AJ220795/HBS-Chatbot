@@ -922,10 +922,10 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
             return_messages=True
         )
         
-        # Create prompt template
+        # Create prompt template - simplified for ConversationChain
         prompt = PromptTemplate(
-            input_variables=["history", "input", "context", "user_analysis"],
-            template="""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
+            input_variables=["history", "input"],
+            template="""You are an expert HBS (Help Business System) assistant.
 
 CONTEXT FROM KNOWLEDGE BASE:
 {context}
