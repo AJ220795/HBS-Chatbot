@@ -1100,7 +1100,7 @@ def main():
         layout="wide"
     )
     
-    # Initialize session state
+    # Initialize session state FIRST - before any other code
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "index" not in st.session_state:
@@ -1133,197 +1133,209 @@ def main():
         st.stop()
 
     # Initialize app
-@st.cache_resource
-def initialize_app():
-    """Initialize the app - load index or build from KB files"""
-    # Try to load existing index first
-    index, corpus = load_index_and_corpus()
-    if index is not None and corpus:
-        return index, corpus, True
-    
-    # Build index from KB files
-    corpus = process_kb_files()
-    if not corpus:
-        return None, [], False
-    
-    index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
-    if index is not None:
-        save_index_and_corpus(index, corpus)
-        return index, corpus, True
-    
-    return None, [], False
-
-# Initialize the app
-st.session_state.index, st.session_state.corpus, st.session_state.kb_loaded = initialize_app()
-
-# Sidebar
-with st.sidebar:
-    st.title("HBS Help Chatbot")
-    
-    # Model selection
-    st.subheader("Model Settings")
-    model_choice = st.selectbox(
-        "Select Model:",
-        CANDIDATE_MODELS,
-        index=0,
-        key="model_selector"
-    )
-    st.session_state.model_name = model_choice
-    
-    # LangChain toggle
-    if LANGCHAIN_AVAILABLE:
-        st.subheader("Advanced Features")
-        use_langchain = st.toggle(
-            "Use LangChain (Enhanced Memory)",
-            value=st.session_state.use_langchain,
-            key="langchain_toggle"
-        )
-        st.session_state.use_langchain = use_langchain
-    else:
-        st.session_state.use_langchain = False
-    
-    # KB status
-    st.subheader("Knowledge Base Status")
-    if st.session_state.kb_loaded:
-        st.success(f"✅ KB Loaded ({len(st.session_state.corpus)} chunks)")
-    else:
-        st.error("❌ KB Not Loaded")
-    
-    # Debug mode toggle
-    st.subheader("Debug Settings")
-    debug_mode = st.toggle("Debug Mode", value=DEBUG_MODE, key="debug_toggle")
-    if debug_mode:
-        st.write("Debug mode enabled - check console for detailed logs")
-    
-    # Clear chat button
-    if st.button("🗑️ Clear Chat", key="clear_chat"):
-        st.session_state.messages = []
-        st.rerun()
-
-# Main chat interface
-st.title("HBS Help Chatbot")
-st.markdown("Ask me anything about HBS reports, procedures, or system features!")
-
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    @st.cache_resource
+    def initialize_app():
+        """Initialize the app - load index or build from KB files"""
+        # Try to load existing index first
+        index, corpus = load_index_and_corpus()
+        if index is not None and corpus:
+            return index, corpus, True
         
-        # Display sources if available
-        if "sources" in message and message["sources"]:
-            st.markdown("**Sources:**")
-            for i, source in enumerate(message["sources"]):
-                source_name = source.get("source", "Unknown")
-                similarity = source.get("similarity_score", 0)
-                
-                # Create unique key for each source button
-                button_key = f"source_{len(st.session_state.messages)}_{i}_{hash(source.get('text', ''))}"
-                
-                if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=button_key):
-                    display_document_content(source_name, source.get("text", ""))
+        # Build index from KB files
+        corpus = process_kb_files()
+        if not corpus:
+            return None, [], False
+        
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+        if index is not None:
+            save_index_and_corpus(index, corpus)
+            return index, corpus, True
+        
+        return None, [], False
 
-# Chat input
-col1, col2 = st.columns([6, 1])
+    # Initialize the app
+    st.session_state.index, st.session_state.corpus, st.session_state.kb_loaded = initialize_app()
 
-with col1:
-    prompt = st.chat_input("Ask me anything about HBS...", key="chat_input")
-
-with col2:
-    uploaded_image = st.file_uploader(
-        "📷",
-        type=["png", "jpg", "jpeg", "webp", "bmp", "tiff"],
-        key="image_uploader",
-        help="Upload an image for analysis"
-    )
-
-# Process user input
-if prompt:
-    # Sanitize user input
-    prompt = sanitize_user_input(prompt)
-    
-    # Add user message to chat
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    # Display user message
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # Process image if uploaded
-    if uploaded_image:
-        try:
-            image_bytes = uploaded_image.read()
-            image_response = process_user_uploaded_image(
-                image_bytes, 
-                prompt, 
-                st.session_state.model_name,
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.creds
+    # Sidebar
+    with st.sidebar:
+        st.title("HBS Help Chatbot")
+        
+        # Model selection
+        st.subheader("Model Settings")
+        model_choice = st.selectbox(
+            "Select Model:",
+            CANDIDATE_MODELS,
+            index=0,
+            key="model_selector"
+        )
+        st.session_state.model_name = model_choice
+        
+        # LangChain toggle
+        if LANGCHAIN_AVAILABLE:
+            st.subheader("Advanced Features")
+            use_langchain = st.toggle(
+                "Use LangChain (Enhanced Memory)",
+                value=st.session_state.use_langchain,
+                key="langchain_toggle"
             )
-            
-            # Add assistant response
-            st.session_state.messages.append({"role": "assistant", "content": image_response})
-            
-            # Display assistant response
-            with st.chat_message("assistant"):
-                st.markdown(image_response)
-            
-            # Clear the uploaded image
-            uploaded_image = None
+            st.session_state.use_langchain = use_langchain
+        else:
+            st.session_state.use_langchain = False
+        
+        # KB status
+        st.subheader("Knowledge Base Status")
+        if st.session_state.kb_loaded:
+            st.success(f"✅ KB Loaded ({len(st.session_state.corpus)} chunks)")
+        else:
+            st.error("❌ KB Not Loaded")
+        
+        # Debug mode toggle
+        st.subheader("Debug Settings")
+        debug_mode = st.toggle("Debug Mode", value=DEBUG_MODE, key="debug_toggle")
+        if debug_mode:
+            st.write("Debug mode enabled - check console for detailed logs")
+        
+        # Clear chat button
+        if st.button("🗑️ Clear Chat", key="clear_chat"):
+            st.session_state.messages = []
             st.rerun()
+
+    # Main chat interface
+    st.title("HBS Help Chatbot")
+    st.markdown("Ask me anything about HBS reports, procedures, or system features!")
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
             
-        except Exception as e:
-            error_msg = f"Error processing image: {str(e)}"
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
-            
-            with st.chat_message("assistant"):
-                st.markdown(error_msg)
-    
-    else:
-        # Regular text processing
-        try:
-            # Get conversation context
-            conversation_context = get_conversation_context(st.session_state.messages)
-            
-            # Analyze user intent and sentiment
-            user_analysis = analyze_user_sentiment_and_intent(
-                prompt, 
-                conversation_context,
-                st.session_state.model_name,
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.creds
-            )
-            
-            # Search knowledge base
-            context_chunks = search_index(
-                prompt,
-                st.session_state.index,
-                st.session_state.corpus,
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.creds,
-                k=2,
-                min_similarity=0.5
-            )
-            
-            # Generate response
-            if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
-                with st.spinner("Thinking..."):
-                    response = generate_response_with_langchain(
-                        prompt,
-                        context_chunks,
-                        user_analysis,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds,
-                        st.session_state.model_name
-                    )
+            # Display sources if available
+            if "sources" in message and message["sources"]:
+                st.markdown("**Sources:**")
+                for i, source in enumerate(message["sources"]):
+                    source_name = source.get("source", "Unknown")
+                    similarity = source.get("similarity_score", 0)
+                    
+                    # Create unique key for each source button
+                    button_key = f"source_{len(st.session_state.messages)}_{i}_{hash(source.get('text', ''))}"
+                    
+                    if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=button_key):
+                        display_document_content(source_name, source.get("text", ""))
+
+    # Chat input
+    col1, col2 = st.columns([6, 1])
+
+    with col1:
+        prompt = st.chat_input("Ask me anything about HBS...", key="chat_input")
+
+    with col2:
+        uploaded_image = st.file_uploader(
+            "📷",
+            type=["png", "jpg", "jpeg", "webp", "bmp", "tiff"],
+            key="image_uploader",
+            help="Upload an image for analysis"
+        )
+
+    # Process user input
+    if prompt:
+        # Sanitize user input
+        prompt = sanitize_user_input(prompt)
+        
+        # Add user message to chat
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Process image if uploaded
+        if uploaded_image:
+            try:
+                image_bytes = uploaded_image.read()
+                image_response = process_user_uploaded_image(
+                    image_bytes, 
+                    prompt, 
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
                 
-                # Fallback if LangChain fails
-                if not response:
-                    st.warning("LangChain failed, using fallback response...")
-                    with st.spinner("Generating fallback response..."):
+                # Add assistant response
+                st.session_state.messages.append({"role": "assistant", "content": image_response})
+                
+                # Display assistant response
+                with st.chat_message("assistant"):
+                    st.markdown(image_response)
+                
+                # Clear the uploaded image
+                uploaded_image = None
+                st.rerun()
+                
+            except Exception as e:
+                error_msg = f"Error processing image: {str(e)}"
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                
+                with st.chat_message("assistant"):
+                    st.markdown(error_msg)
+        
+        else:
+            # Regular text processing
+            try:
+                # Get conversation context
+                conversation_context = get_conversation_context(st.session_state.messages)
+                
+                # Analyze user intent and sentiment
+                user_analysis = analyze_user_sentiment_and_intent(
+                    prompt, 
+                    conversation_context,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                
+                # Search knowledge base
+                context_chunks = search_index(
+                    prompt,
+                    st.session_state.index,
+                    st.session_state.corpus,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds,
+                    k=2,
+                    min_similarity=0.5
+                )
+                
+                # Generate response
+                if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
+                    with st.spinner("Thinking..."):
+                        response = generate_response_with_langchain(
+                            prompt,
+                            context_chunks,
+                            user_analysis,
+                            st.session_state.project_id,
+                            st.session_state.location,
+                            st.session_state.creds,
+                            st.session_state.model_name
+                        )
+                    
+                    # Fallback if LangChain fails
+                    if not response:
+                        st.warning("LangChain failed, using fallback response...")
+                        with st.spinner("Generating fallback response..."):
+                            response = generate_semantic_response(
+                                prompt,
+                                context_chunks,
+                                user_analysis,
+                                conversation_context,
+                                st.session_state.model_name,
+                                st.session_state.project_id,
+                                st.session_state.location,
+                                st.session_state.creds
+                            )
+                else:
+                    with st.spinner("Thinking..."):
                         response = generate_semantic_response(
                             prompt,
                             context_chunks,
@@ -1334,62 +1346,50 @@ if prompt:
                             st.session_state.location,
                             st.session_state.creds
                         )
-            else:
-                with st.spinner("Thinking..."):
-                    response = generate_semantic_response(
-                        prompt,
-                        context_chunks,
-                        user_analysis,
-                        conversation_context,
-                        st.session_state.model_name,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds
-                    )
-            
-            # Check if escalation is needed
-            if user_analysis.get('escalation_needed', False):
-                response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
-            
-            # Add assistant response
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": response,
-                "sources": context_chunks
-            })
-            
-            # Display assistant response
-            with st.chat_message("assistant"):
-                st.markdown(response)
                 
-                # Display sources if available
-                if context_chunks:
-                    st.markdown("**Sources:**")
-                    for i, source in enumerate(context_chunks):
-                        source_name = source.get("source", "Unknown")
-                        similarity = source.get("similarity_score", 0)
-                        
-                        # Create unique key for each source button
-                        button_key = f"source_{len(st.session_state.messages)}_{i}_{hash(source.get('text', ''))}"
-                        
-                        if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=button_key):
-                            display_document_content(source_name, source.get("text", ""))
-            
-        except Exception as e:
-            error_msg = f"Error generating response: {str(e)}"
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
-            
-            with st.chat_message("assistant"):
-                st.markdown(error_msg)
+                # Check if escalation is needed
+                if user_analysis.get('escalation_needed', False):
+                    response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
+                
+                # Add assistant response
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "sources": context_chunks
+                })
+                
+                # Display assistant response
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                    
+                    # Display sources if available
+                    if context_chunks:
+                        st.markdown("**Sources:**")
+                        for i, source in enumerate(context_chunks):
+                            source_name = source.get("source", "Unknown")
+                            similarity = source.get("similarity_score", 0)
+                            
+                            # Create unique key for each source button
+                            button_key = f"source_{len(st.session_state.messages)}_{i}_{hash(source.get('text', ''))}"
+                            
+                            if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=button_key):
+                                display_document_content(source_name, source.get("text", ""))
+                
+            except Exception as e:
+                error_msg = f"Error generating response: {str(e)}"
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                
+                with st.chat_message("assistant"):
+                    st.markdown(error_msg)
 
-# Display escalation requests if any
-if st.session_state.escalation_requests:
-    with st.expander("📋 Live Agent Escalation Requests", expanded=False):
-        for req in st.session_state.escalation_requests:
-            st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
-            st.write(f"**Query:** {req['query']}")
-            st.write(f"**Timestamp:** {req['timestamp']}")
-            st.write("---")
+    # Display escalation requests if any
+    if st.session_state.escalation_requests:
+        with st.expander("📋 Live Agent Escalation Requests", expanded=False):
+            for req in st.session_state.escalation_requests:
+                st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
+                st.write(f"**Query:** {req['query']}")
+                st.write(f"**Timestamp:** {req['timestamp']}")
+                st.write("---")
 
 if __name__ == "__main__":
     main()
