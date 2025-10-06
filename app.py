@@ -31,7 +31,7 @@ from langchain.schema import BaseMessage, HumanMessage, AIMessage
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
-KB_DIR = APP_DIR / "kb"
+KB_DIR = DATA_DIR / "kb"
 EXTRACT_DIR = DATA_DIR / "kb_extracted"
 INDEX_PATH = DATA_DIR / "faiss.index"
 CORPUS_PATH = DATA_DIR / "corpus.json"
@@ -41,10 +41,7 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 CANDIDATE_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash-001",
-    "gemini-1.5-pro-001",
+    "gemini-2.5-pro"
 ]
 
 DEFAULT_LOCATION = "us-central1"
