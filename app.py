@@ -13,7 +13,7 @@ from google.oauth2 import service_account
 from google.cloud import aiplatform
 from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
-from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part, Image
+from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part
 
 from docx import Document
 from pypdf import PdfReader
@@ -23,10 +23,10 @@ from PIL import Image as PILImage
 
 # LangChain imports 
 try:
-    from langchain_google_vertexai import VertexAI
+    from langchain_google_vertexai import ChatVertexAI
     from langchain.memory import ConversationBufferWindowMemory
     from langchain.chains import ConversationChain
-    from langchain.prompts import PromptTemplate
+    from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
     from langchain.schema import BaseMessage, HumanMessage, AIMessage
     LANGCHAIN_AVAILABLE = True
 except ImportError:
@@ -51,6 +51,7 @@ CANDIDATE_MODELS = [
 ]
 
 DEFAULT_LOCATION = "us-central1"
+DEBUG_MODE = False
 
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
@@ -496,7 +497,8 @@ def process_kb_files() -> List[Dict]:
     
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
-    st.write(f"DEBUG: Found {len(files)} files in KB directory: {[f.name for f in files]}")
+    if DEBUG_MODE:
+        st.write(f"DEBUG: Found {len(files)} files in KB directory: {[f.name for f in files]}")
     
     for file_path in files:
         if file_path.is_file():
@@ -624,6 +626,17 @@ def get_conversation_context(messages: List[Dict]) -> str:
     
     return "\n".join(context_parts)
 
+def display_document_content(source_name: str, chunk_text: str):
+    """Display document content in an expandable section"""
+    with st.expander(f"📄 {source_name}", expanded=False):
+        st.text_area(
+            "Document Content:",
+            value=chunk_text,
+            height=300,
+            disabled=True,
+            key=f"doc_content_{source_name}_{hash(chunk_text)}"
+        )
+
 # ---- Semantic Analysis Functions ----
 def analyze_user_sentiment_and_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
     """Use LLM to semantically analyze user sentiment and intent"""
@@ -729,12 +742,6 @@ def generate_semantic_response(query: str, context_chunks: List[Dict], user_anal
         for chunk in context_chunks
     ]) if context_chunks else "No relevant information found in knowledge base."
     
-    # Check if we have image sources
-    image_sources = []
-    for chunk in context_chunks:
-        if chunk.get('file_type') in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-            image_sources.append(chunk['source'])
-    
     # Build conversation context section
     context_section = f"""
 RECENT CONVERSATION CONTEXT:
@@ -754,20 +761,10 @@ USER ANALYSIS:
 
 """
     
-    # Add image availability info
-    image_info = ""
-    if image_sources:
-        image_info = f"""
-AVAILABLE IMAGES:
-The following images are available and will be displayed: {', '.join(image_sources)}
-You can reference these images in your response and they will be shown to the user.
-
-"""
-    
     # Create semantic system prompt
     system_prompt = f"""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
 
-{context_section}{analysis_section}{image_info}KNOWLEDGE BASE CONTEXT:
+{context_section}{analysis_section}KNOWLEDGE BASE CONTEXT:
 {context_text}
 
 USER QUESTION: {query}
@@ -794,12 +791,6 @@ INSTRUCTIONS:
    - If no relevant context found, be honest about limitations
    - Always be helpful and professional
    - Use appropriate tone based on user sentiment
-
-5. **IMAGE HANDLING**:
-   - If images are available, mention them in your response
-   - You can say things like "I'll show you the image" or "Here's what it looks like"
-   - The images will be displayed automatically below your response
-   - You are NOT a text-only AI - you can show images when available
 
 RESPONSE:"""
 
@@ -882,39 +873,6 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
     
     return "\n".join(response_parts)
 
-def generate_image_response(query: str, image_bytes: bytes, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response for image-based queries"""
-    try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
-        
-        # Create image part
-        image_part = Part.from_data(image_bytes, mime_type="image/jpeg")
-        
-        prompt = f"""Analyze this image and answer the user's question: {query}
-
-If this appears to be a screenshot or document related to HBS systems, provide detailed analysis. If it's not related to HBS, politely explain that you specialize in HBS system assistance."""
-        
-        response = model.generate_content([prompt, image_part])
-        return response.text if response.text else "I couldn't analyze the image. Please try again."
-    
-    except Exception as e:
-        return f"Error analyzing image: {str(e)}"
-
-def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Process user uploaded image and generate response"""
-    try:
-        # Display the uploaded image
-        st.subheader("📷 Uploaded Image")
-        image = PILImage.open(io.BytesIO(image_bytes))
-        st.image(image, caption="Your uploaded image", use_column_width=True)
-        
-        # Generate response using the image
-        response = generate_image_response(query, image_bytes, model_name, project_id, location, credentials)
-        return response
-    except Exception as e:
-        return f"Error processing uploaded image: {str(e)}"
-
 # ---- LangChain Integration ----
 @st.cache_resource
 def get_langchain_llm(project_id: str, location: str, _credentials, model_name: str):
@@ -926,8 +884,8 @@ def get_langchain_llm(project_id: str, location: str, _credentials, model_name: 
         # Initialize Vertex AI
         vertexai_init(project=project_id, location=location, credentials=_credentials)
         
-        # Create LangChain VertexAI instance
-        llm = VertexAI(
+        # Create LangChain ChatVertexAI instance (for Gemini chat models)
+        llm = ChatVertexAI(
             model_name=model_name,
             project=project_id,
             location=location,
@@ -948,36 +906,44 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
         return None
     
     try:
-        llm = get_langchain_llm(project_id, location, _credentials, model_name)
-        if not llm:
-            return None
+        vertexai_init(project=project_id, location=location, credentials=_credentials)
         
-        # Create memory
-        memory = ConversationBufferWindowMemory(
-            k=6,  # Keep last 6 messages (3 exchanges)
-            return_messages=True
+        llm = ChatVertexAI(
+            model_name=model_name,
+            project=project_id,
+            location=location,
+            temperature=0.1,
+            max_output_tokens=2048,
+            top_p=0.8,
+            top_k=40
         )
         
-        # Create prompt template - simplified for ConversationChain
-        prompt = PromptTemplate(
-            input_variables=["history", "input"],
-            template="""You are an expert HBS (Help Business System) assistant.
+        # Create memory with proper settings
+        memory = ConversationBufferWindowMemory(
+            k=6,  # Keep last 6 messages (3 exchanges)
+            return_messages=True,  # Return chat messages
+            memory_key="history",
+            input_key="input"
+        )
+        
+        # Create chat prompt template
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert HBS (Help Business System) assistant.
 
-CONVERSATION HISTORY:
-{history}
+CONTEXT FROM KNOWLEDGE BASE:
+{context}
 
-USER QUESTION: {input}
+USER ANALYSIS:
+{user_analysis}
 
 INSTRUCTIONS:
 - Be helpful and professional
 - Provide specific, actionable information
 - If you don't know something, be honest about limitations
-- Always be empathetic to the user's needs
-- You can show images when available - you are NOT a text-only AI
-- If images are mentioned in the context, reference them in your response
-
-RESPONSE:"""
-        )
+- Always be empathetic to the user's needs"""),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}")
+        ])
         
         # Create conversation chain
         chain = ConversationChain(
@@ -1016,19 +982,12 @@ Escalation Needed: {user_analysis.get('escalation_needed', False)}
 Confidence: {user_analysis.get('confidence', 0):.2f}
 Reasoning: {user_analysis.get('reasoning', 'N/A')}"""
         
-        # Create enhanced prompt with context and analysis
-        enhanced_query = f"""CONTEXT FROM KNOWLEDGE BASE:
-{context_text}
-
-USER ANALYSIS:
-{analysis_text}
-
-USER QUESTION: {query}
-
-Please provide a helpful response based on the context and user analysis above."""
-        
         # Generate response using LangChain
-        response = chain.predict(input=enhanced_query)
+        response = chain.predict(
+            input=query,
+            context=context_text,
+            user_analysis=analysis_text
+        )
         
         return response
     except Exception as e:
@@ -1060,10 +1019,6 @@ def main():
         st.session_state.model_name = CANDIDATE_MODELS[0]
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
-    if "uploaded_image" not in st.session_state:
-        st.session_state.uploaded_image = None
-    if "pending_message" not in st.session_state:
-        st.session_state.pending_message = None
     if "use_langchain" not in st.session_state:
         st.session_state.use_langchain = LANGCHAIN_AVAILABLE
     if "escalation_requests" not in st.session_state:
@@ -1127,7 +1082,7 @@ def main():
             key="model_select"
         )
         
-               # LangChain toggle
+        # LangChain toggle
         if LANGCHAIN_AVAILABLE:
             st.session_state.use_langchain = st.checkbox(
                 "Use LangChain (Better Memory)",
@@ -1182,125 +1137,75 @@ def main():
         with st.chat_message(message["role"]):
             st.write(message["content"])
             
-            # Display sources if available
+                        # Display sources if available
             if "sources" in message and message["sources"]:
                 with st.expander("📄 Sources"):
                     for source in message["sources"][:2]:
                         source_name = source['source']
                         similarity = source['similarity_score']
-                        st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
-            
-            # Display images if available
-            if "images" in message and message["images"]:
-                st.subheader("📷 Related Images")
-                for image_info in message["images"]:
-                    try:
-                        image_path = KB_DIR / image_info['source']
-                        if image_path.exists():
-                            image = PILImage.open(image_path)
-                            st.image(image, caption=f"Source: {image_info['source']}", use_column_width=True)
-                    except Exception as e:
-                        st.error(f"Error displaying image {image_info['source']}: {e}")
-    
-    # Image upload section
-    st.subheader("📷 Upload Image for Analysis")
-    uploaded_image = st.file_uploader(
-        "Choose an image file",
-        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
-        key="image_uploader"
-    )
+                        
+                        # Make sources clickable
+                        if st.button(f"📄 {source_name} (similarity: {similarity:.3f})", key=f"source_{source_name}_{hash(source['text'])}"):
+                            display_document_content(source_name, source['text'])
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Check if user uploaded an image
-        if uploaded_image is not None:
-            # Process uploaded image
-            with st.spinner("Analyzing your image..."):
-                image_bytes = uploaded_image.read()
-                response = process_user_uploaded_image(
-                    image_bytes, 
+        # Get conversation context
+        conversation_context = ""
+        if len(st.session_state.messages) > 1:
+            conversation_context = get_conversation_context(st.session_state.messages)
+        
+        # Analyze user sentiment and intent semantically
+        with st.spinner("Understanding your request..."):
+            user_analysis = analyze_user_sentiment_and_intent(
+                prompt,
+                conversation_context,
+                st.session_state.model_name,
+                st.session_state.project_id,
+                st.session_state.location,
+                st.session_state.creds
+            )
+        
+        # Check if escalation is needed
+        if user_analysis.get('escalation_needed', False):
+            response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": response,
+                "timestamp": len(st.session_state.messages)
+            })
+        else:
+            # Search for relevant context
+            with st.spinner("Thinking..."):
+                context_chunks = search_index(
                     prompt, 
-                    st.session_state.model_name,
+                    st.session_state.index, 
+                    st.session_state.corpus,
                     st.session_state.project_id,
                     st.session_state.location,
-                    st.session_state.creds
+                    st.session_state.creds,
+                    k=2,
+                    min_similarity=0.5
                 )
                 
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "timestamp": len(st.session_state.messages)
-                })
-        else:
-            # Regular text processing
-            # Get conversation context
-            conversation_context = ""
-            if len(st.session_state.messages) > 1:
-                conversation_context = get_conversation_context(st.session_state.messages)
-            
-            # Analyze user sentiment and intent semantically
-            with st.spinner("Understanding your request..."):
-                user_analysis = analyze_user_sentiment_and_intent(
-                    prompt,
-                    conversation_context,
-                    st.session_state.model_name,
-                    st.session_state.project_id,
-                    st.session_state.location,
-                    st.session_state.creds
-                )
-            
-            # Check if escalation is needed
-            if user_analysis.get('escalation_needed', False):
-                response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "timestamp": len(st.session_state.messages)
-                })
-            else:
-                # Search for relevant context
-                with st.spinner("Thinking..."):
-                    context_chunks = search_index(
-                        prompt, 
-                        st.session_state.index, 
-                        st.session_state.corpus,
+                # Generate response
+                if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
+                    # Try LangChain first
+                    response = generate_response_with_langchain(
+                        prompt,
+                        context_chunks,
+                        user_analysis,
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds,
-                        k=2,
-                        min_similarity=0.5
+                        st.session_state.model_name
                     )
                     
-                    # Generate response
-                    if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
-                        # Try LangChain first
-                        response = generate_response_with_langchain(
-                            prompt,
-                            context_chunks,
-                            user_analysis,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds,
-                            st.session_state.model_name
-                        )
-                        
-                        # Fallback to regular response if LangChain fails
-                        if not response:
-                            response = generate_semantic_response(
-                                prompt,
-                                context_chunks,
-                                user_analysis,
-                                conversation_context,
-                                st.session_state.model_name,
-                                st.session_state.project_id,
-                                st.session_state.location,
-                                st.session_state.creds
-                            )
-                    else:
-                        # Use regular semantic response generation
+                    # Fallback to regular response if LangChain fails
+                    if not response:
                         response = generate_semantic_response(
                             prompt,
                             context_chunks,
@@ -1311,25 +1216,26 @@ def main():
                             st.session_state.location,
                             st.session_state.creds
                         )
-                    
-                    # Check for images in context chunks
-                    image_sources = []
-                    for chunk in context_chunks:
-                        if chunk.get('file_type') in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-                            image_sources.append(chunk['source'])
-                    
-                    # Add assistant response to messages
-                    message_data = {
-                        "role": "assistant", 
-                        "content": response,
-                        "sources": context_chunks,
-                        "timestamp": len(st.session_state.messages)
-                    }
-                    
-                    if image_sources:
-                        message_data["images"] = [{"source": img} for img in image_sources]
-                    
-                    st.session_state.messages.append(message_data)
+                else:
+                    # Use regular semantic response generation
+                    response = generate_semantic_response(
+                        prompt,
+                        context_chunks,
+                        user_analysis,
+                        conversation_context,
+                        st.session_state.model_name,
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds
+                    )
+                
+                # Add assistant response to messages
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "sources": context_chunks,
+                    "timestamp": len(st.session_state.messages)
+                })
         
         # Rerun to update the chat display
         st.rerun()
