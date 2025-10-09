@@ -1181,11 +1181,12 @@ def main():
                         similarity = source['similarity_score']
                         st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
     
-    # Image upload section - positioned right above chat input
+    # Image upload section - positioned right above chat input with dynamic key
+    upload_key = f"image_uploader_{len(st.session_state.messages)}"
     uploaded_image = st.file_uploader(
         "📷 Upload Image for Analysis",
         type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
-        key="image_uploader"
+        key=upload_key
     )
     
     # Chat input
@@ -1213,7 +1214,7 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
             
-            # Clear the uploaded image after processing
+            # Image will clear automatically due to dynamic key
             st.rerun()
         else:
             # Regular text processing
