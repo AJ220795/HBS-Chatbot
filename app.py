@@ -1214,7 +1214,6 @@ def main():
                 })
             
             # Clear the uploaded image after processing
-            st.session_state.uploaded_image = None
             st.rerun()
         else:
             # Regular text processing
