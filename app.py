@@ -496,7 +496,6 @@ def process_kb_files() -> List[Dict]:
     
     # List all files in KB directory
     files = list(KB_DIR.iterdir())
-    st.write(f"DEBUG: Found {len(files)} files in KB directory: {[f.name for f in files]}")
     
     for file_path in files:
         if file_path.is_file():
