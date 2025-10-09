@@ -624,6 +624,34 @@ def get_conversation_context(messages: List[Dict]) -> str:
     
     return "\n".join(context_parts)
 
+# ---- Image Processing Functions ----
+def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str, project_id: str, location: str, credentials) -> str:
+    """Process user uploaded image and generate response"""
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        # Create image part with proper MIME type detection
+        mime_type = "image/jpeg"  # Default
+        if image_bytes.startswith(b'\x89PNG'):
+            mime_type = "image/png"
+        elif image_bytes.startswith(b'GIF'):
+            mime_type = "image/gif"
+        elif image_bytes.startswith(b'RIFF') and b'WEBP' in image_bytes[:12]:
+            mime_type = "image/webp"
+        
+        image_part = Part.from_data(image_bytes, mime_type=mime_type)
+        
+        prompt = f"""Analyze this image and answer the user's question: {query}
+
+If this appears to be a screenshot or document related to HBS systems, provide detailed analysis. If it's not related to HBS, politely explain that you specialize in HBS system assistance."""
+        
+        response = model.generate_content([prompt, image_part])
+        return response.text if response.text else "I couldn't analyze the image. Please try again."
+    
+    except Exception as e:
+        return f"Error analyzing image: {str(e)}"
+
 # ---- Semantic Analysis Functions ----
 def analyze_user_sentiment_and_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
     """Use LLM to semantically analyze user sentiment and intent"""
@@ -1038,10 +1066,6 @@ def main():
         st.session_state.model_name = CANDIDATE_MODELS[0]
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
-    if "uploaded_image" not in st.session_state:
-        st.session_state.uploaded_image = None
-    if "pending_message" not in st.session_state:
-        st.session_state.pending_message = None
     if "use_langchain" not in st.session_state:
         st.session_state.use_langchain = LANGCHAIN_AVAILABLE
     if "escalation_requests" not in st.session_state:
@@ -1168,64 +1192,104 @@ def main():
                         similarity = source['similarity_score']
                         st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
     
+    # Image upload section - positioned right above chat input
+    uploaded_image = st.file_uploader(
+        "📷 Upload Image for Analysis",
+        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
+        key="image_uploader"
+    )
+    
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Get conversation context
-        conversation_context = ""
-        if len(st.session_state.messages) > 1:
-            conversation_context = get_conversation_context(st.session_state.messages)
-        
-        # Analyze user sentiment and intent semantically
-        with st.spinner("Understanding your request..."):
-            user_analysis = analyze_user_sentiment_and_intent(
-                prompt,
-                conversation_context,
-                st.session_state.model_name,
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.creds
-            )
-        
-        # Check if escalation is needed
-        if user_analysis.get('escalation_needed', False):
-            response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": response,
-                "timestamp": len(st.session_state.messages)
-            })
-        else:
-            # Search for relevant context
-            with st.spinner("Thinking..."):
-                context_chunks = search_index(
+        # Check if user uploaded an image
+        if uploaded_image is not None:
+            # Process uploaded image
+            with st.spinner("Analyzing your image..."):
+                image_bytes = uploaded_image.read()
+                response = process_user_uploaded_image(
+                    image_bytes, 
                     prompt, 
-                    st.session_state.index, 
-                    st.session_state.corpus,
+                    st.session_state.model_name,
                     st.session_state.project_id,
                     st.session_state.location,
-                    st.session_state.creds,
-                    k=2,
-                    min_similarity=0.5
+                    st.session_state.creds
                 )
                 
-                # Generate response
-                if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
-                    # Try LangChain first
-                    response = generate_response_with_langchain(
-                        prompt,
-                        context_chunks,
-                        user_analysis,
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "timestamp": len(st.session_state.messages)
+                })
+        else:
+            # Regular text processing
+            # Get conversation context
+            conversation_context = ""
+            if len(st.session_state.messages) > 1:
+                conversation_context = get_conversation_context(st.session_state.messages)
+            
+            # Analyze user sentiment and intent semantically
+            with st.spinner("Understanding your request..."):
+                user_analysis = analyze_user_sentiment_and_intent(
+                    prompt,
+                    conversation_context,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+            
+            # Check if escalation is needed
+            if user_analysis.get('escalation_needed', False):
+                response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "timestamp": len(st.session_state.messages)
+                })
+            else:
+                # Search for relevant context
+                with st.spinner("Thinking..."):
+                    context_chunks = search_index(
+                        prompt, 
+                        st.session_state.index, 
+                        st.session_state.corpus,
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds,
-                        st.session_state.model_name
+                        k=2,
+                        min_similarity=0.5
                     )
                     
-                    # Fallback to regular response if LangChain fails
-                    if not response:
+                    # Generate response
+                    if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
+                        # Try LangChain first
+                        response = generate_response_with_langchain(
+                            prompt,
+                            context_chunks,
+                            user_analysis,
+                            st.session_state.project_id,
+                            st.session_state.location,
+                            st.session_state.creds,
+                            st.session_state.model_name
+                        )
+                        
+                        # Fallback to regular response if LangChain fails
+                        if not response:
+                            response = generate_semantic_response(
+                                prompt,
+                                context_chunks,
+                                user_analysis,
+                                conversation_context,
+                                st.session_state.model_name,
+                                st.session_state.project_id,
+                                st.session_state.location,
+                                st.session_state.creds
+                            )
+                    else:
+                        # Use regular semantic response generation
                         response = generate_semantic_response(
                             prompt,
                             context_chunks,
@@ -1236,26 +1300,14 @@ def main():
                             st.session_state.location,
                             st.session_state.creds
                         )
-                else:
-                    # Use regular semantic response generation
-                    response = generate_semantic_response(
-                        prompt,
-                        context_chunks,
-                        user_analysis,
-                        conversation_context,
-                        st.session_state.model_name,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds
-                    )
-                
-                # Add assistant response to messages
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "sources": context_chunks,
-                    "timestamp": len(st.session_state.messages)
-                })
+                    
+                    # Add assistant response to messages
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "sources": context_chunks,
+                        "timestamp": len(st.session_state.messages)
+                    })
         
         # Rerun to update the chat display
         st.rerun()
