@@ -494,6 +494,37 @@ def process_kb_files() -> List[Dict]:
         st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
     
+    # List all files in KB directory
+    files = list(KB_DIR.iterdir())
+    
+    for file_path in files:
+        if file_path.is_file():
+            try:
+                if file_path.suffix.lower() == '.docx':
+                    text = extract_text_from_docx_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
+                elif file_path.suffix.lower() == '.pdf':
+                    text = extract_text_from_pdf_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
+                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
                     # Check file size
                     file_size = file_path.stat().st_size
                     if file_size == 0:
@@ -1096,6 +1127,16 @@ def main():
             index=0,
             key="model_select"
         )
+        
+        # LangChain toggle
+        if LANGCHAIN_AVAILABLE:
+            st.session_state.use_langchain = st.checkbox(
+                "Use LangChain (Better Memory)",
+                value=st.session_state.use_langchain,
+                key="langchain_toggle"
+            )
+        else:
+            st.info("LangChain not available")
         
         # Show escalation requests
         if st.session_state.escalation_requests:
