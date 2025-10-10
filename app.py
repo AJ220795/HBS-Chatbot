@@ -77,8 +77,8 @@ def split_into_sentences(text: str) -> List[str]:
     sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 2) -> List[str]:
-    """Improved chunking with smaller chunks for better retrieval"""
+def chunk_text(text: str, max_tokens: int = 300, overlap_sentences: int = 2) -> List[str]:
+    """Improved chunking with much smaller chunks for better retrieval"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
     
@@ -95,19 +95,19 @@ def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 2) -> 
     if buf:
         chunks.append(" ".join(buf))
     
-    # Validate and split oversized chunks with more aggressive limits
+    # Validate and split oversized chunks with very aggressive limits
     validated_chunks = []
     for chunk in chunks:
         chunk_tokens = estimate_tokens(chunk)
-        if chunk_tokens > 10000:  # Much lower limit for safety
+        if chunk_tokens > 5000:  # Very low limit for safety
             # Split oversized chunk into smaller pieces
-            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=10000))
+            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=5000))
         else:
             validated_chunks.append(chunk)
     
     return validated_chunks
 
-def split_oversized_chunk(chunk: str, max_tokens: int = 10000) -> List[str]:
+def split_oversized_chunk(chunk: str, max_tokens: int = 5000) -> List[str]:
     """Split a chunk that's too large into smaller pieces"""
     words = chunk.split()
     sub_chunks = []
@@ -407,16 +407,22 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         
         all_embeddings = []
         
-        # Validate and filter texts before embedding
+        # Validate and filter texts before embedding with very strict limits
         valid_texts = []
+        skipped_count = 0
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
-            if token_count > 15000:  # Much stricter limit
-                st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 15K limit)")
+            if token_count > 10000:  # Very strict limit
+                skipped_count += 1
+                if skipped_count <= 5:  # Only show first 5 warnings to avoid spam
+                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
                 # Add a placeholder embedding of zeros
                 all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
             else:
                 valid_texts.append((i, text))
+        
+        if skipped_count > 5:
+            st.warning(f"Skipped {skipped_count} texts total due to size limits")
         
         # Process valid texts in batches
         for batch_start in range(0, len(valid_texts), batch_size):
@@ -751,13 +757,20 @@ def process_kb_files() -> List[Dict]:
     st.info("Validating chunk sizes...")
     validated_corpus = []
     oversized_chunks = 0
+    max_chunk_size = 0
+    total_chunks = len(corpus)
     
-    for item in corpus:
+    for idx, item in enumerate(corpus):
         chunk_tokens = estimate_tokens(item["text"])
-        if chunk_tokens > 10000:
+        max_chunk_size = max(max_chunk_size, chunk_tokens)
+        
+        if chunk_tokens > 5000:
             oversized_chunks += 1
+            if oversized_chunks <= 3:  # Show details for first 3 oversized chunks
+                st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
+            
             # Split the oversized chunk
-            sub_chunks = split_oversized_chunk(item["text"], max_tokens=10000)
+            sub_chunks = split_oversized_chunk(item["text"], max_tokens=5000)
             for i, sub_chunk in enumerate(sub_chunks):
                 validated_corpus.append({
                     **item,
@@ -766,6 +779,8 @@ def process_kb_files() -> List[Dict]:
                 })
         else:
             validated_corpus.append(item)
+    
+    st.info(f"Max chunk size found: {max_chunk_size} tokens")
     
     if oversized_chunks > 0:
         st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
