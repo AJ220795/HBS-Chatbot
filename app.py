@@ -52,13 +52,33 @@ CANDIDATE_MODELS = [
 
 DEFAULT_LOCATION = "us-central1"
 
+# Token limits for different contexts
+MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
+MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
+MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
+
+# ---- Token Counting Utilities ----
+def estimate_tokens(text: str) -> int:
+    """Estimate token count (rough approximation: 1 token ≈ 4 characters)"""
+    return len(text) // 4
+
+def truncate_to_token_limit(text: str, max_tokens: int) -> str:
+    """Truncate text to fit within token limit"""
+    estimated_tokens = estimate_tokens(text)
+    if estimated_tokens <= max_tokens:
+        return text
+    
+    # Truncate to approximate character limit
+    char_limit = max_tokens * 4
+    return text[:char_limit] + "...[truncated]"
+
 # ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
     sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-def chunk_text(text: str, max_tokens: int = 800, overlap_sentences: int = 2) -> List[str]:
-    """Improved chunking with better overlap and context preservation"""
+def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 2) -> List[str]:
+    """Improved chunking with smaller chunks for better retrieval"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
     
@@ -118,13 +138,10 @@ def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
     
     # Look for report patterns
     if "overdue" in filename.lower() or "overdue" in ocr_text.lower():
-        # Parse Overdue Equipment Report
         structured_data.extend(parse_overdue_report(ocr_text, filename))
     elif "outbound" in filename.lower() or "outbound" in ocr_text.lower():
-        # Parse Outbound Report
         structured_data.extend(parse_outbound_report(ocr_text, filename))
     elif "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
-        # Parse Equipment List Report
         structured_data.extend(parse_equipment_list_report(ocr_text, filename))
     
     return structured_data
@@ -134,20 +151,15 @@ def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
-    # Look for customer data patterns
     for i, line in enumerate(lines):
-        # Pattern: Customer name, Contract, Phone, Stock, Make, Model, Type, Year, Serial, Date Out, Expected, Days Over
-        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:  # Customer name pattern
-            # Look for the next lines that contain the data
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
             if i + 1 < len(lines):
                 next_line = lines[i + 1]
-                # Extract contract number (C followed by digits and R)
                 contract_match = re.search(r'C\d+R', next_line)
                 if contract_match:
                     customer_name = line
                     contract = contract_match.group()
                     
-                    # Try to extract other data from surrounding lines
                     phone = ""
                     stock = ""
                     make = ""
@@ -159,46 +171,37 @@ def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
                     expected = ""
                     days_over = ""
                     
-                    # Look in the next few lines for data
                     for j in range(i, min(i + 5, len(lines))):
                         current_line = lines[j]
                         
-                        # Extract phone number
                         phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
                         if phone_match:
                             phone = phone_match.group()
                         
-                        # Extract stock number (5 digits)
                         stock_match = re.search(r'\b\d{5}\b', current_line)
                         if stock_match:
                             stock = stock_match.group()
                         
-                        # Extract make (BOB, KUB, etc.)
                         make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
                         if make_match:
                             make = make_match.group()
                         
-                        # Extract model
                         model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
                         if model_match:
                             model = model_match.group()
                         
-                        # Extract equipment type
                         type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
                         if type_match:
                             equipment_type = type_match.group()
                         
-                        # Extract year
                         year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
                         if year_match:
                             year = year_match.group()
                         
-                        # Extract serial number
                         serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
                         if serial_match and len(serial_match.group()) > 6:
                             serial = serial_match.group()
                         
-                        # Extract dates
                         date_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', current_line)
                         if date_match:
                             if not date_out:
@@ -206,12 +209,10 @@ def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
                             else:
                                 expected = date_match.group()
                         
-                        # Extract days overdue
                         days_match = re.search(r'\b\d{1,4}\b', current_line)
                         if days_match and days_match.group().isdigit():
                             days_over = days_match.group()
                     
-                    # Create structured data entry
                     if customer_name and contract:
                         data.append({
                             "customer_name": customer_name,
@@ -237,9 +238,8 @@ def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
-    # Look for customer data patterns
     for i, line in enumerate(lines):
-        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:  # Customer name pattern
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
             if i + 1 < len(lines):
                 next_line = lines[i + 1]
                 contract_match = re.search(r'C\d+R', next_line)
@@ -247,7 +247,6 @@ def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
                     customer_name = line
                     contract = contract_match.group()
                     
-                    # Extract other data from surrounding lines
                     phone = ""
                     stock = ""
                     make = ""
@@ -288,7 +287,6 @@ def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
                         if serial_match and len(serial_match.group()) > 6:
                             serial = serial_match.group()
                         
-                        # Extract date/time
                         datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
                         if datetime_match:
                             date_time_out = datetime_match.group()
@@ -316,14 +314,11 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
-    # Look for equipment data patterns
     for i, line in enumerate(lines):
-        # Look for stock number patterns
         stock_match = re.search(r'\b\d{5}\b', line)
         if stock_match:
             stock = stock_match.group()
             
-            # Extract other data from the same line or nearby lines
             make = ""
             model = ""
             equipment_type = ""
@@ -332,32 +327,26 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
             location = ""
             meter = ""
             
-            # Look for make
             make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', line)
             if make_match:
                 make = make_match.group()
             
-            # Look for model
             model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', line)
             if model_match:
                 model = model_match.group()
             
-            # Look for equipment type
             type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', line)
             if type_match:
                 equipment_type = type_match.group()
             
-            # Look for year
             year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', line)
             if year_match:
                 year = year_match.group()
             
-            # Look for serial
             serial_match = re.search(r'\b[A-Z0-9]{6,}\b', line)
             if serial_match and len(serial_match.group()) > 6:
                 serial = serial_match.group()
             
-            # Look for meter reading
             meter_match = re.search(r'\b\d+\b', line)
             if meter_match:
                 meter = meter_match.group()
@@ -413,7 +402,6 @@ def expand_query(query: str) -> str:
     """Expand query with related terms for better search"""
     query_lower = query.lower()
     
-    # Add related terms based on common HBS topics
     if "overdue" in query_lower:
         return f"{query} overdue equipment report rental"
     elif "outbound" in query_lower:
@@ -429,16 +417,95 @@ def expand_query(query: str) -> str:
     else:
         return query
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, k: int = 2, min_similarity: float = 0.5) -> List[Dict]:
-    """Search FAISS index with query expansion and relevance threshold"""
+def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int = 10) -> List[Dict]:
+    """Use LLM to re-rank chunks by relevance to query"""
+    if len(chunks) <= top_k:
+        return chunks
+    
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        # Create a prompt to score relevance
+        chunks_text = ""
+        for i, chunk in enumerate(chunks[:30]):  # Only re-rank top 30 to save time
+            chunks_text += f"\n[{i}] {chunk['text'][:200]}..."
+        
+        rerank_prompt = f"""Score each chunk's relevance to the query on a scale of 0-10.
+
+QUERY: {query}
+
+CHUNKS:
+{chunks_text}
+
+Return ONLY a JSON array of scores in order, like: [8, 3, 9, 2, ...]"""
+
+        response = model.generate_content(
+            rerank_prompt,
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=500
+            )
+        )
+        
+        if response.text:
+            try:
+                scores = json.loads(response.text.strip())
+                if isinstance(scores, list) and len(scores) == len(chunks[:30]):
+                    # Add scores to chunks
+                    for i, score in enumerate(scores):
+                        chunks[i]['rerank_score'] = float(score)
+                    
+                    # Sort by rerank score
+                    sorted_chunks = sorted(chunks[:30], key=lambda x: x.get('rerank_score', 0), reverse=True)
+                    return sorted_chunks[:top_k]
+            except:
+                pass
+        
+        # Fallback: return top k by similarity
+        return chunks[:top_k]
+    
+    except Exception as e:
+        # Fallback: return top k by similarity
+        return chunks[:top_k]
+
+def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> str:
+    """Build optimized context from chunks with token limiting"""
+    if not chunks:
+        return "No relevant information found in knowledge base."
+    
+    context_parts = []
+    current_tokens = 0
+    
+    for chunk in chunks:
+        # Format chunk
+        chunk_text = f"Source: {chunk['source']}\nContent: {chunk['text']}\n"
+        chunk_tokens = estimate_tokens(chunk_text)
+        
+        # Check if adding this chunk would exceed limit
+        if current_tokens + chunk_tokens > max_tokens:
+            # Try to add a truncated version
+            remaining_tokens = max_tokens - current_tokens
+            if remaining_tokens > 100:  # Only add if we have reasonable space
+                truncated = truncate_to_token_limit(chunk['text'], remaining_tokens - 50)
+                context_parts.append(f"Source: {chunk['source']}\nContent: {truncated}\n")
+            break
+        
+        context_parts.append(chunk_text)
+        current_tokens += chunk_tokens
+    
+    return "\n".join(context_parts)
+
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.3) -> List[Dict]:
+    """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
     
     try:
-        # Expand query for better search
+        # Stage 1: Expand query for better search
         expanded_query = expand_query(query)
         
-        # Generate query embedding
+        # Stage 2: Generate query embedding
         query_embeddings = embed_texts([expanded_query], project_id, location, credentials)
         if query_embeddings.size == 0:
             return []
@@ -446,20 +513,26 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         # Normalize query embedding
         faiss.normalize_L2(query_embeddings)
         
-        # Search - get more results to filter
-        scores, indices = index.search(query_embeddings, min(10, len(corpus)))
+        # Stage 3: Retrieve many candidates
+        initial_k = min(MAX_CHUNKS_INITIAL, len(corpus))
+        scores, indices = index.search(query_embeddings, initial_k)
         
-        results = []
+        candidates = []
         for score, idx in zip(scores[0], indices[0]):
-            if idx < len(corpus) and score >= min_similarity:  # Only include relevant results
-                results.append({
+            if idx < len(corpus) and score >= min_similarity:
+                candidates.append({
                     **corpus[idx],
                     "similarity_score": float(score)
                 })
-                if len(results) >= k:  # Stop when we have enough good results
-                    break
         
-        return results
+        if not candidates:
+            return []
+        
+        # Stage 4: Re-rank using LLM for better relevance
+        reranked = rerank_chunks(query, candidates, model_name, project_id, location, credentials, top_k=k)
+        
+        return reranked
+    
     except Exception as e:
         st.error(f"Search error: {e}")
         return []
@@ -494,7 +567,6 @@ def process_kb_files() -> List[Dict]:
         st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
     
-    # List all files in KB directory
     files = list(KB_DIR.iterdir())
     
     for file_path in files:
@@ -525,17 +597,14 @@ def process_kb_files() -> List[Dict]:
                             })
                 
                 elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-                    # Check file size
                     file_size = file_path.stat().st_size
                     if file_size == 0:
                         continue
                     
-                    # Extract OCR text
                     try:
                         ocr_text = extract_text_from_image_bytes(file_path.read_bytes())
                         
                         if ocr_text.strip():
-                            # Add raw OCR text as chunks
                             chunks = chunk_text(ocr_text)
                             for i, chunk in enumerate(chunks):
                                 corpus.append({
@@ -546,12 +615,10 @@ def process_kb_files() -> List[Dict]:
                                     "content_type": "ocr_text"
                                 })
                             
-                            # Parse structured data from OCR
                             try:
                                 structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
                                 
                                 for data_item in structured_data:
-                                    # Create searchable text from structured data
                                     searchable_text = f"Report: {data_item.get('report_type', 'Unknown')} "
                                     if 'customer_name' in data_item:
                                         searchable_text += f"Customer: {data_item['customer_name']} "
@@ -604,22 +671,27 @@ def process_kb_files() -> List[Dict]:
     
     return corpus
 
-def get_conversation_context(messages: List[Dict]) -> str:
-    """Extract conversation context from recent messages"""
+def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
+    """Extract conversation context from recent messages with token limiting"""
     if not messages or len(messages) < 2:
         return ""
     
-    # Get last few messages for context
-    recent_messages = messages[-6:]  # Last 3 exchanges
+    recent_messages = messages[-6:]
     
     context_parts = []
-    for msg in recent_messages:
+    current_tokens = 0
+    
+    for msg in reversed(recent_messages):
         role = msg["role"]
         content = msg["content"]
-        if role == "user":
-            context_parts.append(f"User: {content}")
-        elif role == "assistant":
-            context_parts.append(f"Assistant: {content}")
+        msg_text = f"{role.capitalize()}: {content}"
+        msg_tokens = estimate_tokens(msg_text)
+        
+        if current_tokens + msg_tokens > max_tokens:
+            break
+        
+        context_parts.insert(0, msg_text)
+        current_tokens += msg_tokens
     
     return "\n".join(context_parts)
 
@@ -630,8 +702,7 @@ def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str,
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
         
-        # Create image part with proper MIME type detection
-        mime_type = "image/jpeg"  # Default
+        mime_type = "image/jpeg"
         if image_bytes.startswith(b'\x89PNG'):
             mime_type = "image/png"
         elif image_bytes.startswith(b'GIF'):
@@ -658,10 +729,13 @@ def analyze_user_sentiment_and_intent(query: str, conversation_context: str, mod
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
         
+        # Keep analysis prompt lean
+        context_snippet = truncate_to_token_limit(conversation_context, 500)
+        
         analysis_prompt = f"""Analyze the user's query semantically and provide comprehensive analysis.
 
 CONVERSATION CONTEXT:
-{conversation_context}
+{context_snippet}
 
 USER QUERY: {query}
 
@@ -748,20 +822,20 @@ Respond with ONLY a JSON object:
         }
 
 def generate_semantic_response(query: str, context_chunks: List[Dict], user_analysis: Dict, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response using semantic understanding of user intent and sentiment"""
+    """Generate response using semantic understanding with optimized context"""
     
-    # Build context from retrieved chunks
-    context_text = "\n\n".join([
-        f"Source: {chunk['source']}\nContent: {chunk['text']}"
-        for chunk in context_chunks
-    ]) if context_chunks else "No relevant information found in knowledge base."
+    # Build optimized context
+    context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
     
-    # Build conversation context section
-    context_section = f"""
+    # Limit conversation context
+    context_section = ""
+    if conversation_context:
+        limited_conv_context = truncate_to_token_limit(conversation_context, 2000)
+        context_section = f"""
 RECENT CONVERSATION CONTEXT:
-{conversation_context}
+{limited_conv_context}
 
-""" if conversation_context else ""
+"""
     
     # Build user analysis section
     analysis_section = f"""
@@ -775,7 +849,6 @@ USER ANALYSIS:
 
 """
     
-    # Create semantic system prompt
     system_prompt = f"""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
 
 {context_section}{analysis_section}KNOWLEDGE BASE CONTEXT:
@@ -830,10 +903,8 @@ RESPONSE:"""
 def escalate_to_live_agent(query: str, conversation_context: str, user_analysis: Dict) -> str:
     """Escalate to live agent when bot cannot help"""
     
-    # Get confidence value safely
     confidence = user_analysis.get('confidence', 0)
     
-    # Create a summary of the conversation for the live agent
     conversation_summary = f"""
 CONVERSATION SUMMARY FOR LIVE AGENT:
 ===============================
@@ -855,7 +926,6 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
 ===============================
 """
     
-    # Store the escalation request in session state for the live agent
     if "escalation_requests" not in st.session_state:
         st.session_state.escalation_requests = []
     
@@ -866,7 +936,6 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
         "user_analysis": user_analysis
     })
     
-    # Build the response message
     response_parts = [
         "I understand you need additional assistance. Let me connect you with a live HBS support agent who can provide more specialized help.",
         "",
@@ -887,25 +956,6 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
     
     return "\n".join(response_parts)
 
-def generate_image_response(query: str, image_bytes: bytes, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response for image-based queries"""
-    try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
-        
-        # Create image part
-        image_part = Part.from_data(image_bytes, mime_type="image/jpeg")
-        
-        prompt = f"""Analyze this image and answer the user's question: {query}
-
-If this appears to be a screenshot or document related to HBS systems, provide detailed analysis. If it's not related to HBS, politely explain that you specialize in HBS system assistance."""
-        
-        response = model.generate_content([prompt, image_part])
-        return response.text if response.text else "I couldn't analyze the image. Please try again."
-    
-    except Exception as e:
-        return f"Error analyzing image: {str(e)}"
-
 # ---- LangChain Integration ----
 @st.cache_resource
 def get_langchain_llm(project_id: str, location: str, _credentials, model_name: str):
@@ -914,10 +964,8 @@ def get_langchain_llm(project_id: str, location: str, _credentials, model_name: 
         return None
     
     try:
-        # Initialize Vertex AI
         vertexai_init(project=project_id, location=location, credentials=_credentials)
         
-        # Create LangChain VertexAI instance
         llm = VertexAI(
             model_name=model_name,
             project=project_id,
@@ -943,13 +991,11 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
         if not llm:
             return None
         
-        # Create memory
         memory = ConversationBufferWindowMemory(
-            k=6,  # Keep last 6 messages (3 exchanges)
+            k=6,
             return_messages=True
         )
         
-        # Create prompt template
         prompt = PromptTemplate(
             input_variables=["history", "input", "context", "user_analysis"],
             template="""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
@@ -991,7 +1037,6 @@ INSTRUCTIONS:
 RESPONSE:"""
         )
         
-        # Create conversation chain
         chain = ConversationChain(
             llm=llm,
             memory=memory,
@@ -1014,13 +1059,8 @@ def generate_response_with_langchain(query: str, context_chunks: List[Dict], use
         if not chain:
             return None
         
-        # Build context from retrieved chunks
-        context_text = "\n\n".join([
-            f"Source: {chunk['source']}\nContent: {chunk['text']}"
-            for chunk in context_chunks
-        ]) if context_chunks else "No relevant information found in knowledge base."
+        context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
         
-        # Format user analysis for prompt
         analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
 Sentiment: {user_analysis.get('sentiment', 'neutral')}
 Context Relevance: {user_analysis.get('context_relevance', 'new_topic')}
@@ -1028,7 +1068,6 @@ Escalation Needed: {user_analysis.get('escalation_needed', False)}
 Confidence: {user_analysis.get('confidence', 0):.2f}
 Reasoning: {user_analysis.get('reasoning', 'N/A')}"""
         
-        # Generate response using LangChain
         response = chain.predict(
             input=query,
             context=context_text,
@@ -1084,12 +1123,10 @@ def main():
     @st.cache_resource
     def initialize_app():
         """Initialize the app - load index or build from KB files"""
-        # Try to load existing index first
         index, corpus = load_index_and_corpus()
         if index is not None and corpus:
             return index, corpus, True
         
-        # Build index from KB files
         corpus = process_kb_files()
         if not corpus:
             return None, [], False
@@ -1116,6 +1153,7 @@ def main():
         # Status
         if st.session_state.kb_loaded:
             st.success(f"✅ Knowledge base loaded ({len(st.session_state.corpus)} chunks)")
+            st.info(f"📊 Max context: {MAX_CONTEXT_TOKENS:,} tokens")
         else:
             st.error("❌ Knowledge base not loaded")
         
@@ -1127,6 +1165,10 @@ def main():
             index=0,
             key="model_select"
         )
+        
+        # Retrieval settings
+        st.subheader("Retrieval Settings")
+        st.info(f"Retrieving top {MAX_CHUNKS_FINAL} from {MAX_CHUNKS_INITIAL} candidates")
         
         # Show escalation requests
         if st.session_state.escalation_requests:
@@ -1166,7 +1208,7 @@ def main():
     
     # Display welcome message if no messages yet
     if not st.session_state.messages:
-        st.info("Hi! How can I help you?")
+        st.info("Hi! I can handle your large knowledge base with up to 200,000 tokens. How can I help you?")
     
     # Display chat messages
     for message in st.session_state.messages:
@@ -1176,12 +1218,13 @@ def main():
             # Display sources if available
             if "sources" in message and message["sources"]:
                 with st.expander("📄 Sources"):
-                    for source in message["sources"][:2]:
+                    for source in message["sources"][:3]:
                         source_name = source['source']
                         similarity = source['similarity_score']
-                        st.write(f"📄 {source_name} (similarity: {similarity:.3f})")
+                        rerank = source.get('rerank_score', 'N/A')
+                        st.write(f"📄 {source_name} (sim: {similarity:.3f}, rerank: {rerank})")
     
-    # Image upload section - positioned right above chat input with dynamic key
+    # Image upload section
     upload_key = f"image_uploader_{len(st.session_state.messages)}"
     uploaded_image = st.file_uploader(
         "📷 Upload Image for Analysis",
@@ -1191,12 +1234,9 @@ def main():
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
-        # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Check if user uploaded an image
         if uploaded_image is not None:
-            # Process uploaded image
             with st.spinner("Analyzing your image..."):
                 image_bytes = uploaded_image.read()
                 response = process_user_uploaded_image(
@@ -1214,16 +1254,13 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
             
-            # Image will clear automatically due to dynamic key
             st.rerun()
         else:
-            # Regular text processing
-            # Get conversation context
+            # Regular text processing with optimized retrieval
             conversation_context = ""
             if len(st.session_state.messages) > 1:
                 conversation_context = get_conversation_context(st.session_state.messages)
             
-            # Analyze user sentiment and intent semantically
             with st.spinner("Understanding your request..."):
                 user_analysis = analyze_user_sentiment_and_intent(
                     prompt,
@@ -1234,7 +1271,6 @@ def main():
                     st.session_state.creds
                 )
             
-            # Check if escalation is needed
             if user_analysis.get('escalation_needed', False):
                 response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
                 st.session_state.messages.append({
@@ -1243,8 +1279,7 @@ def main():
                     "timestamp": len(st.session_state.messages)
                 })
             else:
-                # Search for relevant context
-                with st.spinner("Thinking..."):
+                with st.spinner("Searching knowledge base..."):
                     context_chunks = search_index(
                         prompt, 
                         st.session_state.index, 
@@ -1252,13 +1287,12 @@ def main():
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds,
-                        k=2,
-                        min_similarity=0.5
+                        st.session_state.model_name,
+                        k=MAX_CHUNKS_FINAL,
+                        min_similarity=0.3
                     )
                     
-                    # Generate response
                     if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
-                        # Try LangChain first
                         response = generate_response_with_langchain(
                             prompt,
                             context_chunks,
@@ -1269,7 +1303,6 @@ def main():
                             st.session_state.model_name
                         )
                         
-                        # Fallback to regular response if LangChain fails
                         if not response:
                             response = generate_semantic_response(
                                 prompt,
@@ -1282,7 +1315,6 @@ def main():
                                 st.session_state.creds
                             )
                     else:
-                        # Use regular semantic response generation
                         response = generate_semantic_response(
                             prompt,
                             context_chunks,
@@ -1294,7 +1326,6 @@ def main():
                             st.session_state.creds
                         )
                     
-                    # Add assistant response to messages
                     st.session_state.messages.append({
                         "role": "assistant", 
                         "content": response,
@@ -1302,7 +1333,6 @@ def main():
                         "timestamp": len(st.session_state.messages)
                     })
         
-        # Rerun to update the chat display
         st.rerun()
 
 if __name__ == "__main__":
