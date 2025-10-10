@@ -94,7 +94,39 @@ def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 2) -> 
     
     if buf:
         chunks.append(" ".join(buf))
-    return chunks
+    
+    # Validate and split oversized chunks
+    validated_chunks = []
+    for chunk in chunks:
+        if estimate_tokens(chunk) > 15000:  # Safety margin below 20K limit
+            # Split oversized chunk into smaller pieces
+            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=15000))
+        else:
+            validated_chunks.append(chunk)
+    
+    return validated_chunks
+
+def split_oversized_chunk(chunk: str, max_tokens: int = 15000) -> List[str]:
+    """Split a chunk that's too large into smaller pieces"""
+    words = chunk.split()
+    sub_chunks = []
+    current_chunk = []
+    current_tokens = 0
+    
+    for word in words:
+        word_tokens = len(word) // 4
+        if current_tokens + word_tokens > max_tokens and current_chunk:
+            sub_chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_tokens = word_tokens
+        else:
+            current_chunk.append(word)
+            current_tokens += word_tokens
+    
+    if current_chunk:
+        sub_chunks.append(" ".join(current_chunk))
+    
+    return sub_chunks
 
 def extract_text_from_docx_bytes(b: bytes) -> str:
     f = io.BytesIO(b)
@@ -374,13 +406,42 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         
         all_embeddings = []
         
-        # Process in batches
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            st.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+        # Validate and filter texts before embedding
+        valid_texts = []
+        for i, text in enumerate(texts):
+            token_count = estimate_tokens(text)
+            if token_count > 20000:
+                st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 20K limit)")
+                # Add a placeholder embedding of zeros
+                all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
+            else:
+                valid_texts.append((i, text))
+        
+        # Process valid texts in batches
+        for batch_start in range(0, len(valid_texts), batch_size):
+            batch_items = valid_texts[batch_start:batch_start + batch_size]
+            batch_texts = [item[1] for item in batch_items]
             
-            batch_embeddings = model.get_embeddings(batch)
-            all_embeddings.extend([e.values for e in batch_embeddings])
+            st.info(f"Processing embedding batch {batch_start//batch_size + 1}/{(len(valid_texts) + batch_size - 1)//batch_size}")
+            
+            try:
+                batch_embeddings = model.get_embeddings(batch_texts)
+                
+                # Insert embeddings at correct positions
+                for j, embedding in enumerate(batch_embeddings):
+                    original_idx = batch_items[j][0]
+                    # Pad with zeros if needed
+                    while len(all_embeddings) < original_idx:
+                        all_embeddings.append(np.zeros(768))
+                    all_embeddings.append(embedding.values)
+            except Exception as batch_error:
+                st.error(f"Batch embedding error: {batch_error}")
+                # Add zero embeddings for failed batch
+                for j in range(len(batch_items)):
+                    original_idx = batch_items[j][0]
+                    while len(all_embeddings) < original_idx:
+                        all_embeddings.append(np.zeros(768))
+                    all_embeddings.append(np.zeros(768))
         
         return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
@@ -581,6 +642,8 @@ def process_kb_files() -> List[Dict]:
     st.info(f"Found {len(files)} files in KB directory")
     
     processed_files = 0
+    total_chunks_before_validation = 0
+    
     for file_path in files:
         if file_path.is_file():
             try:
@@ -683,8 +746,31 @@ def process_kb_files() -> List[Dict]:
         
         processed_files += 1
     
-    st.success(f"Processed {processed_files} files, created {len(corpus)} chunks")
-    return corpus
+    # Validate chunk sizes and split oversized ones
+    st.info("Validating chunk sizes...")
+    validated_corpus = []
+    oversized_chunks = 0
+    
+    for item in corpus:
+        chunk_tokens = estimate_tokens(item["text"])
+        if chunk_tokens > 15000:
+            oversized_chunks += 1
+            # Split the oversized chunk
+            sub_chunks = split_oversized_chunk(item["text"], max_tokens=15000)
+            for i, sub_chunk in enumerate(sub_chunks):
+                validated_corpus.append({
+                    **item,
+                    "text": sub_chunk,
+                    "chunk_id": f"{item['chunk_id']}_split_{i}"
+                })
+        else:
+            validated_corpus.append(item)
+    
+    if oversized_chunks > 0:
+        st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
+    
+    st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
+    return validated_corpus
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
     """Extract conversation context from recent messages with token limiting"""
