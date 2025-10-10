@@ -95,18 +95,19 @@ def chunk_text(text: str, max_tokens: int = 500, overlap_sentences: int = 2) -> 
     if buf:
         chunks.append(" ".join(buf))
     
-    # Validate and split oversized chunks
+    # Validate and split oversized chunks with more aggressive limits
     validated_chunks = []
     for chunk in chunks:
-        if estimate_tokens(chunk) > 15000:  # Safety margin below 20K limit
+        chunk_tokens = estimate_tokens(chunk)
+        if chunk_tokens > 10000:  # Much lower limit for safety
             # Split oversized chunk into smaller pieces
-            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=15000))
+            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=10000))
         else:
             validated_chunks.append(chunk)
     
     return validated_chunks
 
-def split_oversized_chunk(chunk: str, max_tokens: int = 15000) -> List[str]:
+def split_oversized_chunk(chunk: str, max_tokens: int = 10000) -> List[str]:
     """Split a chunk that's too large into smaller pieces"""
     words = chunk.split()
     sub_chunks = []
@@ -410,8 +411,8 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         valid_texts = []
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
-            if token_count > 20000:
-                st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 20K limit)")
+            if token_count > 15000:  # Much stricter limit
+                st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 15K limit)")
                 # Add a placeholder embedding of zeros
                 all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
             else:
@@ -753,10 +754,10 @@ def process_kb_files() -> List[Dict]:
     
     for item in corpus:
         chunk_tokens = estimate_tokens(item["text"])
-        if chunk_tokens > 15000:
+        if chunk_tokens > 10000:
             oversized_chunks += 1
             # Split the oversized chunk
-            sub_chunks = split_oversized_chunk(item["text"], max_tokens=15000)
+            sub_chunks = split_oversized_chunk(item["text"], max_tokens=10000)
             for i, sub_chunk in enumerate(sub_chunks):
                 validated_corpus.append({
                     **item,
