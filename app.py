@@ -366,13 +366,23 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     
     return data
 
-def embed_texts(texts: List[str], project_id: str, location: str, credentials) -> np.ndarray:
-    """Generate embeddings for texts"""
+def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
+    """Generate embeddings for texts in batches to handle large corpora"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-        embeddings = model.get_embeddings(texts)
-        return np.array([e.values for e in embeddings]).astype(np.float32)
+        
+        all_embeddings = []
+        
+        # Process in batches
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            st.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+            
+            batch_embeddings = model.get_embeddings(batch)
+            all_embeddings.extend([e.values for e in batch_embeddings])
+        
+        return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
         st.error(f"Embedding error: {e}")
         return np.array([])
@@ -506,7 +516,7 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         expanded_query = expand_query(query)
         
         # Stage 2: Generate query embedding
-        query_embeddings = embed_texts([expanded_query], project_id, location, credentials)
+        query_embeddings = embed_texts([expanded_query], project_id, location, credentials, batch_size=1)
         if query_embeddings.size == 0:
             return []
         
@@ -568,7 +578,9 @@ def process_kb_files() -> List[Dict]:
         return corpus
     
     files = list(KB_DIR.iterdir())
+    st.info(f"Found {len(files)} files in KB directory")
     
+    processed_files = 0
     for file_path in files:
         if file_path.is_file():
             try:
@@ -668,7 +680,10 @@ def process_kb_files() -> List[Dict]:
                 
             except Exception as e:
                 st.error(f"Error processing {file_path.name}: {e}")
+        
+        processed_files += 1
     
+    st.success(f"Processed {processed_files} files, created {len(corpus)} chunks")
     return corpus
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
@@ -1123,10 +1138,12 @@ def main():
     @st.cache_resource
     def initialize_app():
         """Initialize the app - load index or build from KB files"""
+        # Try to load existing index first
         index, corpus = load_index_and_corpus()
         if index is not None and corpus:
             return index, corpus, True
         
+        # Build index from KB files
         corpus = process_kb_files()
         if not corpus:
             return None, [], False
@@ -1150,13 +1167,6 @@ def main():
     with st.sidebar:
         st.header("HBS Help Chatbot")
         
-        # Status
-        if st.session_state.kb_loaded:
-            st.success(f"✅ Knowledge base loaded ({len(st.session_state.corpus)} chunks)")
-            st.info(f"📊 Max context: {MAX_CONTEXT_TOKENS:,} tokens")
-        else:
-            st.error("❌ Knowledge base not loaded")
-        
         # Model selection
         st.subheader("Model Settings")
         st.session_state.model_name = st.selectbox(
@@ -1165,10 +1175,6 @@ def main():
             index=0,
             key="model_select"
         )
-        
-        # Retrieval settings
-        st.subheader("Retrieval Settings")
-        st.info(f"Retrieving top {MAX_CHUNKS_FINAL} from {MAX_CHUNKS_INITIAL} candidates")
         
         # Show escalation requests
         if st.session_state.escalation_requests:
@@ -1208,7 +1214,7 @@ def main():
     
     # Display welcome message if no messages yet
     if not st.session_state.messages:
-        st.info("Hi! I can handle your large knowledge base with up to 200,000 tokens. How can I help you?")
+        st.info("Hi! How can I help you today?")
     
     # Display chat messages
     for message in st.session_state.messages:
