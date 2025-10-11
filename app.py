@@ -59,8 +59,8 @@ MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
-    """Estimate token count (rough approximation: 1 token ≈ 4 characters)"""
-    return len(text) // 4
+    """Estimate token count (very conservative: 1 token ≈ 3 characters)"""
+    return max(1, len(text) // 3)
 
 def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     """Truncate text to fit within token limit"""
@@ -69,7 +69,7 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
         return text
     
     # Truncate to approximate character limit
-    char_limit = max_tokens * 4
+    char_limit = max_tokens * 3
     return text[:char_limit] + "...[truncated]"
 
 # ---- Utilities ----
@@ -77,47 +77,37 @@ def split_into_sentences(text: str) -> List[str]:
     sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-def chunk_text(text: str, max_tokens: int = 200, overlap_sentences: int = 2) -> List[str]:
-    """Improved chunking with extremely small chunks for better retrieval"""
-    sents = split_into_sentences(text)
-    chunks, buf, token_est = [], [], 0
+def force_split_oversized_text(text: str, max_tokens: int = 1500) -> List[str]:
+    """Force split any text into chunks that are guaranteed to be under max_tokens"""
+    if estimate_tokens(text) <= max_tokens:
+        return [text]
     
-    for s in sents:
-        s_tokens = max(1, len(s) // 4)
-        if token_est + s_tokens > max_tokens and buf:
-            chunks.append(" ".join(buf))
-            # Better overlap strategy
-            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
-            token_est = sum(max(1, len(x)//4) for x in buf)
-        buf.append(s)
-        token_est += s_tokens
-    
-    if buf:
-        chunks.append(" ".join(buf))
-    
-    # Validate and split oversized chunks with extremely aggressive limits
-    validated_chunks = []
-    for chunk in chunks:
-        chunk_tokens = estimate_tokens(chunk)
-        if chunk_tokens > 2000:  # Extremely low limit for safety
-            # Split oversized chunk into smaller pieces
-            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=2000))
-        else:
-            validated_chunks.append(chunk)
-    
-    return validated_chunks
-
-def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
-    """Split a chunk that's too large into smaller pieces"""
-    words = chunk.split()
-    sub_chunks = []
+    chunks = []
+    words = text.split()
     current_chunk = []
     current_tokens = 0
     
     for word in words:
-        word_tokens = len(word) // 4
+        word_tokens = estimate_tokens(word)
+        
+        # If a single word is too large, split it character by character
+        if word_tokens > max_tokens:
+            # Add current chunk if it has content
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_tokens = 0
+            
+            # Split the oversized word
+            char_limit = max_tokens * 3
+            for i in range(0, len(word), char_limit):
+                sub_word = word[i:i + char_limit]
+                chunks.append(sub_word)
+            continue
+        
+        # Check if adding this word would exceed the limit
         if current_tokens + word_tokens > max_tokens and current_chunk:
-            sub_chunks.append(" ".join(current_chunk))
+            chunks.append(" ".join(current_chunk))
             current_chunk = [word]
             current_tokens = word_tokens
         else:
@@ -125,9 +115,43 @@ def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
             current_tokens += word_tokens
     
     if current_chunk:
-        sub_chunks.append(" ".join(current_chunk))
+        chunks.append(" ".join(current_chunk))
     
-    return sub_chunks
+    # Final validation - ensure no chunk exceeds limit
+    validated_chunks = []
+    for chunk in chunks:
+        if estimate_tokens(chunk) <= max_tokens:
+            validated_chunks.append(chunk)
+        else:
+            # If somehow still too large, force split again with smaller limit
+            validated_chunks.extend(force_split_oversized_text(chunk, max_tokens // 2))
+    
+    return validated_chunks
+
+def chunk_text(text: str, max_tokens: int = 150, overlap_sentences: int = 1) -> List[str]:
+    """Ultra-aggressive chunking with guaranteed small chunks"""
+    sents = split_into_sentences(text)
+    chunks, buf, token_est = [], [], 0
+    
+    for s in sents:
+        s_tokens = estimate_tokens(s)
+        if token_est + s_tokens > max_tokens and buf:
+            chunks.append(" ".join(buf))
+            # Minimal overlap to save tokens
+            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
+            token_est = sum(estimate_tokens(x) for x in buf)
+        buf.append(s)
+        token_est += s_tokens
+    
+    if buf:
+        chunks.append(" ".join(buf))
+    
+    # Force split any chunks that are still too large
+    final_chunks = []
+    for chunk in chunks:
+        final_chunks.extend(force_split_oversized_text(chunk, max_tokens=1500))
+    
+    return final_chunks
 
 def extract_text_from_docx_bytes(b: bytes) -> str:
     f = io.BytesIO(b)
@@ -400,31 +424,36 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     return data
 
 def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
-    """Generate embeddings for texts in batches to handle large corpora"""
+    """Generate embeddings for texts with bulletproof validation"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = TextEmbeddingModel.from_pretrained("text-embedding-005")
         
         all_embeddings = []
         
-        # Validate and filter texts before embedding with very strict limits
+        # BULLETPROOF validation - ensure NO text exceeds limits
         valid_texts = []
         skipped_count = 0
+        
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
-            if token_count > 10000:  # Very strict limit
+            
+            # Ultra-strict limit with massive safety margin
+            if token_count > 8000:  # Much lower than 20K limit
                 skipped_count += 1
-                if skipped_count <= 5:  # Only show first 5 warnings to avoid spam
-                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
-                # Add a placeholder embedding of zeros
-                all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
+                if skipped_count <= 5:
+                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 8K limit)")
+                # Add zero embedding
+                all_embeddings.append(np.zeros(768))
             else:
-                valid_texts.append((i, text))
+                # Double-check by truncating if needed
+                safe_text = truncate_to_token_limit(text, 8000)
+                valid_texts.append((i, safe_text))
         
         if skipped_count > 5:
             st.warning(f"Skipped {skipped_count} texts total due to size limits")
         
-        # Process valid texts in batches
+        # Process valid texts in smaller batches
         for batch_start in range(0, len(valid_texts), batch_size):
             batch_items = valid_texts[batch_start:batch_start + batch_size]
             batch_texts = [item[1] for item in batch_items]
@@ -638,7 +667,7 @@ def save_index_and_corpus(index, corpus: List[Dict]):
         st.error(f"Error saving index: {e}")
 
 def process_kb_files() -> List[Dict]:
-    """Process all KB files and create corpus with image data extraction"""
+    """Process all KB files and create corpus with bulletproof chunk validation"""
     corpus = []
     
     if not KB_DIR.exists():
@@ -649,7 +678,6 @@ def process_kb_files() -> List[Dict]:
     st.info(f"Found {len(files)} files in KB directory")
     
     processed_files = 0
-    total_chunks_before_validation = 0
     
     for file_path in files:
         if file_path.is_file():
@@ -659,24 +687,28 @@ def process_kb_files() -> List[Dict]:
                     if text.strip():
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
-                            corpus.append({
-                                "text": chunk,
-                                "source": file_path.name,
-                                "chunk_id": i,
-                                "file_type": file_path.suffix.lower()
-                            })
+                            # Final validation before adding to corpus
+                            if estimate_tokens(chunk) <= 1500:
+                                corpus.append({
+                                    "text": chunk,
+                                    "source": file_path.name,
+                                    "chunk_id": i,
+                                    "file_type": file_path.suffix.lower()
+                                })
                 
                 elif file_path.suffix.lower() == '.pdf':
                     text = extract_text_from_pdf_bytes(file_path.read_bytes())
                     if text.strip():
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
-                            corpus.append({
-                                "text": chunk,
-                                "source": file_path.name,
-                                "chunk_id": i,
-                                "file_type": file_path.suffix.lower()
-                            })
+                            # Final validation before adding to corpus
+                            if estimate_tokens(chunk) <= 1500:
+                                corpus.append({
+                                    "text": chunk,
+                                    "source": file_path.name,
+                                    "chunk_id": i,
+                                    "file_type": file_path.suffix.lower()
+                                })
                 
                 elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
                     file_size = file_path.stat().st_size
@@ -689,13 +721,15 @@ def process_kb_files() -> List[Dict]:
                         if ocr_text.strip():
                             chunks = chunk_text(ocr_text)
                             for i, chunk in enumerate(chunks):
-                                corpus.append({
-                                    "text": chunk,
-                                    "source": file_path.name,
-                                    "chunk_id": i,
-                                    "file_type": file_path.suffix.lower(),
-                                    "content_type": "ocr_text"
-                                })
+                                # Final validation before adding to corpus
+                                if estimate_tokens(chunk) <= 1500:
+                                    corpus.append({
+                                        "text": chunk,
+                                        "source": file_path.name,
+                                        "chunk_id": i,
+                                        "file_type": file_path.suffix.lower(),
+                                        "content_type": "ocr_text"
+                                    })
                             
                             try:
                                 structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
@@ -733,14 +767,16 @@ def process_kb_files() -> List[Dict]:
                                     if 'meter' in data_item:
                                         searchable_text += f"Meter: {data_item['meter']} "
                                     
-                                    corpus.append({
-                                        "text": searchable_text,
-                                        "source": file_path.name,
-                                        "chunk_id": len(corpus),
-                                        "file_type": file_path.suffix.lower(),
-                                        "content_type": "structured_data",
-                                        "structured_data": data_item
-                                    })
+                                    # Final validation before adding to corpus
+                                    if estimate_tokens(searchable_text) <= 1500:
+                                        corpus.append({
+                                            "text": searchable_text,
+                                            "source": file_path.name,
+                                            "chunk_id": len(corpus),
+                                            "file_type": file_path.suffix.lower(),
+                                            "content_type": "structured_data",
+                                            "structured_data": data_item
+                                        })
                                 
                             except Exception as e:
                                 pass
@@ -753,39 +789,20 @@ def process_kb_files() -> List[Dict]:
         
         processed_files += 1
     
-    # Validate chunk sizes and split oversized ones
-    st.info("Validating chunk sizes...")
+    # Final validation pass - remove any chunks that somehow exceed limits
     validated_corpus = []
-    oversized_chunks = 0
-    max_chunk_size = 0
-    total_chunks = len(corpus)
+    removed_count = 0
     
-    for idx, item in enumerate(corpus):
-        chunk_tokens = estimate_tokens(item["text"])
-        max_chunk_size = max(max_chunk_size, chunk_tokens)
-        
-        if chunk_tokens > 2000:
-            oversized_chunks += 1
-            if oversized_chunks <= 3:  # Show details for first 3 oversized chunks
-                st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
-            
-            # Split the oversized chunk
-            sub_chunks = split_oversized_chunk(item["text"], max_tokens=2000)
-            for i, sub_chunk in enumerate(sub_chunks):
-                validated_corpus.append({
-                    **item,
-                    "text": sub_chunk,
-                    "chunk_id": f"{item['chunk_id']}_split_{i}"
-                })
-        else:
+    for item in corpus:
+        if estimate_tokens(item["text"]) <= 1500:
             validated_corpus.append(item)
+        else:
+            removed_count += 1
     
-    st.info(f"Max chunk size found: {max_chunk_size} tokens")
+    if removed_count > 0:
+        st.warning(f"Removed {removed_count} chunks that exceeded size limits in final validation")
     
-    if oversized_chunks > 0:
-        st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
-    
-    st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
+    st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (bulletproof validation)")
     return validated_corpus
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
