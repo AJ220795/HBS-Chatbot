@@ -657,12 +657,7 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
                     "similarity_score": float(score)
                 })
         
-        # Debug info (only show if no candidates found)
         if not candidates:
-            # Show debug info for troubleshooting
-            top_scores = [float(s) for s in scores[0][:5]]
-            if hasattr(st.session_state, 'debug_mode') and st.session_state.get('debug_mode', False):
-                st.warning(f"Debug: No candidates found. Top 5 scores: {top_scores}, threshold: {min_similarity}")
             return []
         
         # Stage 4: Re-rank using LLM for better relevance
@@ -705,7 +700,9 @@ def process_kb_files() -> List[Dict]:
         return corpus
     
     files = list(KB_DIR.iterdir())
-    st.info(f"Found {len(files)} files in KB directory")
+    # Only show file count during initial loading
+    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+        st.info(f"Found {len(files)} files in KB directory")
     
     processed_files = 0
     total_chunks_before_validation = 0
@@ -796,16 +793,21 @@ def process_kb_files() -> List[Dict]:
                 st.warning(f"Error processing {file_path.name}: {file_error}")
     
     # Validate chunk sizes and split oversized ones
-    st.info("Validating chunk sizes...")
+    # Only show validation message during initial loading
+    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+        st.info("Validating chunk sizes...")
     validated_corpus = []
     oversized_chunks = 0
+    max_chunk_size = 0
+    total_chunks = len(corpus)
     
     for idx, item in enumerate(corpus):
         chunk_tokens = estimate_tokens(item["text"])
+        max_chunk_size = max(max_chunk_size, chunk_tokens)
         
         if chunk_tokens > 2000:
             oversized_chunks += 1
-            if oversized_chunks <= 3:
+            if oversized_chunks <= 3 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
                 st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
             
             # Split the oversized chunk
@@ -819,10 +821,16 @@ def process_kb_files() -> List[Dict]:
         else:
             validated_corpus.append(item)
     
-    if oversized_chunks > 0:
+    # Only show max chunk size during initial loading
+    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+        st.info(f"Max chunk size found: {max_chunk_size} tokens")
+    
+    if oversized_chunks > 0 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
     
-    st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
+    # Only show success message during initial loading
+    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+        st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
     return validated_corpus
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
@@ -1247,9 +1255,6 @@ def main():
             key="model_select"
         )
         
-        # Debug mode toggle
-        st.session_state.debug_mode = st.checkbox("🐛 Debug Mode", value=False)
-        
         # Show escalation requests
         if st.session_state.escalation_requests:
             st.subheader("📞 Live Agent Requests")
@@ -1265,7 +1270,14 @@ def main():
             INDEX_PATH.unlink(missing_ok=True)
             CORPUS_PATH.unlink(missing_ok=True)
             st.session_state.kb_loaded = False
+            st.session_state.kb_loading = True
             st.cache_resource.clear()
+            st.success("Cache cleared! The page will reload to rebuild the knowledge base.")
+            st.rerun()
+        
+        # Clear conversation button
+        if st.button("🗑️ Clear Conversation", key="clear_btn"):
+            st.session_state.messages = []
             st.rerun()
 
     st.title("🤖 HBS Help Chatbot")
