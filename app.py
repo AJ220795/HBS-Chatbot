@@ -55,7 +55,7 @@ DEFAULT_LOCATION = "us-central1"
 # Token limits for different contexts
 MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
 MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
-MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
+MAX_CHUNKS_FINAL = 2     # Send top 2 to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -432,7 +432,9 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
                 # Process current batch
                 batch_num += 1
                 batch_texts = [item[1] for item in current_batch]
-                st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
+                # Progress messages only during initial loading
+                if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+                    st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
                 
                 try:
                     batch_embeddings = model.get_embeddings(batch_texts)
@@ -465,7 +467,9 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         if current_batch:
             batch_num += 1
             batch_texts = [item[1] for item in current_batch]
-            st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
+            # Progress messages only during initial loading
+            if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+                st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
             
             try:
                 batch_embeddings = model.get_embeddings(batch_texts)
@@ -624,7 +628,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.6) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.5) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
@@ -653,7 +657,12 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
                     "similarity_score": float(score)
                 })
         
+        # Debug info (only show if no candidates found)
         if not candidates:
+            # Show debug info for troubleshooting
+            top_scores = [float(s) for s in scores[0][:5]]
+            if hasattr(st.session_state, 'debug_mode') and st.session_state.get('debug_mode', False):
+                st.warning(f"Debug: No candidates found. Top 5 scores: {top_scores}, threshold: {min_similarity}")
             return []
         
         # Stage 4: Re-rank using LLM for better relevance
@@ -1177,6 +1186,8 @@ def main():
         st.session_state.model_name = CANDIDATE_MODELS[0]
     if "kb_loaded" not in st.session_state:
         st.session_state.kb_loaded = False
+    if "kb_loading" not in st.session_state:
+        st.session_state.kb_loading = False
     if "use_langchain" not in st.session_state:
         st.session_state.use_langchain = LANGCHAIN_AVAILABLE
     if "escalation_requests" not in st.session_state:
@@ -1215,31 +1226,42 @@ def main():
 
     # Initialize
     if not st.session_state.kb_loaded:
+        st.session_state.kb_loading = True
         with st.spinner("Loading knowledge base..."):
             index, corpus, loaded = initialize_app()
             st.session_state.index = index
             st.session_state.corpus = corpus
             st.session_state.kb_loaded = loaded
-            
-            if not loaded:
-                st.error("Failed to load knowledge base")
-                st.stop()
+            st.session_state.kb_loading = False
 
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("HBS Help Chatbot")
         
+        # Model selection
+        st.subheader("Model Settings")
         st.session_state.model_name = st.selectbox(
             "Select Model",
             CANDIDATE_MODELS,
-            index=CANDIDATE_MODELS.index(st.session_state.model_name)
+            index=0,
+            key="model_select"
         )
         
-        if st.button("🔄 Clear Conversation"):
-            st.session_state.messages = []
-            st.rerun()
+        # Debug mode toggle
+        st.session_state.debug_mode = st.checkbox("🐛 Debug Mode", value=False)
         
-        if st.button("🔨 Rebuild Knowledge Base"):
+        # Show escalation requests
+        if st.session_state.escalation_requests:
+            st.subheader("📞 Live Agent Requests")
+            for i, req in enumerate(st.session_state.escalation_requests):
+                with st.expander(f"Request #{i+1} - {req['query'][:50]}..."):
+                    st.write(f"**Query:** {req['query']}")
+                    st.write(f"**Intent:** {req['user_analysis'].get('intent', 'unknown') if req['user_analysis'] else 'unknown'}")
+                    st.write(f"**Sentiment:** {req['user_analysis'].get('sentiment', 'unknown') if req['user_analysis'] else 'unknown'}")
+                    st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
+        
+        # Rebuild index button
+        if st.button("🔄 Rebuild Index", key="rebuild_btn"):
             INDEX_PATH.unlink(missing_ok=True)
             CORPUS_PATH.unlink(missing_ok=True)
             st.session_state.kb_loaded = False
