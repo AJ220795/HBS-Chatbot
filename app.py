@@ -118,225 +118,232 @@ def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
         word_tokens = len(word) // 4
         if current_tokens + word_tokens > max_tokens and current_chunk:
             sub_chunks.append(" ".join(current_chunk))
-            current_chunk = []
-            current_tokens = 0
-        
-        current_chunk.append(word)
-        current_tokens += word_tokens
+            current_chunk = [word]
+            current_tokens = word_tokens
+        else:
+            current_chunk.append(word)
+            current_tokens += word_tokens
     
     if current_chunk:
         sub_chunks.append(" ".join(current_chunk))
     
-    return sub_chunks if sub_chunks else [chunk]
+    return sub_chunks
 
-# ---- Document Processing ----
-def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
-    """Extract text from DOCX bytes"""
+def extract_text_from_docx_bytes(b: bytes) -> str:
+    f = io.BytesIO(b)
+    doc = Document(f)
+    out = []
+    for para in doc.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            out.append(t)
+    return "\n".join(out)
+
+def extract_text_from_pdf_bytes(b: bytes) -> str:
     try:
-        doc = Document(io.BytesIO(docx_bytes))
-        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-        return text
-    except Exception as e:
-        st.warning(f"Error reading DOCX: {e}")
+        f = io.BytesIO(b)
+        reader = PdfReader(f)
+        parts = []
+        for page in reader.pages:
+            t = (page.extract_text() or "").strip()
+            if t:
+                parts.append(t)
+        return "\n\n".join(parts)
+    except Exception:
         return ""
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes"""
+def extract_text_from_image_bytes(b: bytes) -> str:
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-        return text
-    except Exception as e:
-        st.warning(f"Error reading PDF: {e}")
-        return ""
-
-def extract_text_from_image_bytes(image_bytes: bytes) -> str:
-    """Extract text from image bytes using OCR"""
-    try:
-        image = PILImage.open(io.BytesIO(image_bytes))
-        img_array = np.array(image)
-        
-        if len(img_array.shape) == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_array
-        
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        text = pytesseract.image_to_string(thresh)
-        return text.strip()
-    except Exception as e:
+        img = PILImage.open(io.BytesIO(b)).convert("RGB")
+        arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        return (pytesseract.image_to_string(gray) or "").strip()
+    except Exception:
         return ""
 
 def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse structured data from OCR text based on filename"""
-    data = []
+    """Parse OCR text to extract structured report data"""
+    structured_data = []
     
-    filename_lower = filename.lower()
-    if "overdue" in filename_lower:
-        return parse_overdue_equipment_report(ocr_text, filename)
-    elif "outbound" in filename_lower:
-        return parse_outbound_report(ocr_text, filename)
-    elif "equipment" in filename_lower and "list" in filename_lower:
-        return parse_equipment_list_report(ocr_text, filename)
+    # Clean up OCR text
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
-    return data
+    # Look for report patterns
+    if "overdue" in filename.lower() or "overdue" in ocr_text.lower():
+        structured_data.extend(parse_overdue_report(ocr_text, filename))
+    elif "outbound" in filename.lower() or "outbound" in ocr_text.lower():
+        structured_data.extend(parse_outbound_report(ocr_text, filename))
+    elif "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
+        structured_data.extend(parse_equipment_list_report(ocr_text, filename))
+    
+    return structured_data
 
-def parse_overdue_equipment_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Overdue Equipment Report"""
+def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse Overdue Equipment Report data"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
     for i, line in enumerate(lines):
-        contract_match = re.search(r'\b\d{5,}\b', line)
-        if contract_match:
-            contract = contract_match.group()
-            
-            customer_name = ""
-            phone = ""
-            stock = ""
-            make = ""
-            model = ""
-            equipment_type = ""
-            year = ""
-            serial = ""
-            date_time_out = ""
-            
-            for j in range(max(0, i-2), min(len(lines), i+3)):
-                current_line = lines[j]
-                
-                name_match = re.search(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', current_line)
-                if name_match and not customer_name:
-                    customer_name = name_match.group()
-                
-                phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', current_line)
-                if phone_match:
-                    phone = phone_match.group()
-                
-                stock_match = re.search(r'\b\d{5}\b', current_line)
-                if stock_match and stock_match.group() != contract:
-                    stock = stock_match.group()
-                
-                make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
-                if make_match:
-                    make = make_match.group()
-                
-                model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
-                if model_match:
-                    model = model_match.group()
-                
-                type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
-                if type_match:
-                    equipment_type = type_match.group()
-                
-                year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
-                if year_match:
-                    year = year_match.group()
-                
-                serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
-                if serial_match and len(serial_match.group()) > 6:
-                    serial = serial_match.group()
-                
-                datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
-                if datetime_match:
-                    date_time_out = datetime_match.group()
-            
-            if customer_name and contract:
-                data.append({
-                    "customer_name": customer_name,
-                    "contract": contract,
-                    "phone": phone,
-                    "stock_number": stock,
-                    "make": make,
-                    "model": model,
-                    "equipment_type": equipment_type,
-                    "year": year,
-                    "serial": serial,
-                    "date_time_out": date_time_out,
-                    "source": filename,
-                    "report_type": "Overdue Equipment Report"
-                })
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                contract_match = re.search(r'C\d+R', next_line)
+                if contract_match:
+                    customer_name = line
+                    contract = contract_match.group()
+                    
+                    phone = ""
+                    stock = ""
+                    make = ""
+                    model = ""
+                    equipment_type = ""
+                    year = ""
+                    serial = ""
+                    date_out = ""
+                    expected = ""
+                    days_over = ""
+                    
+                    for j in range(i, min(i + 5, len(lines))):
+                        current_line = lines[j]
+                        
+                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
+                        if phone_match:
+                            phone = phone_match.group()
+                        
+                        stock_match = re.search(r'\b\d{5}\b', current_line)
+                        if stock_match:
+                            stock = stock_match.group()
+                        
+                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
+                        if make_match:
+                            make = make_match.group()
+                        
+                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
+                        if model_match:
+                            model = model_match.group()
+                        
+                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
+                        if type_match:
+                            equipment_type = type_match.group()
+                        
+                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
+                        if year_match:
+                            year = year_match.group()
+                        
+                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
+                        if serial_match and len(serial_match.group()) > 6:
+                            serial = serial_match.group()
+                        
+                        date_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', current_line)
+                        if date_match:
+                            if not date_out:
+                                date_out = date_match.group()
+                            else:
+                                expected = date_match.group()
+                        
+                        days_match = re.search(r'\b\d{1,4}\b', current_line)
+                        if days_match and days_match.group().isdigit():
+                            days_over = days_match.group()
+                    
+                    if customer_name and contract:
+                        data.append({
+                            "customer_name": customer_name,
+                            "contract": contract,
+                            "phone": phone,
+                            "stock_number": stock,
+                            "make": make,
+                            "model": model,
+                            "equipment_type": equipment_type,
+                            "year": year,
+                            "serial": serial,
+                            "date_out": date_out,
+                            "expected_due": expected,
+                            "days_overdue": days_over,
+                            "source": filename,
+                            "report_type": "Overdue Equipment Report"
+                        })
     
     return data
 
 def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Outbound Report"""
+    """Parse Outbound Report data"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
     for i, line in enumerate(lines):
-        contract_match = re.search(r'\b\d{5,}\b', line)
-        if contract_match:
-            contract = contract_match.group()
-            
-            customer_name = ""
-            phone = ""
-            stock = ""
-            make = ""
-            model = ""
-            equipment_type = ""
-            year = ""
-            serial = ""
-            date_time_out = ""
-            
-            for j in range(max(0, i-2), min(len(lines), i+3)):
-                current_line = lines[j]
-                
-                name_match = re.search(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', current_line)
-                if name_match and not customer_name:
-                    customer_name = name_match.group()
-                
-                phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', current_line)
-                if phone_match:
-                    phone = phone_match.group()
-                
-                stock_match = re.search(r'\b\d{5}\b', current_line)
-                if stock_match and stock_match.group() != contract:
-                    stock = stock_match.group()
-                
-                make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
-                if make_match:
-                    make = make_match.group()
-                
-                model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
-                if model_match:
-                    model = model_match.group()
-                
-                type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
-                if type_match:
-                    equipment_type = type_match.group()
-                
-                year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
-                if year_match:
-                    year = year_match.group()
-                
-                serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
-                if serial_match and len(serial_match.group()) > 6:
-                    serial = serial_match.group()
-                
-                datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
-                if datetime_match:
-                    date_time_out = datetime_match.group()
-            
-            if customer_name and contract:
-                data.append({
-                    "customer_name": customer_name,
-                    "contract": contract,
-                    "phone": phone,
-                    "stock_number": stock,
-                    "make": make,
-                    "model": model,
-                    "equipment_type": equipment_type,
-                    "year": year,
-                    "serial": serial,
-                    "date_time_out": date_time_out,
-                    "source": filename,
-                    "report_type": "Rental Outbound Report"
-                })
+        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                contract_match = re.search(r'C\d+R', next_line)
+                if contract_match:
+                    customer_name = line
+                    contract = contract_match.group()
+                    
+                    phone = ""
+                    stock = ""
+                    make = ""
+                    model = ""
+                    equipment_type = ""
+                    year = ""
+                    serial = ""
+                    date_time_out = ""
+                    
+                    for j in range(i, min(i + 5, len(lines))):
+                        current_line = lines[j]
+                        
+                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
+                        if phone_match:
+                            phone = phone_match.group()
+                        
+                        stock_match = re.search(r'\b\d{5}\b', current_line)
+                        if stock_match:
+                            stock = stock_match.group()
+                        
+                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
+                        if make_match:
+                            make = make_match.group()
+                        
+                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
+                        if model_match:
+                            model = model_match.group()
+                        
+                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
+                        if type_match:
+                            equipment_type = type_match.group()
+                        
+                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
+                        if year_match:
+                            year = year_match.group()
+                        
+                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
+                        if serial_match and len(serial_match.group()) > 6:
+                            serial = serial_match.group()
+                        
+                        datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
+                        if datetime_match:
+                            date_time_out = datetime_match.group()
+                    
+                    if customer_name and contract:
+                        data.append({
+                            "customer_name": customer_name,
+                            "contract": contract,
+                            "phone": phone,
+                            "stock_number": stock,
+                            "make": make,
+                            "model": model,
+                            "equipment_type": equipment_type,
+                            "year": year,
+                            "serial": serial,
+                            "date_time_out": date_time_out,
+                            "source": filename,
+                            "report_type": "Rental Outbound Report"
+                        })
     
     return data
 
 def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Equipment List Report"""
+    """Parse Equipment List Report data"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
@@ -392,30 +399,29 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     
     return data
 
-# ---- Embedding and Indexing ----
-def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
-    """Generate embeddings for texts with token-aware batching"""
+def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250, silent: bool = False) -> np.ndarray:
+    """Generate embeddings for texts in batches to handle large corpora"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = TextEmbeddingModel.from_pretrained("text-embedding-005")
         
         all_embeddings = []
         
-        # Validate and filter texts before embedding
+        # Validate and filter texts before embedding with very strict limits
         valid_texts = []
         skipped_count = 0
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
-            if token_count > 10000:  # Very strict limit per individual text
+            if token_count > 10000:  # Very strict limit
                 skipped_count += 1
-                if skipped_count <= 5:
+                if not silent and skipped_count <= 5:  # Only show first 5 warnings to avoid spam
                     st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
                 # Add a placeholder embedding of zeros
                 all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
             else:
                 valid_texts.append((i, text))
         
-        if skipped_count > 5:
+        if not silent and skipped_count > 5:
             st.warning(f"Skipped {skipped_count} texts total due to size limits")
         
         # Process valid texts in batches with token-aware batching
@@ -433,7 +439,7 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
                 batch_num += 1
                 batch_texts = [item[1] for item in current_batch]
                 # Progress messages only during initial loading
-                if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+                if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
                     st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
                 
                 try:
@@ -447,7 +453,8 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
                             all_embeddings.append(np.zeros(768))
                         all_embeddings.append(embedding.values)
                 except Exception as batch_error:
-                    st.error(f"Batch embedding error: {batch_error}")
+                    if not silent:
+                        st.error(f"Batch embedding error: {batch_error}")
                     # Add zero embeddings for failed batch
                     for j in range(len(current_batch)):
                         orig_idx = current_batch[j][0]
@@ -468,7 +475,7 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
             batch_num += 1
             batch_texts = [item[1] for item in current_batch]
             # Progress messages only during initial loading
-            if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+            if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
                 st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
             
             try:
@@ -481,7 +488,8 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
                         all_embeddings.append(np.zeros(768))
                     all_embeddings.append(embedding.values)
             except Exception as batch_error:
-                st.error(f"Final batch embedding error: {batch_error}")
+                if not silent:
+                    st.error(f"Final batch embedding error: {batch_error}")
                 for j in range(len(current_batch)):
                     orig_idx = current_batch[j][0]
                     while len(all_embeddings) < orig_idx:
@@ -490,16 +498,17 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         
         return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
-        st.error(f"Embedding error: {e}")
+        if not silent:
+            st.error(f"Embedding error: {e}")
         return np.array([])
 
-def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials) -> tuple:
+def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials, silent: bool = False) -> tuple:
     """Build FAISS index from corpus"""
     if not corpus:
         return None, []
     
     texts = [item["text"] for item in corpus]
-    embeddings = embed_texts(texts, project_id, location, credentials)
+    embeddings = embed_texts(texts, project_id, location, credentials, silent=silent)
     
     if embeddings.size == 0:
         return None, []
@@ -638,7 +647,7 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         expanded_query = expand_query(query)
         
         # Stage 2: Generate query embedding
-        query_embeddings = embed_texts([expanded_query], project_id, location, credentials, batch_size=1)
+        query_embeddings = embed_texts([expanded_query], project_id, location, credentials, batch_size=1, silent=True)
         if query_embeddings.size == 0:
             return []
         
@@ -666,10 +675,10 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         return reranked
     
     except Exception as e:
-        st.error(f"Search error: {str(e)}")
+        st.error(f"Search error: {e}")
         return []
 
-def load_index_and_corpus():
+def load_index_and_corpus() -> tuple:
     """Load existing FAISS index and corpus"""
     try:
         if INDEX_PATH.exists() and CORPUS_PATH.exists():
@@ -678,11 +687,11 @@ def load_index_and_corpus():
                 corpus = json.load(f)
             return index, corpus
     except Exception as e:
-        st.warning(f"Could not load existing index: {e}")
+        st.error(f"Error loading index: {e}")
     return None, []
 
-def save_index_and_corpus(index, corpus):
-    """Save FAISS index and corpus to disk"""
+def save_index_and_corpus(index, corpus: List[Dict]):
+    """Save FAISS index and corpus"""
     try:
         if index is not None:
             faiss.write_index(index, str(INDEX_PATH))
@@ -691,17 +700,18 @@ def save_index_and_corpus(index, corpus):
     except Exception as e:
         st.error(f"Error saving index: {e}")
 
-def process_kb_files() -> List[Dict]:
+def process_kb_files(silent: bool = False) -> List[Dict]:
     """Process all KB files and create corpus with image data extraction"""
     corpus = []
     
     if not KB_DIR.exists():
-        st.error(f"KB_DIR does not exist: {KB_DIR}")
+        if not silent:
+            st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
     
     files = list(KB_DIR.iterdir())
     # Only show file count during initial loading
-    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.info(f"Found {len(files)} files in KB directory")
     
     processed_files = 0
@@ -773,28 +783,46 @@ def process_kb_files() -> List[Dict]:
                                     if 'year' in data_item:
                                         searchable_text += f"Year: {data_item['year']} "
                                     if 'serial' in data_item:
-                                        searchable_text += f"Serial: {data_item['serial']}"
+                                        searchable_text += f"Serial: {data_item['serial']} "
+                                    if 'days_overdue' in data_item:
+                                        searchable_text += f"Days Overdue: {data_item['days_overdue']} "
+                                    if 'date_out' in data_item:
+                                        searchable_text += f"Date Out: {data_item['date_out']} "
+                                    if 'expected_due' in data_item:
+                                        searchable_text += f"Expected Due: {data_item['expected_due']} "
+                                    if 'date_time_out' in data_item:
+                                        searchable_text += f"Date/Time Out: {data_item['date_time_out']} "
+                                    if 'phone' in data_item:
+                                        searchable_text += f"Phone: {data_item['phone']} "
+                                    if 'location' in data_item:
+                                        searchable_text += f"Location: {data_item['location']} "
+                                    if 'meter' in data_item:
+                                        searchable_text += f"Meter: {data_item['meter']} "
                                     
                                     corpus.append({
-                                        "text": searchable_text.strip(),
+                                        "text": searchable_text,
                                         "source": file_path.name,
-                                        "chunk_id": data_item.get('contract', data_item.get('stock_number', i)),
+                                        "chunk_id": len(corpus),
                                         "file_type": file_path.suffix.lower(),
                                         "content_type": "structured_data",
                                         "structured_data": data_item
                                     })
-                            except Exception as struct_error:
+                                
+                            except Exception as e:
                                 pass
-                    except Exception as img_error:
+                                
+                    except Exception as e:
                         pass
                 
-                processed_files += 1
-            except Exception as file_error:
-                st.warning(f"Error processing {file_path.name}: {file_error}")
+            except Exception as e:
+                if not silent:
+                    st.error(f"Error processing {file_path.name}: {e}")
+        
+        processed_files += 1
     
     # Validate chunk sizes and split oversized ones
     # Only show validation message during initial loading
-    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.info("Validating chunk sizes...")
     validated_corpus = []
     oversized_chunks = 0
@@ -807,7 +835,7 @@ def process_kb_files() -> List[Dict]:
         
         if chunk_tokens > 2000:
             oversized_chunks += 1
-            if oversized_chunks <= 3 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+            if not silent and oversized_chunks <= 3 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
                 st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
             
             # Split the oversized chunk
@@ -822,14 +850,14 @@ def process_kb_files() -> List[Dict]:
             validated_corpus.append(item)
     
     # Only show max chunk size during initial loading
-    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.info(f"Max chunk size found: {max_chunk_size} tokens")
     
-    if oversized_chunks > 0 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and oversized_chunks > 0 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
     
     # Only show success message during initial loading
-    if hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
         st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
     return validated_corpus
 
@@ -927,47 +955,51 @@ Analyze and classify:
    - "new_topic" - Completely new subject
    - "continuation" - Same topic, different aspect
 
-4. ESCALATION_NEEDED: Does this require human intervention?
-   - true if: user explicitly asks for human help, bot cannot answer adequately, urgent issue, frustrated user
-   - false otherwise
+4. ESCALATION_NEEDED: Does this indicate need for human assistance?
+   - Consider frustration level, complexity, repeated failures, explicit requests
 
-5. CONFIDENCE: How confident are you in this analysis? (0.0 to 1.0)
-
-6. REASONING: Brief explanation of your analysis
-
-Return JSON with keys: intent, sentiment, context_relevance, escalation_needed, confidence, reasoning
-
-Example: {{"intent": "question", "sentiment": "neutral", "context_relevance": "new_topic", "escalation_needed": false, "confidence": 0.9, "reasoning": "User asking straightforward informational question"}}
-
-Return ONLY valid JSON, no other text."""
+Respond with ONLY a JSON object:
+{{
+    "intent": "one_of_the_intents_above",
+    "sentiment": "one_of_the_sentiments_above", 
+    "context_relevance": "one_of_the_relevance_types_above",
+    "escalation_needed": true/false,
+    "confidence": 0.95,
+    "reasoning": "brief explanation of the analysis"
+}}"""
 
         response = model.generate_content(
             analysis_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=500
+                max_output_tokens=300,
+                top_p=0.8,
+                top_k=40
             )
         )
         
         if response.text:
             try:
-                # Try to extract JSON from response
-                json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-                if json_match:
-                    analysis = json.loads(json_match.group())
-                    return analysis
+                result = json.loads(response.text.strip())
+                return result
             except json.JSONDecodeError:
-                pass
-        
-        # Fallback analysis
-        return {
-            "intent": "question",
-            "sentiment": "neutral",
-            "context_relevance": "new_topic", 
-            "escalation_needed": False,
-            "confidence": 0.5,
-            "reasoning": "Using fallback analysis"
-        }
+                return {
+                    "intent": "question",
+                    "sentiment": "neutral",
+                    "context_relevance": "new_topic",
+                    "escalation_needed": False,
+                    "confidence": 0.5,
+                    "reasoning": "Failed to parse analysis response"
+                }
+        else:
+            return {
+                "intent": "question",
+                "sentiment": "neutral", 
+                "context_relevance": "new_topic",
+                "escalation_needed": False,
+                "confidence": 0.5,
+                "reasoning": "No response from analysis model"
+            }
     
     except Exception as e:
         return {
@@ -1104,63 +1136,115 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
 
 # ---- LangChain Integration ----
 @st.cache_resource
-def get_langchain_conversation_chain(_model_name: str, _project_id: str, _location: str, _credentials):
-    """Get LangChain conversation chain with LLMChain"""
+def get_langchain_llm(project_id: str, location: str, _credentials, model_name: str):
+    """Get LangChain LLM instance"""
+    if not LANGCHAIN_AVAILABLE:
+        return None
+    
     try:
-        from langchain.chains import LLMChain
-        from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-        from langchain_google_vertexai import ChatVertexAI
+        vertexai_init(project=project_id, location=location, credentials=_credentials)
         
-        vertexai_init(project=_project_id, location=_location, credentials=_credentials)
-        
-        llm = ChatVertexAI(
-            model_name=_model_name,
-            temperature=0.7,
-            max_output_tokens=1024,
-            project=_project_id,
-            location=_location,
-            credentials=_credentials
+        llm = VertexAI(
+            model_name=model_name,
+            project=project_id,
+            location=location,
+            temperature=0.1,
+            max_output_tokens=2048,
+            top_p=0.8,
+            top_k=40
         )
+        return llm
+    except Exception as e:
+        st.error(f"Error creating LangChain LLM: {e}")
+        return None
+
+@st.cache_resource
+def get_conversation_chain(project_id: str, location: str, _credentials, model_name: str):
+    """Get LangChain conversation chain with memory"""
+    if not LANGCHAIN_AVAILABLE:
+        return None
+    
+    try:
+        llm = get_langchain_llm(project_id, location, _credentials, model_name)
+        if not llm:
+            return None
         
         memory = ConversationBufferWindowMemory(
-            k=5,
-            return_messages=True,
-            memory_key="history",
-            input_key="input"
+            k=6,
+            return_messages=True
         )
         
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert HBS assistant. Use the context and user analysis to provide helpful responses.\n\nContext: {context}\n\nUser Analysis: {user_analysis}"),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{input}")
-        ])
+        prompt = PromptTemplate(
+            input_variables=["history", "input", "context", "user_analysis"],
+            template="""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
+
+CONTEXT FROM KNOWLEDGE BASE:
+{context}
+
+USER ANALYSIS:
+{user_analysis}
+
+CONVERSATION HISTORY:
+{history}
+
+USER QUESTION: {input}
+
+INSTRUCTIONS:
+1. **UNDERSTAND THE USER**: Consider their intent, sentiment, and context relevance
+2. **RESPOND APPROPRIATELY**: 
+   - If sentiment is "frustrated": Be extra patient and helpful
+   - If intent is "troubleshooting": Provide step-by-step guidance
+   - If intent is "clarification": Explain in simpler terms with more detail
+   - If intent is "correction": Acknowledge the error and provide correct information
+   - If intent is "escalation": Offer to connect with human support
+   - If sentiment is "urgent": Prioritize quick, actionable solutions
+
+3. **CONTEXT AWARENESS**:
+   - If "follow_up": Build on previous conversation
+   - If "clarification": Address specific points from previous answer
+   - If "correction": Fix any inconsistencies or errors
+   - If "new_topic": Start fresh but acknowledge context
+
+4. **RESPONSE QUALITY**:
+   - Be empathetic to user's emotional state
+   - Provide specific, actionable information
+   - If no relevant context found, be honest about limitations
+   - Always be helpful and professional
+   - Use appropriate tone based on user sentiment
+
+RESPONSE:"""
+        )
         
-        chain = LLMChain(
+        chain = ConversationChain(
             llm=llm,
-            prompt=prompt,
             memory=memory,
+            prompt=prompt,
             verbose=False
         )
         
         return chain
     except Exception as e:
-        st.error(f"Error creating LangChain chain: {e}")
+        st.error(f"Error creating conversation chain: {e}")
         return None
 
-def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response using LangChain"""
+def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, project_id: str, location: str, _credentials, model_name: str) -> str:
+    """Generate response using LangChain with conversation memory"""
+    if not LANGCHAIN_AVAILABLE:
+        return None
+    
     try:
-        chain = get_langchain_conversation_chain(model_name, project_id, location, credentials)
-        if chain is None:
+        chain = get_conversation_chain(project_id, location, _credentials, model_name)
+        if not chain:
             return None
         
-        # Build context
         context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
         
-        # Format user analysis
         analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
 Sentiment: {user_analysis.get('sentiment', 'neutral')}
-Context: {user_analysis.get('context_relevance', 'new_topic')}"""
+Context Relevance: {user_analysis.get('context_relevance', 'new_topic')}
+Escalation Needed: {user_analysis.get('escalation_needed', False)}
+Confidence: {user_analysis.get('confidence', 0):.2f}
+Reasoning: {user_analysis.get('reasoning', 'N/A')}"""
         
         response = chain.predict(
             input=query,
@@ -1184,6 +1268,10 @@ def main():
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "index" not in st.session_state:
+        st.session_state.index = None
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = []
     if "creds" not in st.session_state:
         st.session_state.creds = None
     if "project_id" not in st.session_state:
@@ -1220,12 +1308,12 @@ def main():
         if index is not None and corpus:
             return index, corpus, True
         
-        # Build index from KB files
-        corpus = process_kb_files()
+        # Build index from KB files (silent mode for cached function)
+        corpus = process_kb_files(silent=True)
         if not corpus:
             return None, [], False
         
-        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds, silent=True)
         if index is not None:
             save_index_and_corpus(index, corpus)
             return index, corpus, True
@@ -1280,53 +1368,38 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    st.title("🤖 HBS Help Chatbot")
-
-    # Display chat messages
-    for idx, message in enumerate(st.session_state.messages):
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            
-            if "sources" in message and message["sources"]:
-                with st.expander("📄 Sources"):
-                    for i, source in enumerate(message["sources"]):
-                        source_name = source.get('source', 'Unknown')
-                        sim_score = source.get('similarity_score', 0)
-                        rerank_score = source.get('rerank_score', 'N/A')
-                        
-                        # Format rerank score
-                        if isinstance(rerank_score, (int, float)):
-                            rerank_display = f"{rerank_score:.1f}"
-                        else:
-                            rerank_display = "N/A"
-                        
-                        with st.expander(f"📄 {source_name} (sim: {sim_score:.3f}, rerank: {rerank_display})"):
-                            st.text_area(
-                                "Content",
-                                value=source.get('text', ''),
-                                height=150,
-                                key=f"source_{idx}_{i}_{hash(source.get('text', ''))}"
-                            )
-
-    # Welcome message
+    # Main chat interface
+    st.title("HBS Help Chatbot")
+    
+    # Display welcome message if no messages yet
     if not st.session_state.messages:
         st.info("Hi! How can I help you today?")
-
-    # Image upload
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            
+            # Display sources if available
+            if "sources" in message and message["sources"]:
+                with st.expander("📄 Sources"):
+                    for source in message["sources"][:3]:
+                        source_name = source['source']
+                        similarity = source['similarity_score']
+                        rerank = source.get('rerank_score', 'N/A')
+                        st.write(f"📄 {source_name} (sim: {similarity:.3f}, rerank: {rerank})")
+    
+    # Image upload section
+    upload_key = f"image_uploader_{len(st.session_state.messages)}"
     uploaded_image = st.file_uploader(
-        "📎 Upload an image (optional)",
-        type=["png", "jpg", "jpeg"],
-        key=f"image_uploader_{len(st.session_state.messages)}"
+        "📷 Upload Image for Analysis",
+        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
+        key=upload_key
     )
-
+    
     # Chat input
-    if prompt := st.chat_input("Ask me anything about HBS..."):
-        # Add user message
-        st.session_state.messages.append({
-            "role": "user", 
-            "content": prompt,
-            "timestamp": len(st.session_state.messages)
-        })
+    if prompt := st.chat_input("Ask me anything about HBS systems..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
         if uploaded_image is not None:
             with st.spinner("Analyzing your image..."):
@@ -1381,27 +1454,49 @@ def main():
                         st.session_state.creds,
                         st.session_state.model_name
                     )
-                
-                with st.spinner("Generating response..."):
-                    response = generate_semantic_response(
-                        prompt,
-                        context_chunks,
-                        user_analysis,
-                        conversation_context,
-                        st.session_state.model_name,
-                        st.session_state.project_id,
-                        st.session_state.location,
-                        st.session_state.creds
-                    )
-                
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "sources": context_chunks,
-                    "timestamp": len(st.session_state.messages)
-                })
-            
-            st.rerun()
+                    
+                    if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
+                        response = generate_response_with_langchain(
+                            prompt,
+                            context_chunks,
+                            user_analysis,
+                            st.session_state.project_id,
+                            st.session_state.location,
+                            st.session_state.creds,
+                            st.session_state.model_name
+                        )
+                        
+                        if not response:
+                            response = generate_semantic_response(
+                                prompt,
+                                context_chunks,
+                                user_analysis,
+                                conversation_context,
+                                st.session_state.model_name,
+                                st.session_state.project_id,
+                                st.session_state.location,
+                                st.session_state.creds
+                            )
+                    else:
+                        response = generate_semantic_response(
+                            prompt,
+                            context_chunks,
+                            user_analysis,
+                            conversation_context,
+                            st.session_state.model_name,
+                            st.session_state.project_id,
+                            st.session_state.location,
+                            st.session_state.creds
+                        )
+                    
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "sources": context_chunks,
+                        "timestamp": len(st.session_state.messages)
+                    })
+        
+        st.rerun()
 
 if __name__ == "__main__":
     main()
