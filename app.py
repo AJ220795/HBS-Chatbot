@@ -50,15 +50,17 @@ CANDIDATE_MODELS = [
     "gemini-2.5-pro"
 ]
 
-# Enhanced token management for large KB
-MAX_CONTEXT_TOKENS = 150000  # Up to 150K tokens for context
-MAX_CHUNKS_INITIAL = 50      # Retrieve 50 candidates initially
-MAX_CHUNKS_FINAL = 10        # Keep top 10 after re-ranking
+DEFAULT_LOCATION = "us-central1"
 
-# ---- Helper Functions ----
+# Token limits for different contexts
+MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
+MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
+MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
+
+# ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
-    """Estimate token count (roughly 1 token ≈ 4 characters)"""
-    return max(1, len(text) // 4)
+    """Estimate token count (rough approximation: 1 token ≈ 4 characters)"""
+    return len(text) // 4
 
 def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     """Truncate text to fit within token limit"""
@@ -66,45 +68,17 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     if estimated_tokens <= max_tokens:
         return text
     
-    # Truncate by character count
-    max_chars = max_tokens * 4
-    return text[:max_chars] + "..."
+    # Truncate to approximate character limit
+    char_limit = max_tokens * 4
+    return text[:char_limit] + "...[truncated]"
 
-def sanitize_user_input(user_input: str) -> str:
-    """Sanitize user input to prevent prompt injection"""
-    dangerous_patterns = [
-        r"ignore previous instructions",
-        r"disregard all above",
-        r"forget everything",
-        r"new instructions:",
-        r"system:",
-        r"override",
-        r"admin mode"
-    ]
-    
-    sanitized = user_input
-    for pattern in dangerous_patterns:
-        sanitized = re.sub(pattern, "", sanitized, flags=re.IGNORECASE)
-    
-    return sanitized.strip()
-
-def get_credentials():
-    """Get Google Cloud credentials from Streamlit secrets"""
-    try:
-        credentials_dict = dict(st.secrets["gcp_service_account"])
-        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
-        return credentials
-    except Exception as e:
-        st.error(f"Error loading credentials: {e}")
-        return None
-
+# ---- Utilities ----
 def split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences"""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if s.strip()]
+    sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
+    return [s.strip() for s in sents if s.strip()]
 
-def chunk_text(text: str, max_tokens: int = 300, overlap_sentences: int = 2) -> List[str]:
-    """Improved chunking with much smaller chunks for better retrieval"""
+def chunk_text(text: str, max_tokens: int = 200, overlap_sentences: int = 2) -> List[str]:
+    """Improved chunking with extremely small chunks for better retrieval"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
     
@@ -121,55 +95,94 @@ def chunk_text(text: str, max_tokens: int = 300, overlap_sentences: int = 2) -> 
     if buf:
         chunks.append(" ".join(buf))
     
-    # Validate and split oversized chunks with very aggressive limits
+    # Validate and split oversized chunks with extremely aggressive limits
     validated_chunks = []
     for chunk in chunks:
         chunk_tokens = estimate_tokens(chunk)
-        if chunk_tokens > 2000:  # Very low limit for safety
-            # Split by words if still too large
-            sub_chunks = split_oversized_chunk(chunk, max_tokens=2000)
-            validated_chunks.extend(sub_chunks)
+        if chunk_tokens > 2000:  # Extremely low limit for safety
+            # Split oversized chunk into smaller pieces
+            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=2000))
         else:
             validated_chunks.append(chunk)
     
     return validated_chunks
 
 def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
-    """Split an oversized chunk into smaller pieces by words"""
+    """Split a chunk that's too large into smaller pieces"""
     words = chunk.split()
-    chunks = []
+    sub_chunks = []
     current_chunk = []
     current_tokens = 0
     
     for word in words:
-        word_tokens = max(1, len(word) // 4)
+        word_tokens = len(word) // 4
         if current_tokens + word_tokens > max_tokens and current_chunk:
-            chunks.append(" ".join(current_chunk))
+            sub_chunks.append(" ".join(current_chunk))
             current_chunk = []
             current_tokens = 0
+        
         current_chunk.append(word)
         current_tokens += word_tokens
     
     if current_chunk:
-        chunks.append(" ".join(current_chunk))
+        sub_chunks.append(" ".join(current_chunk))
     
-    return chunks if chunks else [chunk]
+    return sub_chunks if sub_chunks else [chunk]
 
-# ---- OCR and Image Processing ----
-def extract_text_from_image(image_path: Path) -> str:
-    """Extract text from image using OCR"""
+# ---- Document Processing ----
+def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
+    """Extract text from DOCX bytes"""
     try:
-        img = cv2.imread(str(image_path))
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        doc = Document(io.BytesIO(docx_bytes))
+        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        return text
+    except Exception as e:
+        st.warning(f"Error reading DOCX: {e}")
+        return ""
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes"""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
+        return text
+    except Exception as e:
+        st.warning(f"Error reading PDF: {e}")
+        return ""
+
+def extract_text_from_image_bytes(image_bytes: bytes) -> str:
+    """Extract text from image bytes using OCR"""
+    try:
+        image = PILImage.open(io.BytesIO(image_bytes))
+        img_array = np.array(image)
+        
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img_array
+        
         _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
         text = pytesseract.image_to_string(thresh)
         return text.strip()
     except Exception as e:
-        st.warning(f"OCR failed for {image_path.name}: {e}")
         return ""
 
+def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
+    """Parse structured data from OCR text based on filename"""
+    data = []
+    
+    filename_lower = filename.lower()
+    if "overdue" in filename_lower:
+        return parse_overdue_equipment_report(ocr_text, filename)
+    elif "outbound" in filename_lower:
+        return parse_outbound_report(ocr_text, filename)
+    elif "equipment" in filename_lower and "list" in filename_lower:
+        return parse_equipment_list_report(ocr_text, filename)
+    
+    return data
+
 def parse_overdue_equipment_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Overdue Equipment Report data"""
+    """Parse Overdue Equipment Report"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
@@ -246,7 +259,7 @@ def parse_overdue_equipment_report(ocr_text: str, filename: str) -> List[Dict]:
     return data
 
 def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Outbound Report data"""
+    """Parse Outbound Report"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
@@ -323,7 +336,7 @@ def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
     return data
 
 def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Equipment List Report data"""
+    """Parse Equipment List Report"""
     data = []
     lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
     
@@ -379,40 +392,138 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     
     return data
 
-# ---- Document Processing ----
-def extract_text_from_docx(file_path: Path) -> str:
-    """Extract text from DOCX file"""
+# ---- Embedding and Indexing ----
+def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
+    """Generate embeddings for texts with token-aware batching"""
     try:
-        doc = Document(file_path)
-        return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = TextEmbeddingModel.from_pretrained("text-embedding-005")
+        
+        all_embeddings = []
+        
+        # Validate and filter texts before embedding
+        valid_texts = []
+        skipped_count = 0
+        for i, text in enumerate(texts):
+            token_count = estimate_tokens(text)
+            if token_count > 10000:  # Very strict limit per individual text
+                skipped_count += 1
+                if skipped_count <= 5:
+                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
+                # Add a placeholder embedding of zeros
+                all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
+            else:
+                valid_texts.append((i, text))
+        
+        if skipped_count > 5:
+            st.warning(f"Skipped {skipped_count} texts total due to size limits")
+        
+        # Process valid texts in batches with token-aware batching
+        batch_num = 0
+        current_batch = []
+        current_batch_tokens = 0
+        MAX_BATCH_TOKENS = 15000  # Safe limit well below 20K
+        
+        for idx, (original_idx, text) in enumerate(valid_texts):
+            text_tokens = estimate_tokens(text)
+            
+            # Check if adding this text would exceed batch limit
+            if current_batch and (current_batch_tokens + text_tokens > MAX_BATCH_TOKENS or len(current_batch) >= 100):
+                # Process current batch
+                batch_num += 1
+                batch_texts = [item[1] for item in current_batch]
+                st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
+                
+                try:
+                    batch_embeddings = model.get_embeddings(batch_texts)
+                    
+                    # Insert embeddings at correct positions
+                    for j, embedding in enumerate(batch_embeddings):
+                        orig_idx = current_batch[j][0]
+                        # Pad with zeros if needed
+                        while len(all_embeddings) < orig_idx:
+                            all_embeddings.append(np.zeros(768))
+                        all_embeddings.append(embedding.values)
+                except Exception as batch_error:
+                    st.error(f"Batch embedding error: {batch_error}")
+                    # Add zero embeddings for failed batch
+                    for j in range(len(current_batch)):
+                        orig_idx = current_batch[j][0]
+                        while len(all_embeddings) < orig_idx:
+                            all_embeddings.append(np.zeros(768))
+                        all_embeddings.append(np.zeros(768))
+                
+                # Reset batch
+                current_batch = []
+                current_batch_tokens = 0
+            
+            # Add current text to batch
+            current_batch.append((original_idx, text))
+            current_batch_tokens += text_tokens
+        
+        # Process final batch
+        if current_batch:
+            batch_num += 1
+            batch_texts = [item[1] for item in current_batch]
+            st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
+            
+            try:
+                batch_embeddings = model.get_embeddings(batch_texts)
+                
+                # Insert embeddings at correct positions
+                for j, embedding in enumerate(batch_embeddings):
+                    orig_idx = current_batch[j][0]
+                    while len(all_embeddings) < orig_idx:
+                        all_embeddings.append(np.zeros(768))
+                    all_embeddings.append(embedding.values)
+            except Exception as batch_error:
+                st.error(f"Final batch embedding error: {batch_error}")
+                for j in range(len(current_batch)):
+                    orig_idx = current_batch[j][0]
+                    while len(all_embeddings) < orig_idx:
+                        all_embeddings.append(np.zeros(768))
+                    all_embeddings.append(np.zeros(768))
+        
+        return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
-        st.warning(f"Error reading {file_path.name}: {e}")
-        return ""
+        st.error(f"Embedding error: {e}")
+        return np.array([])
 
-def extract_text_from_pdf(file_path: Path) -> str:
-    """Extract text from PDF file"""
-    try:
-        reader = PdfReader(file_path)
-        return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-    except Exception as e:
-        st.warning(f"Error reading {file_path.name}: {e}")
-        return ""
+def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials) -> tuple:
+    """Build FAISS index from corpus"""
+    if not corpus:
+        return None, []
+    
+    texts = [item["text"] for item in corpus]
+    embeddings = embed_texts(texts, project_id, location, credentials)
+    
+    if embeddings.size == 0:
+        return None, []
+    
+    # Create FAISS index
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+    
+    # Normalize embeddings for cosine similarity
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings)
+    
+    return index, corpus
 
-# ---- Query Expansion ----
 def expand_query(query: str) -> str:
-    """Expand query with domain-specific synonyms"""
+    """Expand query with related terms for better search"""
     query_lower = query.lower()
     
-    if "buyback" in query_lower or "buy back" in query_lower:
-        return f"{query} CNH buyback verified submission evaluation"
-    elif "document" in query_lower or "upload" in query_lower or "file" in query_lower:
-        return f"{query} document management DM NetView upload search"
-    elif "transport" in query_lower or "ticket" in query_lower or "delivery" in query_lower:
-        return f"{query} transport ticket TRNS delivery unit"
-    elif "task" in query_lower or "overdue" in query_lower or "completed" in query_lower:
-        return f"{query} NetView Insight tasks status"
-    elif "rental" in query_lower or "rent" in query_lower:
-        return f"{query} rental equipment outbound overdue"
+    if "overdue" in query_lower:
+        return f"{query} overdue equipment report rental"
+    elif "outbound" in query_lower:
+        return f"{query} outbound report rental equipment"
+    elif "equipment" in query_lower:
+        return f"{query} equipment list rental"
+    elif "customer" in query_lower:
+        return f"{query} customer contract phone"
+    elif "stock" in query_lower:
+        return f"{query} stock number equipment"
     elif "serial" in query_lower:
         return f"{query} serial number equipment"
     else:
@@ -554,99 +665,27 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         st.error(f"Search error: {str(e)}")
         return []
 
-# ---- Embedding and Indexing ----
-def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
-    """Generate embeddings for texts in batches to handle large corpora"""
+def load_index_and_corpus():
+    """Load existing FAISS index and corpus"""
     try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-        
-        all_embeddings = []
-        
-        # Validate and filter texts before embedding with very strict limits
-        valid_texts = []
-        skipped_count = 0
-        for i, text in enumerate(texts):
-            token_count = estimate_tokens(text)
-            if token_count > 10000:  # Very strict limit
-                skipped_count += 1
-                if skipped_count <= 5:  # Only show first 5 warnings to avoid spam
-                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
-                # Add a placeholder embedding of zeros
-                all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
-            else:
-                valid_texts.append((i, text))
-        
-        if skipped_count > 5:
-            st.warning(f"Skipped {skipped_count} total texts that exceeded token limits")
-        
-        # Process valid texts in batches
-        for batch_idx in range(0, len(valid_texts), batch_size):
-            batch = valid_texts[batch_idx:batch_idx + batch_size]
-            batch_texts = [text for _, text in batch]
-            
-            # Calculate total batch tokens
-            batch_tokens = sum(estimate_tokens(text) for text in batch_texts)
-            st.info(f"Processing embedding batch {batch_idx//batch_size + 1}/{(len(valid_texts) + batch_size - 1)//batch_size} (tokens: {batch_tokens})")
-            
-            batch_embeddings = model.get_embeddings(batch_texts)
-            
-            # Insert embeddings at correct positions
-            for (original_idx, _), embedding in zip(batch, batch_embeddings):
-                # Store embedding at its original position
-                if len(all_embeddings) <= original_idx:
-                    all_embeddings.extend([None] * (original_idx - len(all_embeddings) + 1))
-                all_embeddings[original_idx] = embedding.values
-        
-        # Fill any remaining None values with zeros
-        all_embeddings = [emb if emb is not None else np.zeros(768) for emb in all_embeddings]
-        
-        return np.array(all_embeddings).astype(np.float32)
-    except Exception as e:
-        st.error(f"Embedding error: {str(e)}")
-        return np.array([])
-
-@st.cache_resource
-def build_faiss_index(corpus: List[Dict], _project_id: str, _location: str, _credentials) -> faiss.Index:
-    """Build FAISS index from corpus"""
-    if not corpus:
-        return None
-    
-    texts = [item["text"] for item in corpus]
-    embeddings = embed_texts(texts, _project_id, _location, _credentials)
-    
-    if embeddings.size == 0:
-        st.error("Failed to build index")
-        return None
-    
-    faiss.normalize_L2(embeddings)
-    
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
-    index.add(embeddings)
-    
-    faiss.write_index(index, str(INDEX_PATH))
-    
-    with open(CORPUS_PATH, "w", encoding="utf-8") as f:
-        json.dump(corpus, f, ensure_ascii=False, indent=2)
-    
-    return index
-
-@st.cache_resource
-def load_or_build_index(_project_id: str, _location: str, _credentials):
-    """Load existing index or build new one"""
-    if INDEX_PATH.exists() and CORPUS_PATH.exists():
-        try:
+        if INDEX_PATH.exists() and CORPUS_PATH.exists():
             index = faiss.read_index(str(INDEX_PATH))
-            with open(CORPUS_PATH, "r", encoding="utf-8") as f:
+            with open(CORPUS_PATH, 'r') as f:
                 corpus = json.load(f)
             return index, corpus
-        except Exception as e:
-            st.warning(f"Could not load index: {e}. Rebuilding...")
-    
-    corpus = process_kb_files()
-    index = build_faiss_index(corpus, _project_id, _location, _credentials)
-    return index, corpus
+    except Exception as e:
+        st.warning(f"Could not load existing index: {e}")
+    return None, []
+
+def save_index_and_corpus(index, corpus):
+    """Save FAISS index and corpus to disk"""
+    try:
+        if index is not None:
+            faiss.write_index(index, str(INDEX_PATH))
+        with open(CORPUS_PATH, 'w') as f:
+            json.dump(corpus, f, indent=2)
+    except Exception as e:
+        st.error(f"Error saving index: {e}")
 
 def process_kb_files() -> List[Dict]:
     """Process all KB files and create corpus with image data extraction"""
@@ -663,92 +702,101 @@ def process_kb_files() -> List[Dict]:
     total_chunks_before_validation = 0
     
     for file_path in files:
-        if file_path.suffix.lower() == ".docx":
-            text = extract_text_from_docx(file_path)
-            if text:
-                chunks = chunk_text(text)
-                for i, chunk in enumerate(chunks):
-                    corpus.append({
-                        "text": chunk,
-                        "source": file_path.name,
-                        "chunk_id": f"{file_path.stem}_{i}",
-                        "type": "document"
-                    })
-        
-        elif file_path.suffix.lower() == ".pdf":
-            text = extract_text_from_pdf(file_path)
-            if text:
-                chunks = chunk_text(text)
-                for i, chunk in enumerate(chunks):
-                    corpus.append({
-                        "text": chunk,
-                        "source": file_path.name,
-                        "chunk_id": f"{file_path.stem}_{i}",
-                        "type": "document"
-                    })
-        
-        elif file_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
-            ocr_text = extract_text_from_image(file_path)
-            if ocr_text:
-                if "overdue" in file_path.name.lower():
-                    structured_data = parse_overdue_equipment_report(ocr_text, file_path.name)
-                    for data in structured_data:
-                        text_repr = f"Overdue Equipment: {data['customer_name']} (Contract: {data['contract']}) - {data['make']} {data['model']} {data['equipment_type']} (Stock: {data['stock_number']}, Serial: {data['serial']}, Year: {data['year']}) - Out: {data['date_time_out']}"
-                        corpus.append({
-                            "text": text_repr,
-                            "source": file_path.name,
-                            "chunk_id": f"{file_path.stem}_{data['contract']}",
-                            "type": "structured_data",
-                            "data": data
-                        })
-                elif "outbound" in file_path.name.lower():
-                    structured_data = parse_outbound_report(ocr_text, file_path.name)
-                    for data in structured_data:
-                        text_repr = f"Outbound Rental: {data['customer_name']} (Contract: {data['contract']}) - {data['make']} {data['model']} {data['equipment_type']} (Stock: {data['stock_number']}, Serial: {data['serial']}, Year: {data['year']}) - Out: {data['date_time_out']}"
-                        corpus.append({
-                            "text": text_repr,
-                            "source": file_path.name,
-                            "chunk_id": f"{file_path.stem}_{data['contract']}",
-                            "type": "structured_data",
-                            "data": data
-                        })
-                elif "equipment" in file_path.name.lower() and "list" in file_path.name.lower():
-                    structured_data = parse_equipment_list_report(ocr_text, file_path.name)
-                    for data in structured_data:
-                        text_repr = f"Equipment: {data['make']} {data['model']} {data['equipment_type']} (Stock: {data['stock_number']}, Serial: {data['serial']}, Year: {data['year']}, Meter: {data['meter']})"
-                        corpus.append({
-                            "text": text_repr,
-                            "source": file_path.name,
-                            "chunk_id": f"{file_path.stem}_{data['stock_number']}",
-                            "type": "structured_data",
-                            "data": data
-                        })
-                else:
-                    chunks = chunk_text(ocr_text)
-                    for i, chunk in enumerate(chunks):
-                        corpus.append({
-                            "text": chunk,
-                            "source": file_path.name,
-                            "chunk_id": f"{file_path.stem}_{i}",
-                            "type": "ocr_text"
-                        })
-        
-        processed_files += 1
+        if file_path.is_file():
+            try:
+                if file_path.suffix.lower() == '.docx':
+                    text = extract_text_from_docx_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
+                elif file_path.suffix.lower() == '.pdf':
+                    text = extract_text_from_pdf_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
+                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
+                    file_size = file_path.stat().st_size
+                    if file_size == 0:
+                        continue
+                    
+                    try:
+                        ocr_text = extract_text_from_image_bytes(file_path.read_bytes())
+                        
+                        if ocr_text.strip():
+                            chunks = chunk_text(ocr_text)
+                            for i, chunk in enumerate(chunks):
+                                corpus.append({
+                                    "text": chunk,
+                                    "source": file_path.name,
+                                    "chunk_id": i,
+                                    "file_type": file_path.suffix.lower(),
+                                    "content_type": "ocr_text"
+                                })
+                            
+                            try:
+                                structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
+                                
+                                for data_item in structured_data:
+                                    searchable_text = f"Report: {data_item.get('report_type', 'Unknown')} "
+                                    if 'customer_name' in data_item:
+                                        searchable_text += f"Customer: {data_item['customer_name']} "
+                                    if 'contract' in data_item:
+                                        searchable_text += f"Contract: {data_item['contract']} "
+                                    if 'stock_number' in data_item:
+                                        searchable_text += f"Stock: {data_item['stock_number']} "
+                                    if 'make' in data_item:
+                                        searchable_text += f"Make: {data_item['make']} "
+                                    if 'model' in data_item:
+                                        searchable_text += f"Model: {data_item['model']} "
+                                    if 'equipment_type' in data_item:
+                                        searchable_text += f"Type: {data_item['equipment_type']} "
+                                    if 'year' in data_item:
+                                        searchable_text += f"Year: {data_item['year']} "
+                                    if 'serial' in data_item:
+                                        searchable_text += f"Serial: {data_item['serial']}"
+                                    
+                                    corpus.append({
+                                        "text": searchable_text.strip(),
+                                        "source": file_path.name,
+                                        "chunk_id": data_item.get('contract', data_item.get('stock_number', i)),
+                                        "file_type": file_path.suffix.lower(),
+                                        "content_type": "structured_data",
+                                        "structured_data": data_item
+                                    })
+                            except Exception as struct_error:
+                                pass
+                    except Exception as img_error:
+                        pass
+                
+                processed_files += 1
+            except Exception as file_error:
+                st.warning(f"Error processing {file_path.name}: {file_error}")
     
     # Validate chunk sizes and split oversized ones
     st.info("Validating chunk sizes...")
     validated_corpus = []
     oversized_chunks = 0
-    max_chunk_size = 0
-    total_chunks = len(corpus)
     
     for idx, item in enumerate(corpus):
         chunk_tokens = estimate_tokens(item["text"])
-        max_chunk_size = max(max_chunk_size, chunk_tokens)
         
         if chunk_tokens > 2000:
             oversized_chunks += 1
-            if oversized_chunks <= 3:  # Show details for first 3 oversized chunks
+            if oversized_chunks <= 3:
                 st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
             
             # Split the oversized chunk
@@ -1039,111 +1087,144 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
 
 # ---- LangChain Integration ----
 @st.cache_resource
-def get_langchain_llm(_model_name: str, _project_id: str, _location: str, _credentials):
-    """Get LangChain LLM instance"""
-    vertexai_init(project=_project_id, location=_location, credentials=_credentials)
-    return VertexAI(
-        model_name=_model_name,
-        temperature=0.7,
-        max_output_tokens=1024,
-        credentials=_credentials
-    )
+def get_langchain_conversation_chain(_model_name: str, _project_id: str, _location: str, _credentials):
+    """Get LangChain conversation chain with LLMChain"""
+    try:
+        from langchain.chains import LLMChain
+        from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+        from langchain_google_vertexai import ChatVertexAI
+        
+        vertexai_init(project=_project_id, location=_location, credentials=_credentials)
+        
+        llm = ChatVertexAI(
+            model_name=_model_name,
+            temperature=0.7,
+            max_output_tokens=1024,
+            project=_project_id,
+            location=_location,
+            credentials=_credentials
+        )
+        
+        memory = ConversationBufferWindowMemory(
+            k=5,
+            return_messages=True,
+            memory_key="history",
+            input_key="input"
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert HBS assistant. Use the context and user analysis to provide helpful responses.\n\nContext: {context}\n\nUser Analysis: {user_analysis}"),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}")
+        ])
+        
+        chain = LLMChain(
+            llm=llm,
+            prompt=prompt,
+            memory=memory,
+            verbose=False
+        )
+        
+        return chain
+    except Exception as e:
+        st.error(f"Error creating LangChain chain: {e}")
+        return None
 
-@st.cache_resource
-def get_conversation_chain(_model_name: str, _project_id: str, _location: str, _credentials):
-    """Get LangChain conversation chain"""
-    llm = get_langchain_llm(_model_name, _project_id, _location, _credentials)
-    
-    memory = ConversationBufferWindowMemory(
-        k=5,
-        return_messages=True,
-        memory_key="chat_history"
-    )
-    
-    template = """You are an expert HBS (Help Business System) assistant. 
-Use the conversation history to provide contextual, helpful responses.
-
-Conversation History:
-{chat_history}
-
-Current Question: {input}
-
-Provide a helpful, accurate response based on your HBS knowledge."""
-    
-    prompt = PromptTemplate(
-        input_variables=["chat_history", "input"],
-        template=template
-    )
-    
-    conversation = ConversationChain(
-        llm=llm,
-        memory=memory,
-        prompt=prompt,
-        verbose=False
-    )
-    
-    return conversation
-
-def generate_response_with_langchain(query: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> str:
+def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, model_name: str, project_id: str, location: str, credentials) -> str:
     """Generate response using LangChain"""
     try:
-        conversation = get_conversation_chain(model_name, project_id, location, credentials)
+        chain = get_langchain_conversation_chain(model_name, project_id, location, credentials)
+        if chain is None:
+            return None
         
-        # Build optimized context
+        # Build context
         context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
         
-        enhanced_query = f"""Based on the following HBS knowledge base context, answer the user's question.
-
-CONTEXT:
-{context_text}
-
-QUESTION: {query}
-
-Provide a helpful, accurate response."""
+        # Format user analysis
+        analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
+Sentiment: {user_analysis.get('sentiment', 'neutral')}
+Context: {user_analysis.get('context_relevance', 'new_topic')}"""
         
-        response = conversation.predict(input=enhanced_query)
+        response = chain.predict(
+            input=query,
+            context=context_text,
+            user_analysis=analysis_text
+        )
+        
         return response
-    
     except Exception as e:
-        return f"Error with LangChain response: {str(e)}"
+        st.error(f"Error generating response with LangChain: {e}")
+        return None
 
 # ---- Streamlit App ----
-def initialize_app():
-    """Initialize the Streamlit app"""
+def main():
     st.set_page_config(
         page_title="HBS Help Chatbot",
         page_icon="🤖",
         layout="wide"
     )
     
+    # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    
-    if "credentials" not in st.session_state:
-        st.session_state.credentials = get_credentials()
-    
+    if "creds" not in st.session_state:
+        st.session_state.creds = None
     if "project_id" not in st.session_state:
-        st.session_state.project_id = st.secrets.get("project_id", "")
-    
+        st.session_state.project_id = None
     if "location" not in st.session_state:
-        st.session_state.location = st.secrets.get("location", "us-central1")
-    
+        st.session_state.location = None
     if "model_name" not in st.session_state:
         st.session_state.model_name = CANDIDATE_MODELS[0]
-    
-    if "index" not in st.session_state or "corpus" not in st.session_state:
-        with st.spinner("Loading knowledge base..."):
-            st.session_state.index, st.session_state.corpus = load_or_build_index(
-                st.session_state.project_id,
-                st.session_state.location,
-                st.session_state.credentials
-            )
+    if "kb_loaded" not in st.session_state:
+        st.session_state.kb_loaded = False
+    if "use_langchain" not in st.session_state:
+        st.session_state.use_langchain = LANGCHAIN_AVAILABLE
+    if "escalation_requests" not in st.session_state:
+        st.session_state.escalation_requests = []
 
-def main():
-    initialize_app()
-    
-    st.title("🤖 HBS Help Chatbot")
-    
+    # Initialize credentials
+    try:
+        sa_info = json.loads(st.secrets["google"]["credentials_json"])
+        st.session_state.creds = service_account.Credentials.from_service_account_info(sa_info)
+        st.session_state.project_id = st.secrets["google"]["project"]
+        st.session_state.location = st.secrets["google"].get("location", DEFAULT_LOCATION)
+    except Exception as e:
+        st.error(f"Error loading credentials: {e}")
+        st.stop()
+
+    # Initialize app
+    @st.cache_resource
+    def initialize_app():
+        """Initialize the app - load index or build from KB files"""
+        # Try to load existing index first
+        index, corpus = load_index_and_corpus()
+        if index is not None and corpus:
+            return index, corpus, True
+        
+        # Build index from KB files
+        corpus = process_kb_files()
+        if not corpus:
+            return None, [], False
+        
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds)
+        if index is not None:
+            save_index_and_corpus(index, corpus)
+            return index, corpus, True
+        
+        return None, [], False
+
+    # Initialize
+    if not st.session_state.kb_loaded:
+        with st.spinner("Loading knowledge base..."):
+            index, corpus, loaded = initialize_app()
+            st.session_state.index = index
+            st.session_state.corpus = corpus
+            st.session_state.kb_loaded = loaded
+            
+            if not loaded:
+                st.error("Failed to load knowledge base")
+                st.stop()
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -1161,11 +1242,14 @@ def main():
         if st.button("🔨 Rebuild Knowledge Base"):
             INDEX_PATH.unlink(missing_ok=True)
             CORPUS_PATH.unlink(missing_ok=True)
+            st.session_state.kb_loaded = False
             st.cache_resource.clear()
             st.rerun()
-    
+
+    st.title("🤖 HBS Help Chatbot")
+
     # Display chat messages
-    for message in st.session_state.messages:
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             
@@ -1187,120 +1271,103 @@ def main():
                                 "Content",
                                 value=source.get('text', ''),
                                 height=150,
-                                key=f"source_{len(st.session_state.messages)}_{i}_{hash(source.get('text', ''))}"
+                                key=f"source_{idx}_{i}_{hash(source.get('text', ''))}"
                             )
-    
+
     # Welcome message
     if not st.session_state.messages:
         st.info("Hi! How can I help you today?")
-    
-    # Image upload (above text input)
+
+    # Image upload
     uploaded_image = st.file_uploader(
         "📎 Upload an image (optional)",
         type=["png", "jpg", "jpeg"],
         key=f"image_uploader_{len(st.session_state.messages)}"
     )
-    
+
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS..."):
-        # Sanitize input
-        prompt = sanitize_user_input(prompt)
-        
         # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.messages.append({
+            "role": "user", 
+            "content": prompt,
+            "timestamp": len(st.session_state.messages)
+        })
         
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # Handle image if uploaded
-                if uploaded_image is not None:
-                    image_bytes = uploaded_image.read()
-                    response = process_user_uploaded_image(
-                        image_bytes,
-                        prompt,
-                        st.session_state.model_name,
+        if uploaded_image is not None:
+            with st.spinner("Analyzing your image..."):
+                image_bytes = uploaded_image.read()
+                response = process_user_uploaded_image(
+                    image_bytes, 
+                    prompt, 
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+                
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "timestamp": len(st.session_state.messages)
+                })
+            
+            st.rerun()
+        else:
+            # Regular text processing with optimized retrieval
+            conversation_context = ""
+            if len(st.session_state.messages) > 1:
+                conversation_context = get_conversation_context(st.session_state.messages)
+            
+            with st.spinner("Understanding your request..."):
+                user_analysis = analyze_user_sentiment_and_intent(
+                    prompt,
+                    conversation_context,
+                    st.session_state.model_name,
+                    st.session_state.project_id,
+                    st.session_state.location,
+                    st.session_state.creds
+                )
+            
+            if user_analysis.get('escalation_needed', False):
+                response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response,
+                    "timestamp": len(st.session_state.messages)
+                })
+            else:
+                with st.spinner("Searching knowledge base..."):
+                    context_chunks = search_index(
+                        prompt, 
+                        st.session_state.index, 
+                        st.session_state.corpus,
                         st.session_state.project_id,
                         st.session_state.location,
-                        st.session_state.credentials
+                        st.session_state.creds,
+                        st.session_state.model_name
                     )
-                    st.markdown(response)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                else:
-                    # Get conversation context
-                    conversation_context = get_conversation_context(st.session_state.messages)
-                    
-                    # Analyze user sentiment and intent
-                    user_analysis = analyze_user_sentiment_and_intent(
+                
+                with st.spinner("Generating response..."):
+                    response = generate_semantic_response(
                         prompt,
+                        context_chunks,
+                        user_analysis,
                         conversation_context,
                         st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
-                        st.session_state.credentials
+                        st.session_state.creds
                     )
-                    
-                    # Check if escalation is needed
-                    if user_analysis.get('escalation_needed', False):
-                        response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
-                        st.markdown(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                    else:
-                        # Search knowledge base
-                        context_chunks = search_index(
-                            prompt,
-                            st.session_state.index,
-                            st.session_state.corpus,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.credentials,
-                            st.session_state.model_name
-                        )
-                        
-                        # Generate semantic response
-                        response = generate_semantic_response(
-                            prompt,
-                            context_chunks,
-                            user_analysis,
-                            conversation_context,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.credentials
-                        )
-                        
-                        st.markdown(response)
-                        
-                        # Store message with sources
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": response,
-                            "sources": context_chunks
-                        })
-                        
-                        # Display sources
-                        if context_chunks:
-                            with st.expander("📄 Sources"):
-                                for i, source in enumerate(context_chunks):
-                                    source_name = source.get('source', 'Unknown')
-                                    sim_score = source.get('similarity_score', 0)
-                                    rerank_score = source.get('rerank_score', 'N/A')
-                                    
-                                    # Format rerank score
-                                    if isinstance(rerank_score, (int, float)):
-                                        rerank_display = f"{rerank_score:.1f}"
-                                    else:
-                                        rerank_display = "N/A"
-                                    
-                                    with st.expander(f"📄 {source_name} (sim: {sim_score:.3f}, rerank: {rerank_display})"):
-                                        st.text_area(
-                                            "Content",
-                                            value=source.get('text', ''),
-                                            height=150,
-                                            key=f"source_new_{i}_{hash(source.get('text', ''))}"
-                                        )
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "sources": context_chunks,
+                    "timestamp": len(st.session_state.messages)
+                })
+            
+            st.rerun()
 
 if __name__ == "__main__":
     main()
