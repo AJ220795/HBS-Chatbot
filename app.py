@@ -59,8 +59,8 @@ MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
-    """Estimate token count (very conservative: 1 token ≈ 3 characters)"""
-    return max(1, len(text) // 3)
+    """Estimate token count (very conservative: 1 token ≈ 2.5 characters)"""
+    return max(1, len(text) // 2)
 
 def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     """Truncate text to fit within token limit"""
@@ -69,7 +69,7 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
         return text
     
     # Truncate to approximate character limit
-    char_limit = max_tokens * 3
+    char_limit = max_tokens * 2
     return text[:char_limit] + "...[truncated]"
 
 # ---- Utilities ----
@@ -77,7 +77,7 @@ def split_into_sentences(text: str) -> List[str]:
     sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-def force_split_oversized_text(text: str, max_tokens: int = 1500) -> List[str]:
+def force_split_oversized_text(text: str, max_tokens: int = 1000) -> List[str]:
     """Force split any text into chunks that are guaranteed to be under max_tokens"""
     if estimate_tokens(text) <= max_tokens:
         return [text]
@@ -99,7 +99,7 @@ def force_split_oversized_text(text: str, max_tokens: int = 1500) -> List[str]:
                 current_tokens = 0
             
             # Split the oversized word
-            char_limit = max_tokens * 3
+            char_limit = max_tokens * 2
             for i in range(0, len(word), char_limit):
                 sub_word = word[i:i + char_limit]
                 chunks.append(sub_word)
@@ -128,8 +128,8 @@ def force_split_oversized_text(text: str, max_tokens: int = 1500) -> List[str]:
     
     return validated_chunks
 
-def chunk_text(text: str, max_tokens: int = 150, overlap_sentences: int = 1) -> List[str]:
-    """Ultra-aggressive chunking with guaranteed small chunks"""
+def chunk_text(text: str, max_tokens: int = 100, overlap_sentences: int = 0) -> List[str]:
+    """Ultra-aggressive chunking with guaranteed tiny chunks"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
     
@@ -137,9 +137,9 @@ def chunk_text(text: str, max_tokens: int = 150, overlap_sentences: int = 1) -> 
         s_tokens = estimate_tokens(s)
         if token_est + s_tokens > max_tokens and buf:
             chunks.append(" ".join(buf))
-            # Minimal overlap to save tokens
-            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
-            token_est = sum(estimate_tokens(x) for x in buf)
+            # No overlap to save tokens
+            buf = []
+            token_est = 0
         buf.append(s)
         token_est += s_tokens
     
@@ -149,7 +149,7 @@ def chunk_text(text: str, max_tokens: int = 150, overlap_sentences: int = 1) -> 
     # Force split any chunks that are still too large
     final_chunks = []
     for chunk in chunks:
-        final_chunks.extend(force_split_oversized_text(chunk, max_tokens=1500))
+        final_chunks.extend(force_split_oversized_text(chunk, max_tokens=1000))
     
     return final_chunks
 
@@ -423,42 +423,60 @@ def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
     
     return data
 
-def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250) -> np.ndarray:
-    """Generate embeddings for texts with bulletproof validation"""
+def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 50) -> np.ndarray:
+    """Generate embeddings for texts with TINY batches and bulletproof validation"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = TextEmbeddingModel.from_pretrained("text-embedding-005")
         
         all_embeddings = []
         
-        # BULLETPROOF validation - ensure NO text exceeds limits
+        # ULTRA-STRICT validation - ensure NO text exceeds limits
         valid_texts = []
         skipped_count = 0
         
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
             
-            # Ultra-strict limit with massive safety margin
-            if token_count > 8000:  # Much lower than 20K limit
+            # EXTREMELY strict limit with massive safety margin
+            if token_count > 5000:  # Much lower than 20K limit
                 skipped_count += 1
                 if skipped_count <= 5:
-                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 8K limit)")
+                    st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 5K limit)")
                 # Add zero embedding
                 all_embeddings.append(np.zeros(768))
             else:
                 # Double-check by truncating if needed
-                safe_text = truncate_to_token_limit(text, 8000)
+                safe_text = truncate_to_token_limit(text, 5000)
                 valid_texts.append((i, safe_text))
         
         if skipped_count > 5:
             st.warning(f"Skipped {skipped_count} texts total due to size limits")
         
-        # Process valid texts in smaller batches
+        # Process valid texts in TINY batches
         for batch_start in range(0, len(valid_texts), batch_size):
             batch_items = valid_texts[batch_start:batch_start + batch_size]
             batch_texts = [item[1] for item in batch_items]
             
-            st.info(f"Processing embedding batch {batch_start//batch_size + 1}/{(len(valid_texts) + batch_size - 1)//batch_size}")
+            # Validate batch size before sending
+            batch_tokens = sum(estimate_tokens(text) for text in batch_texts)
+            if batch_tokens > 100000:  # Safety check for total batch size
+                st.warning(f"Batch {batch_start//batch_size + 1} has {batch_tokens} total tokens - splitting further")
+                # Process each text individually
+                for j, (original_idx, text) in enumerate(batch_items):
+                    try:
+                        single_embedding = model.get_embeddings([text])
+                        while len(all_embeddings) < original_idx:
+                            all_embeddings.append(np.zeros(768))
+                        all_embeddings.append(single_embedding[0].values)
+                    except Exception as e:
+                        st.error(f"Single text embedding error: {e}")
+                        while len(all_embeddings) < original_idx:
+                            all_embeddings.append(np.zeros(768))
+                        all_embeddings.append(np.zeros(768))
+                continue
+            
+            st.info(f"Processing embedding batch {batch_start//batch_size + 1}/{(len(valid_texts) + batch_size - 1)//batch_size} (tokens: {batch_tokens})")
             
             try:
                 batch_embeddings = model.get_embeddings(batch_texts)
@@ -472,12 +490,18 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
                     all_embeddings.append(embedding.values)
             except Exception as batch_error:
                 st.error(f"Batch embedding error: {batch_error}")
-                # Add zero embeddings for failed batch
-                for j in range(len(batch_items)):
-                    original_idx = batch_items[j][0]
-                    while len(all_embeddings) < original_idx:
+                # Process individually as fallback
+                for j, (original_idx, text) in enumerate(batch_items):
+                    try:
+                        single_embedding = model.get_embeddings([text])
+                        while len(all_embeddings) < original_idx:
+                            all_embeddings.append(np.zeros(768))
+                        all_embeddings.append(single_embedding[0].values)
+                    except Exception as e:
+                        st.error(f"Individual text embedding error: {e}")
+                        while len(all_embeddings) < original_idx:
+                            all_embeddings.append(np.zeros(768))
                         all_embeddings.append(np.zeros(768))
-                    all_embeddings.append(np.zeros(768))
         
         return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
@@ -688,7 +712,7 @@ def process_kb_files() -> List[Dict]:
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
                             # Final validation before adding to corpus
-                            if estimate_tokens(chunk) <= 1500:
+                            if estimate_tokens(chunk) <= 1000:
                                 corpus.append({
                                     "text": chunk,
                                     "source": file_path.name,
@@ -702,7 +726,7 @@ def process_kb_files() -> List[Dict]:
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
                             # Final validation before adding to corpus
-                            if estimate_tokens(chunk) <= 1500:
+                            if estimate_tokens(chunk) <= 1000:
                                 corpus.append({
                                     "text": chunk,
                                     "source": file_path.name,
@@ -722,7 +746,7 @@ def process_kb_files() -> List[Dict]:
                             chunks = chunk_text(ocr_text)
                             for i, chunk in enumerate(chunks):
                                 # Final validation before adding to corpus
-                                if estimate_tokens(chunk) <= 1500:
+                                if estimate_tokens(chunk) <= 1000:
                                     corpus.append({
                                         "text": chunk,
                                         "source": file_path.name,
@@ -768,7 +792,7 @@ def process_kb_files() -> List[Dict]:
                                         searchable_text += f"Meter: {data_item['meter']} "
                                     
                                     # Final validation before adding to corpus
-                                    if estimate_tokens(searchable_text) <= 1500:
+                                    if estimate_tokens(searchable_text) <= 1000:
                                         corpus.append({
                                             "text": searchable_text,
                                             "source": file_path.name,
@@ -794,7 +818,7 @@ def process_kb_files() -> List[Dict]:
     removed_count = 0
     
     for item in corpus:
-        if estimate_tokens(item["text"]) <= 1500:
+        if estimate_tokens(item["text"]) <= 1000:
             validated_corpus.append(item)
         else:
             removed_count += 1
