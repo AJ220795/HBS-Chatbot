@@ -902,9 +902,14 @@ def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str,
         
         image_part = Part.from_data(image_bytes, mime_type=mime_type)
         
-        prompt = f"""Analyze this image and answer the user's question: {query}
+        prompt = f"""You are an HBS assistant helping dealership employees with NetView.
 
-If this appears to be a screenshot or document related to HBS systems, provide detailed analysis. If it's not related to HBS, politely explain that you specialize in HBS system assistance."""
+SYSTEM CONTEXT:
+You operate inside HBS Systems' NetView — a dealership management system (DMS) used by equipment dealers across agriculture, construction, and rental industries. NetView manages every department of a dealership — Parts, Service, Rental, Sales, Accounting, and CRM — through integrated modules.
+
+Analyze this image and answer the user's question: {query}
+
+If this appears to be a screenshot or document related to HBS/NetView, provide detailed analysis using dealership terminology. If it's not related, politely explain that you specialize in HBS NetView assistance."""
         
         response = model.generate_content([prompt, image_part])
         return response.text if response.text else "I couldn't analyze the image. Please try again."
@@ -1039,7 +1044,14 @@ USER ANALYSIS:
 
 """
     
-    system_prompt = f"""You are an expert HBS (Help Business System) assistant. Provide comprehensive, detailed answers that fully address the user's question.
+    system_prompt = f"""You are an expert HBS assistant. Provide comprehensive, detailed answers that fully address the user's question.
+
+SYSTEM CONTEXT:
+You operate inside HBS Systems' NetView — a dealership management system (DMS) used by equipment dealers across agriculture, construction, and rental industries. 
+
+NetView manages every department of a dealership — Parts, Service, Rental, Sales, Accounting, and CRM — through integrated modules (NetView ECO, Service Connect, ECOM, DealerNow App, etc.). Users rely on NetView to look up part availability and pricing, check repair order status, schedule service jobs, quote rentals, manage invoices, and view customer or unit history. 
+
+Your purpose is to help dealership employees (e.g., parts clerks, service advisors, rental managers, accountants) quickly find information or complete tasks inside NetView. Always respond using dealership terminology (RO, unit, quote, part number, location, etc.) and stay within the context of HBS Systems' workflows.
 
 {context_section}{analysis_section}KNOWLEDGE BASE CONTEXT:
 {context_text}
@@ -1061,8 +1073,9 @@ RESPONSE GUIDELINES:
 - Provide detailed, informative responses (300-500 words when appropriate)
 - Break down complex topics into understandable sections
 - Include specific examples, field names, button locations, or menu paths from the knowledge base
-- Explain relevant HBS features, modules, or processes in depth
-- Add context about why certain steps are important or how features relate to each other
+- Explain relevant HBS/NetView features, modules, or processes in depth
+- Add context about why certain steps are important or how features relate to dealership workflows
+- Use dealership terminology consistently (RO, unit, quote, part number, location, etc.)
 - Use formatting (bullet points, numbered lists, **bold** for emphasis) to improve readability
 - If no relevant info found, explain what you searched for and say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
 
@@ -1184,7 +1197,7 @@ def get_conversation_chain(project_id: str, location: str, _credentials, model_n
         
         prompt = PromptTemplate(
             input_variables=["history", "input", "context", "user_analysis"],
-            template="""You are an expert HBS (Help Business System) assistant with deep understanding of user intent and sentiment.
+            template="""You are an expert HBS assistant with deep understanding of user intent and sentiment.
 
 CONTEXT FROM KNOWLEDGE BASE:
 {context}
