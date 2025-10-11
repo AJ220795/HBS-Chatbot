@@ -54,8 +54,8 @@ DEFAULT_LOCATION = "us-central1"
 
 # Token limits for different contexts
 MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
-MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
-MAX_CHUNKS_FINAL = 10    # Send top 10 to model after re-ranking
+MAX_CHUNKS_INITIAL = 100  # Retrieve more chunks initially for better coverage
+MAX_CHUNKS_FINAL = 15     # Send more chunks to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -128,8 +128,8 @@ def force_split_oversized_text(text: str, max_tokens: int = 1000) -> List[str]:
     
     return validated_chunks
 
-def chunk_text(text: str, max_tokens: int = 100, overlap_sentences: int = 0) -> List[str]:
-    """Ultra-aggressive chunking with guaranteed tiny chunks"""
+def chunk_text(text: str, max_tokens: int = 150, overlap_sentences: int = 1) -> List[str]:
+    """Balanced chunking with small chunks but better retrieval"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
     
@@ -137,9 +137,9 @@ def chunk_text(text: str, max_tokens: int = 100, overlap_sentences: int = 0) -> 
         s_tokens = estimate_tokens(s)
         if token_est + s_tokens > max_tokens and buf:
             chunks.append(" ".join(buf))
-            # No overlap to save tokens
-            buf = []
-            token_est = 0
+            # Small overlap for better retrieval
+            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
+            token_est = sum(estimate_tokens(x) for x in buf)
         buf.append(s)
         token_est += s_tokens
     
@@ -149,7 +149,7 @@ def chunk_text(text: str, max_tokens: int = 100, overlap_sentences: int = 0) -> 
     # Force split any chunks that are still too large
     final_chunks = []
     for chunk in chunks:
-        final_chunks.extend(force_split_oversized_text(chunk, max_tokens=1000))
+        final_chunks.extend(force_split_oversized_text(chunk, max_tokens=1500))
     
     return final_chunks
 
@@ -533,22 +533,29 @@ def expand_query(query: str) -> str:
     """Expand query with related terms for better search"""
     query_lower = query.lower()
     
+    # More comprehensive query expansion
     if "overdue" in query_lower:
-        return f"{query} overdue equipment report rental"
+        return f"{query} overdue equipment report rental customer contract"
     elif "outbound" in query_lower:
-        return f"{query} outbound report rental equipment"
+        return f"{query} outbound report rental equipment delivery"
     elif "equipment" in query_lower:
-        return f"{query} equipment list rental"
+        return f"{query} equipment list rental inventory stock"
     elif "customer" in query_lower:
-        return f"{query} customer contract phone"
+        return f"{query} customer contract phone contact information"
     elif "stock" in query_lower:
-        return f"{query} stock number equipment"
+        return f"{query} stock number equipment inventory serial"
     elif "serial" in query_lower:
-        return f"{query} serial number equipment"
+        return f"{query} serial number equipment identification"
+    elif "report" in query_lower:
+        return f"{query} report document data information"
+    elif "invoice" in query_lower:
+        return f"{query} invoice billing payment financial"
+    elif "rental" in query_lower:
+        return f"{query} rental equipment lease contract"
     else:
         return query
 
-def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int = 10) -> List[Dict]:
+def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int = 15) -> List[Dict]:
     """Use LLM to re-rank chunks by relevance to query"""
     if len(chunks) <= top_k:
         return chunks
@@ -559,8 +566,8 @@ def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: s
         
         # Create a prompt to score relevance
         chunks_text = ""
-        for i, chunk in enumerate(chunks[:30]):  # Only re-rank top 30 to save time
-            chunks_text += f"\n[{i}] {chunk['text'][:200]}..."
+        for i, chunk in enumerate(chunks[:50]):  # Re-rank more chunks for better coverage
+            chunks_text += f"\n[{i}] {chunk['text'][:300]}..."
         
         rerank_prompt = f"""Score each chunk's relevance to the query on a scale of 0-10.
 
@@ -575,20 +582,20 @@ Return ONLY a JSON array of scores in order, like: [8, 3, 9, 2, ...]"""
             rerank_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=500
+                max_output_tokens=1000
             )
         )
         
         if response.text:
             try:
                 scores = json.loads(response.text.strip())
-                if isinstance(scores, list) and len(scores) == len(chunks[:30]):
+                if isinstance(scores, list) and len(scores) == len(chunks[:50]):
                     # Add scores to chunks
                     for i, score in enumerate(scores):
                         chunks[i]['rerank_score'] = float(score)
                     
                     # Sort by rerank score
-                    sorted_chunks = sorted(chunks[:30], key=lambda x: x.get('rerank_score', 0), reverse=True)
+                    sorted_chunks = sorted(chunks[:50], key=lambda x: x.get('rerank_score', 0), reverse=True)
                     return sorted_chunks[:top_k]
             except:
                 pass
@@ -627,7 +634,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.3) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.2) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
@@ -644,7 +651,7 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         # Normalize query embedding
         faiss.normalize_L2(query_embeddings)
         
-        # Stage 3: Retrieve many candidates
+        # Stage 3: Retrieve many candidates with lower similarity threshold
         initial_k = min(MAX_CHUNKS_INITIAL, len(corpus))
         scores, indices = index.search(query_embeddings, initial_k)
         
@@ -712,7 +719,7 @@ def process_kb_files() -> List[Dict]:
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
                             # Final validation before adding to corpus
-                            if estimate_tokens(chunk) <= 1000:
+                            if estimate_tokens(chunk) <= 1500:
                                 corpus.append({
                                     "text": chunk,
                                     "source": file_path.name,
@@ -726,7 +733,7 @@ def process_kb_files() -> List[Dict]:
                         chunks = chunk_text(text)
                         for i, chunk in enumerate(chunks):
                             # Final validation before adding to corpus
-                            if estimate_tokens(chunk) <= 1000:
+                            if estimate_tokens(chunk) <= 1500:
                                 corpus.append({
                                     "text": chunk,
                                     "source": file_path.name,
@@ -746,7 +753,7 @@ def process_kb_files() -> List[Dict]:
                             chunks = chunk_text(ocr_text)
                             for i, chunk in enumerate(chunks):
                                 # Final validation before adding to corpus
-                                if estimate_tokens(chunk) <= 1000:
+                                if estimate_tokens(chunk) <= 1500:
                                     corpus.append({
                                         "text": chunk,
                                         "source": file_path.name,
@@ -792,7 +799,7 @@ def process_kb_files() -> List[Dict]:
                                         searchable_text += f"Meter: {data_item['meter']} "
                                     
                                     # Final validation before adding to corpus
-                                    if estimate_tokens(searchable_text) <= 1000:
+                                    if estimate_tokens(searchable_text) <= 1500:
                                         corpus.append({
                                             "text": searchable_text,
                                             "source": file_path.name,
@@ -818,7 +825,7 @@ def process_kb_files() -> List[Dict]:
     removed_count = 0
     
     for item in corpus:
-        if estimate_tokens(item["text"]) <= 1000:
+        if estimate_tokens(item["text"]) <= 1500:
             validated_corpus.append(item)
         else:
             removed_count += 1
@@ -1438,7 +1445,7 @@ def main():
                         st.session_state.creds,
                         st.session_state.model_name,
                         k=MAX_CHUNKS_FINAL,
-                        min_similarity=0.3
+                        min_similarity=0.2
                     )
                     
                     if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
