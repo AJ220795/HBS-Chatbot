@@ -21,17 +21,7 @@ import cv2
 import pytesseract
 from PIL import Image as PILImage
 
-# LangChain imports 
-try:
-    from langchain_google_vertexai import VertexAI
-    from langchain.memory import ConversationBufferWindowMemory
-    from langchain.chains import ConversationChain
-    from langchain.prompts import PromptTemplate
-    from langchain.schema import BaseMessage, HumanMessage, AIMessage
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    st.warning("LangChain not available. Using fallback conversation handling.")
+# LangChain removed - using direct Vertex AI integration
 
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
@@ -138,6 +128,55 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
         if t:
             out.append(t)
     return "\n".join(out)
+
+def extract_text_from_doc_bytes(b: bytes) -> str:
+    """Extract text from .doc files using textract or antiword fallback"""
+    try:
+        # Try using textract first (most reliable)
+        import textract
+        text = textract.process(io.BytesIO(b), extension='doc').decode('utf-8')
+        return text.strip()
+    except ImportError:
+        # Fallback: Try antiword if available
+        try:
+            import subprocess
+            import tempfile
+            
+            # Write bytes to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp_file:
+                tmp_file.write(b)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Use antiword to extract text
+                result = subprocess.run(
+                    ['antiword', tmp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if result.returncode == 0:
+                    return result.stdout.strip()
+                else:
+                    return ""
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+        except Exception:
+            # Last fallback: try to read as plain text (may have formatting issues)
+            try:
+                text = b.decode('utf-8', errors='ignore')
+                # Clean up common binary artifacts
+                text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t')
+                return text.strip()
+            except:
+                return ""
+    except Exception as e:
+        return ""
 
 def extract_text_from_pdf_bytes(b: bytes) -> str:
     try:
@@ -732,6 +771,18 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
                                 "file_type": file_path.suffix.lower()
                             })
                 
+                elif file_path.suffix.lower() == '.doc':
+                    text = extract_text_from_doc_bytes(file_path.read_bytes())
+                    if text.strip():
+                        chunks = chunk_text(text)
+                        for i, chunk in enumerate(chunks):
+                            corpus.append({
+                                "text": chunk,
+                                "source": file_path.name,
+                                "chunk_id": i,
+                                "file_type": file_path.suffix.lower()
+                            })
+                
                 elif file_path.suffix.lower() == '.pdf':
                     text = extract_text_from_pdf_bytes(file_path.read_bytes())
                     if text.strip():
@@ -1070,14 +1121,14 @@ INSTRUCTIONS:
 5. **ESCALATION**: If user wants human help or you can't answer adequately, offer to connect them with an HBS Support Technician.
 
 RESPONSE GUIDELINES:
-- Provide detailed, informative responses (300-500 words when appropriate)
-- Break down complex topics into understandable sections
+- Keep responses concise and focused (150-300 words typical)
+- Get straight to the point - lead with the most important information
+- Break down complex topics into clear, scannable sections
 - Include specific examples, field names, button locations, or menu paths from the knowledge base
-- Explain relevant HBS/NetView features, modules, or processes in depth
-- Add context about why certain steps are important or how features relate to dealership workflows
 - Use dealership terminology consistently (RO, unit, quote, part number, location, etc.)
-- Use formatting (bullet points, numbered lists, **bold** for emphasis) to improve readability
-- If no relevant info found, explain what you searched for and say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
+- Use formatting (bullet points, numbered lists, **bold** for emphasis) for quick scanning
+- Only provide deep explanations when the question specifically asks for detail
+- If no relevant info found, briefly say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
 
 RESPONSE:"""
 
@@ -1089,7 +1140,7 @@ RESPONSE:"""
             system_prompt,
             generation_config=GenerationConfig(
                 temperature=0.2,
-                max_output_tokens=4096,
+                max_output_tokens=2048,
                 top_p=0.9,
                 top_k=40
             )
@@ -1155,128 +1206,7 @@ ESCALATION REASON: Bot determined user needs human assistance based on semantic 
     
     return "\n".join(response_parts)
 
-# ---- LangChain Integration ----
-@st.cache_resource
-def get_langchain_llm(project_id: str, location: str, _credentials, model_name: str):
-    """Get LangChain LLM instance"""
-    if not LANGCHAIN_AVAILABLE:
-        return None
-    
-    try:
-        vertexai_init(project=project_id, location=location, credentials=_credentials)
-        
-        llm = VertexAI(
-            model_name=model_name,
-            project=project_id,
-            location=location,
-            temperature=0.1,
-            max_output_tokens=2048,
-            top_p=0.8,
-            top_k=40
-        )
-        return llm
-    except Exception as e:
-        st.error(f"Error creating LangChain LLM: {e}")
-        return None
-
-@st.cache_resource
-def get_conversation_chain(project_id: str, location: str, _credentials, model_name: str):
-    """Get LangChain conversation chain with memory"""
-    if not LANGCHAIN_AVAILABLE:
-        return None
-    
-    try:
-        llm = get_langchain_llm(project_id, location, _credentials, model_name)
-        if not llm:
-            return None
-        
-        memory = ConversationBufferWindowMemory(
-            k=6,
-            return_messages=True
-        )
-        
-        prompt = PromptTemplate(
-            input_variables=["history", "input", "context", "user_analysis"],
-            template="""You are an expert HBS assistant with deep understanding of user intent and sentiment.
-
-CONTEXT FROM KNOWLEDGE BASE:
-{context}
-
-USER ANALYSIS:
-{user_analysis}
-
-CONVERSATION HISTORY:
-{history}
-
-USER QUESTION: {input}
-
-INSTRUCTIONS:
-1. **UNDERSTAND THE USER**: Consider their intent, sentiment, and context relevance
-2. **RESPOND APPROPRIATELY**: 
-   - If sentiment is "frustrated": Be extra patient and helpful
-   - If intent is "troubleshooting": Provide step-by-step guidance
-   - If intent is "clarification": Explain in simpler terms with more detail
-   - If intent is "correction": Acknowledge the error and provide correct information
-   - If intent is "escalation": Offer to connect with human support
-   - If sentiment is "urgent": Prioritize quick, actionable solutions
-
-3. **CONTEXT AWARENESS**:
-   - If "follow_up": Build on previous conversation
-   - If "clarification": Address specific points from previous answer
-   - If "correction": Fix any inconsistencies or errors
-   - If "new_topic": Start fresh but acknowledge context
-
-4. **RESPONSE QUALITY**:
-   - Be empathetic to user's emotional state
-   - Provide specific, actionable information
-   - If no relevant context found, be honest about limitations
-   - Always be helpful and professional
-   - Use appropriate tone based on user sentiment
-
-RESPONSE:"""
-        )
-        
-        chain = ConversationChain(
-            llm=llm,
-            memory=memory,
-            prompt=prompt,
-            verbose=False
-        )
-        
-        return chain
-    except Exception as e:
-        st.error(f"Error creating conversation chain: {e}")
-        return None
-
-def generate_response_with_langchain(query: str, context_chunks: List[Dict], user_analysis: Dict, project_id: str, location: str, _credentials, model_name: str) -> str:
-    """Generate response using LangChain with conversation memory"""
-    if not LANGCHAIN_AVAILABLE:
-        return None
-    
-    try:
-        chain = get_conversation_chain(project_id, location, _credentials, model_name)
-        if not chain:
-            return None
-        
-        context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
-        
-        analysis_text = f"""Intent: {user_analysis.get('intent', 'unknown')}
-Sentiment: {user_analysis.get('sentiment', 'neutral')}
-Context Relevance: {user_analysis.get('context_relevance', 'new_topic')}
-Escalation Needed: {user_analysis.get('escalation_needed', False)}
-Confidence: {user_analysis.get('confidence', 0):.2f}
-Reasoning: {user_analysis.get('reasoning', 'N/A')}"""
-        
-        response = chain.predict(
-            input=query,
-            context=context_text,
-            user_analysis=analysis_text
-        )
-        
-        return response
-    except Exception as e:
-        st.error(f"Error generating response with LangChain: {e}")
-        return None
+# LangChain integration removed - using direct Vertex AI only
 
 # ---- Streamlit App ----
 def main():
@@ -1305,8 +1235,6 @@ def main():
         st.session_state.kb_loaded = False
     if "kb_loading" not in st.session_state:
         st.session_state.kb_loading = False
-    if "use_langchain" not in st.session_state:
-        st.session_state.use_langchain = LANGCHAIN_AVAILABLE
     if "escalation_requests" not in st.session_state:
         st.session_state.escalation_requests = []
 
@@ -1476,39 +1404,16 @@ def main():
                         st.session_state.model_name
                     )
                     
-                    if st.session_state.use_langchain and LANGCHAIN_AVAILABLE:
-                        response = generate_response_with_langchain(
-                            prompt,
-                            context_chunks,
-                            user_analysis,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds,
-                            st.session_state.model_name
-                        )
-                        
-                        if not response:
-                            response = generate_semantic_response(
-                                prompt,
-                                context_chunks,
-                                user_analysis,
-                                conversation_context,
-                                st.session_state.model_name,
-                                st.session_state.project_id,
-                                st.session_state.location,
-                                st.session_state.creds
-                            )
-                    else:
-                        response = generate_semantic_response(
-                            prompt,
-                            context_chunks,
-                            user_analysis,
-                            conversation_context,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds
-                        )
+                    response = generate_semantic_response(
+                        prompt,
+                        context_chunks,
+                        user_analysis,
+                        conversation_context,
+                        st.session_state.model_name,
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds
+                    )
                     
                     st.session_state.messages.append({
                         "role": "assistant", 
