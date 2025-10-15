@@ -45,7 +45,7 @@ DEFAULT_LOCATION = "us-central1"
 # Token limits for different contexts
 MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
 MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
-MAX_CHUNKS_FINAL = 2     # Send top 2 to model after re-ranking
+MAX_CHUNKS_FINAL = 5     # Send top 5 to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -676,7 +676,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.5) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.3) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
@@ -1110,25 +1110,24 @@ Your purpose is to help dealership employees (e.g., parts clerks, service adviso
 USER QUESTION: {query}
 
 INSTRUCTIONS:
-1. **BE COMPREHENSIVE**: Provide thorough, detailed explanations. Include context, examples, and step-by-step guidance when relevant.
-2. **BE HELPFUL**: Anticipate follow-up questions and address them proactively. Explain both "how" and "why".
-3. **BE ACCURATE**: Only use information from the knowledge base context above. If information is limited, acknowledge it.
+1. **BE ACCURATE FIRST**: Carefully read and use ALL information from the knowledge base context above. This is your PRIMARY source of truth.
+2. **BE THOROUGH**: Extract and present relevant information from the KB context. Don't summarize too much - include specific details.
+3. **BE HELPFUL**: Provide complete answers with context, examples, and step-by-step guidance when available in the KB.
 4. **BE STRUCTURED**: Use clear formatting with:
-   - Introductory context or overview
-   - Detailed main content with bullet points, numbered steps, or sections
-   - Additional tips, best practices, or related information
-   - Clear next steps or summary when appropriate
-5. **ESCALATION**: If user wants human help or you can't answer adequately, offer to connect them with an HBS Support Technician.
+   - Direct answer to the question
+   - Detailed steps or information from the KB
+   - Specific examples, field names, or procedures mentioned in the KB
+   - Related information if relevant
+5. **ESCALATION**: If the KB context doesn't contain the answer, say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
 
 RESPONSE GUIDELINES:
-- Keep responses concise and focused (150-300 words typical)
-- Get straight to the point - lead with the most important information
-- Break down complex topics into clear, scannable sections
-- Include specific examples, field names, button locations, or menu paths from the knowledge base
+- Read the KB context carefully - the answer is likely there
+- Use specific information, terms, and procedures from the KB context
+- Include field names, button locations, menu paths, or steps exactly as described in the KB
 - Use dealership terminology consistently (RO, unit, quote, part number, location, etc.)
-- Use formatting (bullet points, numbered lists, **bold** for emphasis) for quick scanning
-- Only provide deep explanations when the question specifically asks for detail
-- If no relevant info found, briefly say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
+- Format responses clearly with bullet points and numbered lists
+- Aim for completeness over brevity - include all relevant KB information
+- If KB context has detailed steps, include them all
 
 RESPONSE:"""
 
@@ -1139,9 +1138,9 @@ RESPONSE:"""
         response = model.generate_content(
             system_prompt,
             generation_config=GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=2048,
-                top_p=0.9,
+                temperature=0.1,
+                max_output_tokens=3072,
+                top_p=0.8,
                 top_k=40
             )
         )
@@ -1332,7 +1331,7 @@ def main():
             # Display sources if available
             if "sources" in message and message["sources"]:
                 with st.expander("📄 Sources"):
-                    for source in message["sources"][:3]:
+                    for source in message["sources"][:5]:
                         source_name = source['source']
                         similarity = source['similarity_score']
                         rerank = source.get('rerank_score', 'N/A')
