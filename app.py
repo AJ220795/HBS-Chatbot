@@ -44,8 +44,8 @@ DEFAULT_LOCATION = "us-central1"
 
 # Token limits for different contexts
 MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
-MAX_CHUNKS_INITIAL = 50  # Retrieve many chunks initially
-MAX_CHUNKS_FINAL = 5     # Send top 5 to model after re-ranking
+MAX_CHUNKS_INITIAL = 100  # Retrieve many chunks initially
+MAX_CHUNKS_FINAL = 10     # Send top 10 to model after re-ranking
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -676,7 +676,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.3) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.25) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
@@ -1331,7 +1331,7 @@ def main():
             # Display sources if available
             if "sources" in message and message["sources"]:
                 with st.expander("📄 Sources"):
-                    for source in message["sources"][:5]:
+                    for source in message["sources"][:10]:
                         source_name = source['source']
                         similarity = source['similarity_score']
                         rerank = source.get('rerank_score', 'N/A')
