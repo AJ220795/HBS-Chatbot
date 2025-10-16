@@ -676,7 +676,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.5) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.4) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
@@ -1121,13 +1121,15 @@ INSTRUCTIONS:
 5. **ESCALATION**: If the KB context doesn't contain the answer, say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
 
 RESPONSE GUIDELINES:
+- Keep responses concise - aim for ~200 words unless the user asks for more detail or says "elaborate"
 - Read the KB context carefully - the answer is likely there
 - Use specific information, terms, and procedures from the KB context
 - Include field names, button locations, menu paths, or steps exactly as described in the KB
 - Use dealership terminology consistently (RO, unit, quote, part number, location, etc.)
-- Format responses clearly with bullet points and numbered lists
-- Aim for completeness over brevity - include all relevant KB information
-- If KB context has detailed steps, include them all
+- Format responses clearly with bullet points and numbered lists for scannability
+- Provide the essential information first, then supporting details
+- If the user asks to "elaborate", "explain more", "give details", or similar, then provide fuller 400-600 word responses
+- If KB context has detailed steps, summarize them concisely unless user requests full details
 
 RESPONSE:"""
 
@@ -1139,7 +1141,7 @@ RESPONSE:"""
             system_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=3072,
+                max_output_tokens=2048,
                 top_p=0.8,
                 top_k=40
             )
