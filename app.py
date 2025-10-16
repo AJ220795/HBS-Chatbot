@@ -676,7 +676,7 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TO
     
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.2) -> List[Dict]:
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.5) -> List[Dict]:
     """Search FAISS index with multi-stage retrieval and re-ranking"""
     if index is None or not corpus:
         return []
