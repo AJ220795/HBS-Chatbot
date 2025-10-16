@@ -17,22 +17,8 @@ from vertexai.preview.generative_models import GenerativeModel, GenerationConfig
 
 from docx import Document
 from pypdf import PdfReader
-
-# Optional imports with fallbacks
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    cv2 = None
-
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
-    pytesseract = None
-
+import cv2
+import pytesseract
 from PIL import Image as PILImage
 
 # LangChain removed - using direct Vertex AI integration
@@ -207,9 +193,6 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
 
 def extract_text_from_image_bytes(b: bytes) -> str:
     try:
-        if not CV2_AVAILABLE or not TESSERACT_AVAILABLE:
-            return "[Image OCR not available - cv2 or pytesseract missing]"
-        
         img = PILImage.open(io.BytesIO(b)).convert("RGB")
         arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
         gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
@@ -555,7 +538,7 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, b
         return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
         if not silent:
-        st.error(f"Embedding error: {e}")
+            st.error(f"Embedding error: {e}")
         return np.array([])
 
 def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials, silent: bool = False) -> tuple:
@@ -762,7 +745,7 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
     
     if not KB_DIR.exists():
         if not silent:
-        st.error(f"KB_DIR does not exist: {KB_DIR}")
+            st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
     
     files = list(KB_DIR.iterdir())
@@ -884,8 +867,8 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
                 
             except Exception as e:
                 if not silent:
-                st.error(f"Error processing {file_path.name}: {e}")
-    
+                    st.error(f"Error processing {file_path.name}: {e}")
+        
         processed_files += 1
     
     # Validate chunk sizes and split oversized ones
@@ -983,8 +966,6 @@ If this appears to be a screenshot or document related to HBS/NetView, provide d
         return response.text if response.text else "I couldn't analyze the image. Please try again."
     
     except Exception as e:
-        if not CV2_AVAILABLE or not TESSERACT_AVAILABLE:
-            return "Image analysis is currently unavailable due to missing dependencies (cv2 or pytesseract). Please ask your question as text instead."
         return f"Error analyzing image: {str(e)}"
 
 # ---- Semantic Analysis Functions ----
@@ -1330,7 +1311,7 @@ def main():
             st.session_state.kb_loading = True
             st.cache_resource.clear()
             st.success("Cache cleared! The page will reload to rebuild the knowledge base.")
-                        st.rerun()
+            st.rerun()
         
         # Clear conversation button
         if st.button("🗑️ Clear Conversation", key="clear_btn"):
@@ -1365,10 +1346,6 @@ def main():
         type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
         key=upload_key
     )
-    
-    # Show warning if image processing is not available
-    if not CV2_AVAILABLE or not TESSERACT_AVAILABLE:
-        st.warning("⚠️ Image analysis is currently unavailable due to missing dependencies. You can still ask questions about your knowledge base as text.")
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
@@ -1422,22 +1399,22 @@ def main():
                         prompt, 
                         st.session_state.index, 
                         st.session_state.corpus,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds,
-                            st.session_state.model_name
-                        )
-                        
-                        response = generate_semantic_response(
-                            prompt,
-                            context_chunks,
-                            user_analysis,
-                            conversation_context,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds
-                        )
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds,
+                        st.session_state.model_name
+                    )
+                    
+                    response = generate_semantic_response(
+                        prompt,
+                        context_chunks,
+                        user_analysis,
+                        conversation_context,
+                        st.session_state.model_name,
+                        st.session_state.project_id,
+                        st.session_state.location,
+                        st.session_state.creds
+                    )
                     
                     st.session_state.messages.append({
                         "role": "assistant", 
