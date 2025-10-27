@@ -3,7 +3,6 @@ import io
 import json
 import re
 import time
-import schedule
 import threading
 from pathlib import Path
 from typing import List, Dict
@@ -67,7 +66,6 @@ def check_db_changes():
         # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > %s", (last_check,))
         
         # For now, we'll use a simple file-based approach
-        # Replace this with your actual database query
         if check_kb_files_modified():
             print("KB files changed, triggering rebuild...")
             trigger_rebuild()
@@ -107,24 +105,21 @@ def trigger_rebuild():
         print(f"Error triggering rebuild: {e}")
 
 def start_database_polling():
-    """Start background polling for database changes"""
-    def run_scheduler():
+    """Start background polling for database changes using simple threading"""
+    def run_polling():
         while True:
             try:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
+                check_db_changes()
+                time.sleep(300)  # Check every 5 minutes (300 seconds)
             except Exception as e:
-                print(f"Scheduler error: {e}")
-                time.sleep(60)
+                print(f"Polling error: {e}")
+                time.sleep(300)
     
-    # Schedule checks every 5 minutes
-    schedule.every(5).minutes.do(check_db_changes)
+    # Start polling in background thread
+    polling_thread = threading.Thread(target=run_polling, daemon=True)
+    polling_thread.start()
     
-    # Start scheduler in background thread
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    
-    return scheduler_thread
+    return polling_thread
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
