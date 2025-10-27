@@ -3,6 +3,8 @@ import io
 import json
 import re
 import time
+import schedule
+import threading
 from pathlib import Path
 from typing import List, Dict
 
@@ -21,10 +23,6 @@ from pypdf import PdfReader
 import cv2
 import pytesseract
 from PIL import Image as PILImage
-
-# File watcher imports
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 # LangChain removed - using direct Vertex AI integration
 
@@ -52,50 +50,81 @@ MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
 MAX_CHUNKS_INITIAL = 150  # Retrieve many chunks initially
 MAX_CHUNKS_FINAL = 15     # Send top 15 to model after re-ranking
 
-# ---- File Watcher Classes ----
-class KBFileHandler(FileSystemEventHandler):
-    def __init__(self):
-        self.last_rebuild = 0
-        self.debounce_seconds = 5  # Wait 5 seconds after last change
-    
-    def on_modified(self, event):
-        # This function runs EVERY TIME a file changes
-        if event.is_directory:
-            return  # Ignore folder changes
+# ---- Database Polling Functions ----
+def check_db_changes():
+    """Check database for KB file changes and trigger rebuild if needed"""
+    try:
+        # This is where you'd query your company DBMS
+        # Example queries for different database types:
         
-        # Only watch specific file types
-        if event.src_path.endswith(('.docx', '.pdf', '.doc')):
-            current_time = time.time()
+        # SQL Server example:
+        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > ?", last_check)
+        
+        # Oracle example:
+        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > :last_check", last_check=last_check)
+        
+        # MySQL example:
+        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > %s", (last_check,))
+        
+        # For now, we'll use a simple file-based approach
+        # Replace this with your actual database query
+        if check_kb_files_modified():
+            print("KB files changed, triggering rebuild...")
+            trigger_rebuild()
             
-            # Debounce: only rebuild if 5+ seconds since last rebuild
-            if current_time - self.last_rebuild > self.debounce_seconds:
-                self.last_rebuild = current_time
-                print(f" KB file changed: {event.src_path}")
-                self.trigger_rebuild()
-    
-    def trigger_rebuild(self):
-        # This is the magic - it restarts your Streamlit app
+    except Exception as e:
+        print(f"Error checking database changes: {e}")
+
+def check_kb_files_modified():
+    """Check if KB files have been modified since last check"""
+    try:
+        # Get last check time from session state
+        last_check = st.session_state.get('last_kb_check', 0)
+        current_time = time.time()
+        
+        # Check if any files in KB directory are newer than last check
+        if KB_DIR.exists():
+            for file_path in KB_DIR.iterdir():
+                if file_path.is_file() and file_path.stat().st_mtime > last_check:
+                    st.session_state.last_kb_check = current_time
+                    return True
+        
+        st.session_state.last_kb_check = current_time
+        return False
+        
+    except Exception as e:
+        print(f"Error checking file modifications: {e}")
+        return False
+
+def trigger_rebuild():
+    """Trigger knowledge base rebuild"""
+    try:
         st.session_state.kb_loaded = False
         st.session_state.kb_loading = True
         st.cache_resource.clear()
-        st.rerun()  # This restarts the entire app
+        st.rerun()
+    except Exception as e:
+        print(f"Error triggering rebuild: {e}")
 
-@st.cache_resource
-def start_file_watcher():
-    """Start the file watcher to monitor KB directory"""
-    # Create KB directory if it doesn't exist
-    if not KB_DIR.exists():
-        KB_DIR.mkdir(parents=True, exist_ok=True)
+def start_database_polling():
+    """Start background polling for database changes"""
+    def run_scheduler():
+        while True:
+            try:
+                schedule.run_pending()
+                time.sleep(60)  # Check every minute
+            except Exception as e:
+                print(f"Scheduler error: {e}")
+                time.sleep(60)
     
-    # Create the file watcher
-    event_handler = KBFileHandler()
-    observer = Observer()
+    # Schedule checks every 5 minutes
+    schedule.every(5).minutes.do(check_db_changes)
     
-    # Tell it to watch the ./kb directory
-    observer.schedule(event_handler, path=str(KB_DIR), recursive=True)
-    observer.start()  # Start watching
+    # Start scheduler in background thread
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
     
-    return observer
+    return scheduler_thread
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -1295,6 +1324,8 @@ def main():
         st.session_state.kb_loading = False
     if "escalation_requests" not in st.session_state:
         st.session_state.escalation_requests = []
+    if "last_kb_check" not in st.session_state:
+        st.session_state.last_kb_check = 0
 
     # Initialize credentials
     try:
@@ -1337,8 +1368,10 @@ def main():
             st.session_state.kb_loaded = loaded
             st.session_state.kb_loading = False
 
-    # Start file watcher
-    observer = start_file_watcher()
+    # Start database polling
+    if not st.session_state.get('polling_started', False):
+        start_database_polling()
+        st.session_state.polling_started = True
 
     # Sidebar
     with st.sidebar:
