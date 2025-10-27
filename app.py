@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import time
 from pathlib import Path
 from typing import List, Dict
 
@@ -20,6 +21,10 @@ from pypdf import PdfReader
 import cv2
 import pytesseract
 from PIL import Image as PILImage
+
+# File watcher imports
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # LangChain removed - using direct Vertex AI integration
 
@@ -46,6 +51,51 @@ DEFAULT_LOCATION = "us-central1"
 MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
 MAX_CHUNKS_INITIAL = 150  # Retrieve many chunks initially
 MAX_CHUNKS_FINAL = 15     # Send top 15 to model after re-ranking
+
+# ---- File Watcher Classes ----
+class KBFileHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_rebuild = 0
+        self.debounce_seconds = 5  # Wait 5 seconds after last change
+    
+    def on_modified(self, event):
+        # This function runs EVERY TIME a file changes
+        if event.is_directory:
+            return  # Ignore folder changes
+        
+        # Only watch specific file types
+        if event.src_path.endswith(('.docx', '.pdf', '.doc')):
+            current_time = time.time()
+            
+            # Debounce: only rebuild if 5+ seconds since last rebuild
+            if current_time - self.last_rebuild > self.debounce_seconds:
+                self.last_rebuild = current_time
+                print(f" KB file changed: {event.src_path}")
+                self.trigger_rebuild()
+    
+    def trigger_rebuild(self):
+        # This is the magic - it restarts your Streamlit app
+        st.session_state.kb_loaded = False
+        st.session_state.kb_loading = True
+        st.cache_resource.clear()
+        st.rerun()  # This restarts the entire app
+
+@st.cache_resource
+def start_file_watcher():
+    """Start the file watcher to monitor KB directory"""
+    # Create KB directory if it doesn't exist
+    if not KB_DIR.exists():
+        KB_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Create the file watcher
+    event_handler = KBFileHandler()
+    observer = Observer()
+    
+    # Tell it to watch the ./kb directory
+    observer.schedule(event_handler, path=str(KB_DIR), recursive=True)
+    observer.start()  # Start watching
+    
+    return observer
 
 # ---- Token Counting Utilities ----
 def estimate_tokens(text: str) -> int:
@@ -1141,11 +1191,18 @@ RESPONSE:"""
             system_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=2048,
+                max_output_tokens=4096,
                 top_p=0.8,
                 top_k=40
             )
         )
+        
+        # Check for response truncation or safety issues
+        if hasattr(response, 'candidates') and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'finish_reason'):
+                if candidate.finish_reason in ['SAFETY', 'MAX_TOKENS', 'LENGTH']:
+                    return f"{response.text}\n\n[Response truncated - ask me to continue or rephrase for a more concise answer]"
         
         return response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
     
@@ -1279,6 +1336,9 @@ def main():
             st.session_state.corpus = corpus
             st.session_state.kb_loaded = loaded
             st.session_state.kb_loading = False
+
+    # Start file watcher
+    observer = start_file_watcher()
 
     # Sidebar
     with st.sidebar:
