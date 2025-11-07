@@ -4,6 +4,7 @@ import json
 import re
 import time
 import threading
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict
 
@@ -12,7 +13,6 @@ import numpy as np
 import faiss
 
 from google.oauth2 import service_account
-from google.cloud import aiplatform
 from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part, Image
@@ -22,8 +22,6 @@ from pypdf import PdfReader
 import cv2
 import pytesseract
 from PIL import Image as PILImage
-
-# LangChain removed - using direct Vertex AI integration
 
 # ---- App constants ----
 APP_DIR = Path(__file__).parent
@@ -44,58 +42,52 @@ CANDIDATE_MODELS = [
 
 DEFAULT_LOCATION = "us-central1"
 
-# Token limits for different contexts
-MAX_CONTEXT_TOKENS = 150000  # Leave room for response and conversation
-MAX_CHUNKS_INITIAL = 150  # Retrieve many chunks initially
-MAX_CHUNKS_FINAL = 15     # Send top 15 to model after re-ranking
+MAX_CONTEXT_TOKENS = 150000
+MAX_CHUNKS_INITIAL = 150
+MAX_CHUNKS_FINAL = 15
 
-# ---- Database Polling Functions ----
+MULTI_QUERY_VARIATIONS = 3
+DEEP_RETRIEVAL_MULTIPLIER = 2
+
+MODEL_CONTEXT_LIMITS = {
+    "gemini-2.5-flash-lite": 1_000_000,
+    "gemini-2.5-pro": 2_000_000,
+}
+
+DEEP_RETRIEVAL_KEYWORDS = [
+    "steps", "step-by-step", "process", "procedure", "workflow", "walk me through",
+    "combine", "together", "multiple documents", "full instructions", "detailed",
+    "all details", "comprehensive", "complete answer", "entire process",
+    "different documents", "across", "multi-part", "split across"
+]
+
+# ---- Background polling -----------------------------------------------------
 def check_db_changes():
-    """Check database for KB file changes and trigger rebuild if needed"""
     try:
-        # This is where you'd query your company DBMS
-        # Example queries for different database types:
-        
-        # SQL Server example:
-        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > ?", last_check)
-        
-        # Oracle example:
-        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > :last_check", last_check=last_check)
-        
-        # MySQL example:
-        # cursor.execute("SELECT COUNT(*) FROM kb_files WHERE modified_date > %s", (last_check,))
-        
-        # For now, we'll use a simple file-based approach
         if check_kb_files_modified():
             print("KB files changed, triggering rebuild...")
             trigger_rebuild()
-            
     except Exception as e:
         print(f"Error checking database changes: {e}")
 
 def check_kb_files_modified():
-    """Check if KB files have been modified since last check"""
     try:
-        # Get last check time from session state
-        last_check = st.session_state.get('last_kb_check', 0)
+        last_check = st.session_state.get("last_kb_check", 0)
         current_time = time.time()
-        
-        # Check if any files in KB directory are newer than last check
+
         if KB_DIR.exists():
             for file_path in KB_DIR.iterdir():
                 if file_path.is_file() and file_path.stat().st_mtime > last_check:
                     st.session_state.last_kb_check = current_time
                     return True
-        
+
         st.session_state.last_kb_check = current_time
         return False
-        
     except Exception as e:
         print(f"Error checking file modifications: {e}")
         return False
 
 def trigger_rebuild():
-    """Trigger knowledge base rebuild"""
     try:
         st.session_state.kb_loaded = False
         st.session_state.kb_loading = True
@@ -105,262 +97,213 @@ def trigger_rebuild():
         print(f"Error triggering rebuild: {e}")
 
 def start_database_polling():
-    """Start background polling for database changes using simple threading"""
     def run_polling():
         while True:
             try:
                 check_db_changes()
-                time.sleep(300)  # Check every 5 minutes (300 seconds)
+                time.sleep(300)
             except Exception as e:
                 print(f"Polling error: {e}")
                 time.sleep(300)
-    
-    # Start polling in background thread
+
     polling_thread = threading.Thread(target=run_polling, daemon=True)
     polling_thread.start()
-    
     return polling_thread
 
-# ---- Token Counting Utilities ----
+# ---- Token helpers ----------------------------------------------------------
 def estimate_tokens(text: str) -> int:
-    """Estimate token count (rough approximation: 1 token ≈ 4 characters)"""
     return len(text) // 4
 
-def truncate_to_token_limit(text: str, max_tokens: int) -> str:
-    """Truncate text to fit within token limit"""
-    estimated_tokens = estimate_tokens(text)
-    if estimated_tokens <= max_tokens:
-        return text
-    
-    # Truncate to approximate character limit
-    char_limit = max_tokens * 4
-    return text[:char_limit] + "...[truncated]"
+def get_max_context_tokens(model_name: str) -> int:
+    limit = MODEL_CONTEXT_LIMITS.get(model_name, MAX_CONTEXT_TOKENS)
+    return int(limit * 0.8)
 
-# ---- Utilities ----
+def truncate_to_token_limit(text: str, max_tokens: int) -> str:
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    return text[: max_tokens * 4] + "...[truncated]"
+
+# ---- Text utilities ---------------------------------------------------------
 def split_into_sentences(text: str) -> List[str]:
-    sents = re.split(r'(?<=[\.\?\!])\s+', text.strip())
+    sents = re.split(r"(?<=[\.\?\!])\s+", text.strip())
     return [s.strip() for s in sents if s.strip()]
 
 def chunk_text(text: str, max_tokens: int = 200, overlap_sentences: int = 2) -> List[str]:
-    """Improved chunking with extremely small chunks for better retrieval"""
     sents = split_into_sentences(text)
     chunks, buf, token_est = [], [], 0
-    
+
     for s in sents:
         s_tokens = max(1, len(s) // 4)
         if token_est + s_tokens > max_tokens and buf:
             chunks.append(" ".join(buf))
-            # Better overlap strategy
             buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
             token_est = sum(max(1, len(x)//4) for x in buf)
         buf.append(s)
         token_est += s_tokens
-    
+
     if buf:
         chunks.append(" ".join(buf))
-    
-    # Validate and split oversized chunks with extremely aggressive limits
-    validated_chunks = []
+
+    validated = []
     for chunk in chunks:
-        chunk_tokens = estimate_tokens(chunk)
-        if chunk_tokens > 2000:  # Extremely low limit for safety
-            # Split oversized chunk into smaller pieces
-            validated_chunks.extend(split_oversized_chunk(chunk, max_tokens=2000))
+        if estimate_tokens(chunk) > 2000:
+            validated.extend(split_oversized_chunk(chunk, 2000))
         else:
-            validated_chunks.append(chunk)
-    
-    return validated_chunks
+            validated.append(chunk)
+    return validated
 
 def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
-    """Split a chunk that's too large into smaller pieces"""
-    words = chunk.split()
-    sub_chunks = []
-    current_chunk = []
-    current_tokens = 0
-    
+    words, sub_chunks = chunk.split(), []
+    current, current_tokens = [], 0
+
     for word in words:
         word_tokens = len(word) // 4
-        if current_tokens + word_tokens > max_tokens and current_chunk:
-            sub_chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_tokens = word_tokens
+        if current_tokens + word_tokens > max_tokens and current:
+            sub_chunks.append(" ".join(current))
+            current, current_tokens = [word], word_tokens
         else:
-            current_chunk.append(word)
+            current.append(word)
             current_tokens += word_tokens
-    
-    if current_chunk:
-        sub_chunks.append(" ".join(current_chunk))
-    
+
+    if current:
+        sub_chunks.append(" ".join(current))
     return sub_chunks
 
+# ---- Extraction helpers -----------------------------------------------------
 def extract_text_from_docx_bytes(b: bytes) -> str:
     f = io.BytesIO(b)
     doc = Document(f)
-    out = []
-    for para in doc.paragraphs:
-        t = (para.text or "").strip()
-        if t:
-            out.append(t)
-    return "\n".join(out)
+    return "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
 
 def extract_text_from_doc_bytes(b: bytes) -> str:
-    """Extract text from .doc files using textract or antiword fallback"""
     try:
-        # Try using textract first (most reliable)
         import textract
-        text = textract.process(io.BytesIO(b), extension='doc').decode('utf-8')
-        return text.strip()
+        return textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
     except ImportError:
-        # Fallback: Try antiword if available
         try:
-            import subprocess
-            import tempfile
-            
-            # Write bytes to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp_file:
+            import subprocess, tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
                 tmp_file.write(b)
                 tmp_path = tmp_file.name
-            
             try:
-                # Use antiword to extract text
                 result = subprocess.run(
-                    ['antiword', tmp_path],
+                    ["antiword", tmp_path],
                     capture_output=True,
                     text=True,
-                    timeout=30
+                    timeout=30,
                 )
-                
                 if result.returncode == 0:
                     return result.stdout.strip()
-                else:
-                    return ""
+                return ""
             finally:
-                # Clean up temporary file
                 try:
                     os.unlink(tmp_path)
-                except:
+                except FileNotFoundError:
                     pass
         except Exception:
-            # Last fallback: try to read as plain text (may have formatting issues)
             try:
-                text = b.decode('utf-8', errors='ignore')
-                # Clean up common binary artifacts
-                text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t')
-                return text.strip()
-            except:
+                text = b.decode("utf-8", errors="ignore")
+                return "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
+            except Exception:
                 return ""
-    except Exception as e:
+    except Exception:
         return ""
 
 def extract_text_from_pdf_bytes(b: bytes) -> str:
     try:
-        f = io.BytesIO(b)
-        reader = PdfReader(f)
-        parts = []
-        for page in reader.pages:
-            t = (page.extract_text() or "").strip()
-            if t:
-                parts.append(t)
-        return "\n\n".join(parts)
+        reader = PdfReader(io.BytesIO(b))
+        parts = [(page.extract_text() or "").strip() for page in reader.pages]
+        return "\n\n".join(p for p in parts if p)
     except Exception:
         return ""
 
 def extract_text_from_image_bytes(b: bytes) -> str:
     try:
         img = PILImage.open(io.BytesIO(b)).convert("RGB")
-        arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+        arr = np.array(img)[:, :, ::-1]
         gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
         gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
         return (pytesseract.image_to_string(gray) or "").strip()
     except Exception:
         return ""
 
+# ---- Structured data parsing (OCR) -----------------------------------------
 def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse OCR text to extract structured report data"""
-    structured_data = []
-    
-    # Clean up OCR text
-    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
-    
-    # Look for report patterns
+    lines = [line.strip() for line in ocr_text.split("\n") if line.strip()]
     if "overdue" in filename.lower() or "overdue" in ocr_text.lower():
-        structured_data.extend(parse_overdue_report(ocr_text, filename))
-    elif "outbound" in filename.lower() or "outbound" in ocr_text.lower():
-        structured_data.extend(parse_outbound_report(ocr_text, filename))
-    elif "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
-        structured_data.extend(parse_equipment_list_report(ocr_text, filename))
-    
-    return structured_data
+        return parse_overdue_report(lines, filename)
+    if "outbound" in filename.lower() or "outbound" in ocr_text.lower():
+        return parse_outbound_report(lines, filename)
+    if "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
+        return parse_equipment_list_report(lines, filename)
+    return []
 
-def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Overdue Equipment Report data"""
-    data = []
-    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
-    
+def parse_overdue_report(lines: List[str], filename: str) -> List[Dict]:
+    # same as original (omitted for brevity) ...
+    # copy the function body from your existing code (no logical changes)
+    # ...
+
+    data: List[Dict] = []
     for i, line in enumerate(lines):
-        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
+        if re.match(r"^[A-Z\s]+$", line) and len(line) > 3:
             if i + 1 < len(lines):
                 next_line = lines[i + 1]
-                contract_match = re.search(r'C\d+R', next_line)
-                if contract_match:
-                    customer_name = line
-                    contract = contract_match.group()
-                    
-                    phone = ""
-                    stock = ""
-                    make = ""
-                    model = ""
-                    equipment_type = ""
-                    year = ""
-                    serial = ""
-                    date_out = ""
-                    expected = ""
-                    days_over = ""
-                    
-                    for j in range(i, min(i + 5, len(lines))):
-                        current_line = lines[j]
-                        
-                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
-                        if phone_match:
-                            phone = phone_match.group()
-                        
-                        stock_match = re.search(r'\b\d{5}\b', current_line)
-                        if stock_match:
-                            stock = stock_match.group()
-                        
-                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
-                        if make_match:
-                            make = make_match.group()
-                        
-                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
-                        if model_match:
-                            model = model_match.group()
-                        
-                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
-                        if type_match:
-                            equipment_type = type_match.group()
-                        
-                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
-                        if year_match:
-                            year = year_match.group()
-                        
-                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
-                        if serial_match and len(serial_match.group()) > 6:
-                            serial = serial_match.group()
-                        
-                        date_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', current_line)
-                        if date_match:
-                            if not date_out:
-                                date_out = date_match.group()
-                            else:
-                                expected = date_match.group()
-                        
-                        days_match = re.search(r'\b\d{1,4}\b', current_line)
-                        if days_match and days_match.group().isdigit():
-                            days_over = days_match.group()
-                    
-                    if customer_name and contract:
-                        data.append({
+                contract_match = re.search(r"C\d+R", next_line)
+                if not contract_match:
+                    continue
+                customer_name = line
+                contract = contract_match.group()
+                phone = stock = make = model = equipment_type = ""
+                year = serial = date_out = expected = days_over = ""
+
+                for j in range(i, min(i + 5, len(lines))):
+                    current_line = lines[j]
+                    phone_match = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", current_line)
+                    if phone_match:
+                        phone = phone_match.group()
+
+                    stock_match = re.search(r"\b\d{5}\b", current_line)
+                    if stock_match:
+                        stock = stock_match.group()
+
+                    make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", current_line)
+                    if make_match:
+                        make = make_match.group()
+
+                    model_match = re.search(
+                        r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
+                        current_line,
+                    )
+                    if model_match:
+                        model = model_match.group()
+
+                    type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", current_line)
+                    if type_match:
+                        equipment_type = type_match.group()
+
+                    year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", current_line)
+                    if year_match:
+                        year = year_match.group()
+
+                    serial_match = re.search(r"\b[A-Z0-9]{6,}\b", current_line)
+                    if serial_match and len(serial_match.group()) > 6:
+                        serial = serial_match.group()
+
+                    date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", current_line)
+                    if date_match:
+                        if not date_out:
+                            date_out = date_match.group()
+                        else:
+                            expected = date_match.group()
+
+                    days_match = re.search(r"\b\d{1,4}\b", current_line)
+                    if days_match and days_match.group().isdigit():
+                        days_over = days_match.group()
+
+                if customer_name and contract:
+                    data.append(
+                        {
                             "customer_name": customer_name,
                             "contract": contract,
                             "phone": phone,
@@ -374,71 +317,68 @@ def parse_overdue_report(ocr_text: str, filename: str) -> List[Dict]:
                             "expected_due": expected,
                             "days_overdue": days_over,
                             "source": filename,
-                            "report_type": "Overdue Equipment Report"
-                        })
-    
+                            "report_type": "Overdue Equipment Report",
+                        }
+                    )
     return data
 
-def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Outbound Report data"""
-    data = []
-    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
-    
+def parse_outbound_report(lines: List[str], filename: str) -> List[Dict]:
+    # identical to your existing implementation (omitted to save space)
+    data: List[Dict] = []
     for i, line in enumerate(lines):
-        if re.match(r'^[A-Z\s]+$', line) and len(line) > 3:
+        if re.match(r"^[A-Z\s]+$", line) and len(line) > 3:
             if i + 1 < len(lines):
                 next_line = lines[i + 1]
-                contract_match = re.search(r'C\d+R', next_line)
-                if contract_match:
-                    customer_name = line
-                    contract = contract_match.group()
-                    
-                    phone = ""
-                    stock = ""
-                    make = ""
-                    model = ""
-                    equipment_type = ""
-                    year = ""
-                    serial = ""
-                    date_time_out = ""
-                    
-                    for j in range(i, min(i + 5, len(lines))):
-                        current_line = lines[j]
-                        
-                        phone_match = re.search(r'\(\d{3}\)\s*\d{3}-\d{4}', current_line)
-                        if phone_match:
-                            phone = phone_match.group()
-                        
-                        stock_match = re.search(r'\b\d{5}\b', current_line)
-                        if stock_match:
-                            stock = stock_match.group()
-                        
-                        make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', current_line)
-                        if make_match:
-                            make = make_match.group()
-                        
-                        model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', current_line)
-                        if model_match:
-                            model = model_match.group()
-                        
-                        type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', current_line)
-                        if type_match:
-                            equipment_type = type_match.group()
-                        
-                        year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', current_line)
-                        if year_match:
-                            year = year_match.group()
-                        
-                        serial_match = re.search(r'\b[A-Z0-9]{6,}\b', current_line)
-                        if serial_match and len(serial_match.group()) > 6:
-                            serial = serial_match.group()
-                        
-                        datetime_match = re.search(r'\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b', current_line)
-                        if datetime_match:
-                            date_time_out = datetime_match.group()
-                    
-                    if customer_name and contract:
-                        data.append({
+                contract_match = re.search(r"C\d+R", next_line)
+                if not contract_match:
+                    continue
+                customer_name = line
+                contract = contract_match.group()
+
+                phone = stock = make = model = equipment_type = ""
+                year = serial = date_time_out = ""
+
+                for j in range(i, min(i + 5, len(lines))):
+                    current_line = lines[j]
+
+                    phone_match = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", current_line)
+                    if phone_match:
+                        phone = phone_match.group()
+
+                    stock_match = re.search(r"\b\d{5}\b", current_line)
+                    if stock_match:
+                        stock = stock_match.group()
+
+                    make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", current_line)
+                    if make_match:
+                        make = make_match.group()
+
+                    model_match = re.search(
+                        r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
+                        current_line,
+                    )
+                    if model_match:
+                        model = model_match.group()
+
+                    type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", current_line)
+                    if type_match:
+                        equipment_type = type_match.group()
+
+                    year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", current_line)
+                    if year_match:
+                        year = year_match.group()
+
+                    serial_match = re.search(r"\b[A-Z0-9]{6,}\b", current_line)
+                    if serial_match and len(serial_match.group()) > 6:
+                        serial = serial_match.group()
+
+                    datetime_match = re.search(r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b", current_line)
+                    if datetime_match:
+                        date_time_out = datetime_match.group()
+
+                if customer_name and contract:
+                    data.append(
+                        {
                             "customer_name": customer_name,
                             "contract": contract,
                             "phone": phone,
@@ -450,353 +390,363 @@ def parse_outbound_report(ocr_text: str, filename: str) -> List[Dict]:
                             "serial": serial,
                             "date_time_out": date_time_out,
                             "source": filename,
-                            "report_type": "Rental Outbound Report"
-                        })
-    
+                            "report_type": "Rental Outbound Report",
+                        }
+                    )
     return data
 
-def parse_equipment_list_report(ocr_text: str, filename: str) -> List[Dict]:
-    """Parse Equipment List Report data"""
-    data = []
-    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
-    
-    for i, line in enumerate(lines):
-        stock_match = re.search(r'\b\d{5}\b', line)
-        if stock_match:
-            stock = stock_match.group()
-            
-            make = ""
-            model = ""
-            equipment_type = ""
-            year = ""
-            serial = ""
-            location = ""
-            meter = ""
-            
-            make_match = re.search(r'\b(BOB|KUB|JD|BOM)\b', line)
-            if make_match:
-                make = make_match.group()
-            
-            model_match = re.search(r'\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b', line)
-            if model_match:
-                model = model_match.group()
-            
-            type_match = re.search(r'\b(SKIDSTEER|EXCAVATOR|ROLLER)\b', line)
-            if type_match:
-                equipment_type = type_match.group()
-            
-            year_match = re.search(r'\b(2013|2014|2015|2016|1979|2006|2008|2012)\b', line)
-            if year_match:
-                year = year_match.group()
-            
-            serial_match = re.search(r'\b[A-Z0-9]{6,}\b', line)
-            if serial_match and len(serial_match.group()) > 6:
-                serial = serial_match.group()
-            
-            meter_match = re.search(r'\b\d+\b', line)
-            if meter_match:
-                meter = meter_match.group()
-            
-            data.append({
+def parse_equipment_list_report(lines: List[str], filename: str) -> List[Dict]:
+    data: List[Dict] = []
+    for line in lines:
+        stock_match = re.search(r"\b\d{5}\b", line)
+        if not stock_match:
+            continue
+        stock = stock_match.group()
+
+        make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", line)
+        model_match = re.search(
+            r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
+            line,
+        )
+        type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", line)
+        year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", line)
+        serial_match = re.search(r"\b[A-Z0-9]{6,}\b", line)
+        meter_match = re.search(r"\b\d+\b", line)
+
+        data.append(
+            {
                 "stock_number": stock,
-                "make": make,
-                "model": model,
-                "equipment_type": equipment_type,
-                "year": year,
-                "serial": serial,
-                "location": location,
-                "meter": meter,
+                "make": make_match.group() if make_match else "",
+                "model": model_match.group() if model_match else "",
+                "equipment_type": type_match.group() if type_match else "",
+                "year": year_match.group() if year_match else "",
+                "serial": serial_match.group() if serial_match and len(serial_match.group()) > 6 else "",
+                "location": "",
+                "meter": meter_match.group() if meter_match else "",
                 "source": filename,
-                "report_type": "Rental Equipment List"
-            })
-    
+                "report_type": "Rental Equipment List",
+            }
+        )
     return data
 
+# ---- Embedding & FAISS ------------------------------------------------------
 def embed_texts(texts: List[str], project_id: str, location: str, credentials, batch_size: int = 250, silent: bool = False) -> np.ndarray:
-    """Generate embeddings for texts in batches to handle large corpora"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-        
-        all_embeddings = []
-        
-        # Validate and filter texts before embedding with very strict limits
-        valid_texts = []
-        skipped_count = 0
+
+        all_embeddings: List[np.ndarray] = []
+        valid_texts, skipped = [], 0
+
         for i, text in enumerate(texts):
             token_count = estimate_tokens(text)
-            if token_count > 10000:  # Very strict limit
-                skipped_count += 1
-                if not silent and skipped_count <= 5:  # Only show first 5 warnings to avoid spam
+            if token_count > 10000:
+                skipped += 1
+                if not silent and skipped <= 5:
                     st.warning(f"Skipping text {i+1} with {token_count} tokens (exceeds 10K limit)")
-                # Add a placeholder embedding of zeros
-                all_embeddings.append(np.zeros(768))  # text-embedding-005 has 768 dimensions
+                all_embeddings.append(np.zeros(768))
             else:
                 valid_texts.append((i, text))
-        
-        if not silent and skipped_count > 5:
-            st.warning(f"Skipped {skipped_count} texts total due to size limits")
-        
-        # Process valid texts in batches with token-aware batching
-        batch_num = 0
-        current_batch = []
-        current_batch_tokens = 0
-        MAX_BATCH_TOKENS = 15000  # Safe limit well below 20K
-        
-        for idx, (original_idx, text) in enumerate(valid_texts):
-            text_tokens = estimate_tokens(text)
-            
-            # Check if adding this text would exceed batch limit
-            if current_batch and (current_batch_tokens + text_tokens > MAX_BATCH_TOKENS or len(current_batch) >= 100):
-                # Process current batch
-                batch_num += 1
-                batch_texts = [item[1] for item in current_batch]
-                # Progress messages only during initial loading
-                if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
-                    st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
-                
-                try:
-                    batch_embeddings = model.get_embeddings(batch_texts)
-                    
-                    # Insert embeddings at correct positions
-                    for j, embedding in enumerate(batch_embeddings):
-                        orig_idx = current_batch[j][0]
-                        # Pad with zeros if needed
-                        while len(all_embeddings) < orig_idx:
-                            all_embeddings.append(np.zeros(768))
-                        all_embeddings.append(embedding.values)
-                except Exception as batch_error:
-                    if not silent:
-                        st.error(f"Batch embedding error: {batch_error}")
-                    # Add zero embeddings for failed batch
-                    for j in range(len(current_batch)):
-                        orig_idx = current_batch[j][0]
-                        while len(all_embeddings) < orig_idx:
-                            all_embeddings.append(np.zeros(768))
-                        all_embeddings.append(np.zeros(768))
-                
-                # Reset batch
-                current_batch = []
-                current_batch_tokens = 0
-            
-            # Add current text to batch
-            current_batch.append((original_idx, text))
-            current_batch_tokens += text_tokens
-        
-        # Process final batch
-        if current_batch:
+
+        if not silent and skipped > 5:
+            st.warning(f"Skipped {skipped} texts total due to size limits")
+
+        batch_num, current_batch, current_tokens = 0, [], 0
+        MAX_BATCH_TOKENS = 15000
+
+        def flush_batch():
+            nonlocal batch_num, current_batch, current_tokens
             batch_num += 1
             batch_texts = [item[1] for item in current_batch]
-            # Progress messages only during initial loading
-            if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
-                st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_batch_tokens} tokens)")
-            
+
+            if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
+                st.info(f"Processing embedding batch {batch_num} ({len(current_batch)} texts, {current_tokens} tokens)")
+
             try:
-                batch_embeddings = model.get_embeddings(batch_texts)
-                
-                # Insert embeddings at correct positions
-                for j, embedding in enumerate(batch_embeddings):
+                results = model.get_embeddings(batch_texts)
+                for j, embedding in enumerate(results):
                     orig_idx = current_batch[j][0]
                     while len(all_embeddings) < orig_idx:
                         all_embeddings.append(np.zeros(768))
                     all_embeddings.append(embedding.values)
             except Exception as batch_error:
                 if not silent:
-                    st.error(f"Final batch embedding error: {batch_error}")
-                for j in range(len(current_batch)):
-                    orig_idx = current_batch[j][0]
+                    st.error(f"Batch embedding error: {batch_error}")
+                for j, (orig_idx, _) in enumerate(current_batch):
                     while len(all_embeddings) < orig_idx:
                         all_embeddings.append(np.zeros(768))
                     all_embeddings.append(np.zeros(768))
-        
+
+            current_batch, current_tokens = [], 0
+
+        for original_idx, text in valid_texts:
+            tokens = estimate_tokens(text)
+            if current_batch and (current_tokens + tokens > MAX_BATCH_TOKENS or len(current_batch) >= 100):
+                flush_batch()
+            current_batch.append((original_idx, text))
+            current_tokens += tokens
+
+        if current_batch:
+            flush_batch()
+
         return np.array(all_embeddings).astype(np.float32)
     except Exception as e:
         if not silent:
             st.error(f"Embedding error: {e}")
         return np.array([])
 
-def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials, silent: bool = False) -> tuple:
-    """Build FAISS index from corpus"""
+def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials, silent: bool = False):
     if not corpus:
         return None, []
-    
+
     texts = [item["text"] for item in corpus]
     embeddings = embed_texts(texts, project_id, location, credentials, silent=silent)
-    
     if embeddings.size == 0:
         return None, []
-    
-    # Create FAISS index
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
-    
-    # Normalize embeddings for cosine similarity
+
+    index = faiss.IndexFlatIP(embeddings.shape[1])
     faiss.normalize_L2(embeddings)
     index.add(embeddings)
-    
     return index, corpus
 
+# ---- Retrieval helpers ------------------------------------------------------
 def expand_query(query: str) -> str:
-    """Expand query with related terms for better search"""
-    query_lower = query.lower()
-    
-    if "overdue" in query_lower:
+    q = query.lower()
+    if "overdue" in q:
         return f"{query} overdue equipment report rental"
-    elif "outbound" in query_lower:
+    if "outbound" in q:
         return f"{query} outbound report rental equipment"
-    elif "equipment" in query_lower:
+    if "equipment" in q:
         return f"{query} equipment list rental"
-    elif "customer" in query_lower:
+    if "customer" in q:
         return f"{query} customer contract phone"
-    elif "stock" in query_lower:
+    if "stock" in q:
         return f"{query} stock number equipment"
-    elif "serial" in query_lower:
+    if "serial" in q:
         return f"{query} serial number equipment"
-    else:
-        return query
+    return query
 
-def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int = 10) -> List[Dict]:
-    """Use LLM to re-rank chunks by relevance to query"""
-    if len(chunks) <= top_k:
-        # Assign default rerank scores to all chunks
-        for chunk in chunks:
-            if 'rerank_score' not in chunk:
-                chunk['rerank_score'] = chunk.get('similarity_score', 0.5)
-        return chunks
-    
+def generate_query_variations(query: str, model_name: str, project_id: str, location: str, credentials) -> List[str]:
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        
-        # Create a prompt to score relevance
-        chunks_text = ""
-        for i, chunk in enumerate(chunks[:30]):  # Only re-rank top 30 to save time
-            chunks_text += f"\n[{i}] {chunk['text'][:200]}..."
-        
-        rerank_prompt = f"""Score each chunk's relevance to the query on a scale of 0-10.
+
+        prompt = f"""Generate {MULTI_QUERY_VARIATIONS} alternative search queries that might retrieve different knowledge base documents about HBS NetView.
+
+Original query: {query}
+
+- Use dealership terminology (RO, unit, part, rental, accounting, etc.)
+- Include synonyms or related phrases
+- Return ONLY a JSON array of strings
+"""
+
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                temperature=0.5,
+                max_output_tokens=200,
+            ),
+        )
+
+        if response.text:
+            variations = json.loads(response.text.strip())
+            if isinstance(variations, list):
+                variations = [v for v in variations if isinstance(v, str) and v.strip()]
+                return [query] + variations[:MULTI_QUERY_VARIATIONS]
+    except Exception:
+        pass
+
+    return [query]
+
+def needs_deep_retrieval(query: str) -> bool:
+    lowered = query.lower()
+    return any(keyword in lowered for keyword in DEEP_RETRIEVAL_KEYWORDS)
+
+def cluster_chunks(chunks: List[Dict]) -> List[Dict]:
+    if not chunks:
+        return []
+
+    grouped = defaultdict(list)
+    for chunk in chunks:
+        grouped[chunk.get("source", "Unknown")].append(chunk)
+
+    merged = []
+    for source, source_chunks in grouped.items():
+        source_chunks.sort(key=lambda x: str(x.get("chunk_id")))
+        merged_text = "\n".join(ch["text"] for ch in source_chunks)
+
+        merged.append(
+            {
+                "source": source,
+                "text": merged_text,
+                "similarity_score": max(ch.get("similarity_score", 0) for ch in source_chunks),
+                "rerank_score": max(ch.get("rerank_score", 0) for ch in source_chunks),
+                "chunk_id": source_chunks[0].get("chunk_id"),
+            }
+        )
+
+    merged.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
+    return merged
+
+def verify_answer_quality(query: str, answer: str, context_chunks: List[Dict], model_name: str, project_id: str, location: str, credentials) -> Dict:
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+
+        context_summary = "\n".join(f"- {chunk['text'][:300]}" for chunk in context_chunks[:5])
+
+        prompt = f"""Verify the quality of an answer using the provided context.
+
+QUESTION:
+{query}
+
+ANSWER:
+{answer}
+
+CONTEXT:
+{context_summary}
+
+Provide JSON only: {{"relevance":8,"support":7,"completeness":6,"accuracy_risk":2}} (accuracy_risk 0–10, lower is better).
+"""
+
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+            ),
+        )
+
+        if response.text:
+            result = json.loads(response.text.strip())
+            if isinstance(result, dict):
+                result["needs_improvement"] = result.get("support", 0) < 5 or result.get("accuracy_risk", 10) > 6
+                return result
+    except Exception:
+        pass
+
+    return {"relevance": 6, "support": 6, "completeness": 6, "accuracy_risk": 4, "needs_improvement": False}
+
+def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int = 10) -> List[Dict]:
+    if len(chunks) <= top_k:
+        return chunks
+
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+
+        chunk_snippets = [f"[{i}] {chunk['text'][:1000]}" for i, chunk in enumerate(chunks[:50])]
+        rerank_prompt = f"""Score each chunk's relevance to the query on a 0-10 scale.
 
 QUERY: {query}
 
 CHUNKS:
-{chunks_text}
+{chr(10).join(chunk_snippets)}
 
-Return ONLY a JSON array of scores in order, like: [8, 3, 9, 2, ...]"""
+Return a JSON array of scores in order (e.g., [8, 3, 9, ...]).
+"""
 
         response = model.generate_content(
             rerank_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=500
-            )
+                max_output_tokens=500,
+            ),
         )
-        
+
         if response.text:
-            try:
-                scores = json.loads(response.text.strip())
-                if isinstance(scores, list) and len(scores) == len(chunks[:30]):
-                    # Add scores to chunks
-                    for i, score in enumerate(scores):
-                        chunks[i]['rerank_score'] = float(score)
-                    
-                    # Sort by rerank score
-                    sorted_chunks = sorted(chunks[:30], key=lambda x: x.get('rerank_score', 0), reverse=True)
-                    
-                    # Add default rerank scores to remaining chunks
-                    for chunk in chunks[30:]:
-                        if 'rerank_score' not in chunk:
-                            chunk['rerank_score'] = chunk.get('similarity_score', 0.5)
-                    
-                    return sorted_chunks[:top_k]
-            except:
-                pass
-        
-        # Fallback: return top k by similarity with default rerank scores
-        for chunk in chunks:
-            if 'rerank_score' not in chunk:
-                chunk['rerank_score'] = chunk.get('similarity_score', 0.5)
-        return chunks[:top_k]
-    
-    except Exception as e:
-        # Fallback: return top k by similarity with default rerank scores
-        for chunk in chunks:
-            if 'rerank_score' not in chunk:
-                chunk['rerank_score'] = chunk.get('similarity_score', 0.5)
-        return chunks[:top_k]
+            scores = json.loads(response.text.strip())
+            if isinstance(scores, list):
+                limit = min(len(scores), len(chunks))
+                for i in range(limit):
+                    chunks[i]["rerank_score"] = float(scores[i])
+
+                chunks.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
+                return chunks[:top_k]
+    except Exception:
+        pass
+
+    return chunks[:top_k]
 
 def build_optimized_context(chunks: List[Dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> str:
-    """Build optimized context from chunks with token limiting"""
     if not chunks:
         return "No relevant information found in knowledge base."
-    
-    context_parts = []
-    current_tokens = 0
-    
+
+    seen = set()
+    unique_chunks = []
     for chunk in chunks:
-        # Format chunk
-        chunk_text = f"Source: {chunk['source']}\nContent: {chunk['text']}\n"
+        signature = (chunk.get("source", ""), chunk["text"][:200])
+        if signature not in seen:
+            seen.add(signature)
+            unique_chunks.append(chunk)
+
+    unique_chunks.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
+
+    context_parts, current_tokens, current_source = [], 0, None
+    for chunk in unique_chunks:
+        source = chunk.get("source", "Unknown")
+        chunk_text = f"Source: {source}\nContent: {chunk['text']}\n"
         chunk_tokens = estimate_tokens(chunk_text)
-        
-        # Check if adding this chunk would exceed limit
+
         if current_tokens + chunk_tokens > max_tokens:
-            # Try to add a truncated version
-            remaining_tokens = max_tokens - current_tokens
-            if remaining_tokens > 100:  # Only add if we have reasonable space
-                truncated = truncate_to_token_limit(chunk['text'], remaining_tokens - 50)
-                context_parts.append(f"Source: {chunk['source']}\nContent: {truncated}\n")
+            remaining = max_tokens - current_tokens
+            if remaining > 100:
+                truncated = truncate_to_token_limit(chunk["text"], remaining - 50)
+                context_parts.append(f"Source: {source}\nContent: {truncated}\n")
             break
-        
+
+        if source != current_source:
+            if current_source is not None:
+                context_parts.append("")
+            current_source = source
+
         context_parts.append(chunk_text)
         current_tokens += chunk_tokens
-    
+
     return "\n".join(context_parts)
 
-def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.2) -> List[Dict]:
-    """Search FAISS index with multi-stage retrieval and re-ranking"""
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, deep_mode: bool, k: int = MAX_CHUNKS_FINAL, min_similarity: float = 0.2) -> List[Dict]:
     if index is None or not corpus:
         return []
-    
+
     try:
-        # Stage 1: Expand query for better search
-        expanded_query = expand_query(query)
-        
-        # Stage 2: Generate query embedding
-        query_embeddings = embed_texts([expanded_query], project_id, location, credentials, batch_size=1, silent=True)
-        if query_embeddings.size == 0:
+        variations = generate_query_variations(query, model_name, project_id, location, credentials)
+        all_candidates, seen_indices = [], set()
+
+        base_k = min(MAX_CHUNKS_INITIAL, len(corpus))
+        initial_k = min(base_k * (DEEP_RETRIEVAL_MULTIPLIER if deep_mode else 1), len(corpus))
+        top_k = k * (DEEP_RETRIEVAL_MULTIPLIER if deep_mode else 1)
+
+        for variation in variations:
+            expanded = expand_query(variation)
+            query_vec = embed_texts([expanded], project_id, location, credentials, batch_size=1, silent=True)
+            if query_vec.size == 0:
+                continue
+
+            faiss.normalize_L2(query_vec)
+            scores, indices = index.search(query_vec, initial_k)
+
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < len(corpus) and score >= min_similarity and idx not in seen_indices:
+                    seen_indices.add(idx)
+                    all_candidates.append({**corpus[idx], "similarity_score": float(score), "query_source": variation})
+
+        if not all_candidates:
             return []
-        
-        # Normalize query embedding
-        faiss.normalize_L2(query_embeddings)
-        
-        # Stage 3: Retrieve many candidates
-        initial_k = min(MAX_CHUNKS_INITIAL, len(corpus))
-        scores, indices = index.search(query_embeddings, initial_k)
-        
-        candidates = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < len(corpus) and score >= min_similarity:
-                candidates.append({
-                    **corpus[idx],
-                    "similarity_score": float(score)
-                })
-        
-        if not candidates:
-            return []
-        
-        # Stage 4: Re-rank using LLM for better relevance
-        reranked = rerank_chunks(query, candidates, model_name, project_id, location, credentials, top_k=k)
-        
+
+        all_candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
+        reranked = rerank_chunks(query, all_candidates, model_name, project_id, location, credentials, top_k=top_k)
         return reranked
-    
     except Exception as e:
         st.error(f"Search error: {e}")
         return []
 
-def load_index_and_corpus() -> tuple:
-    """Load existing FAISS index and corpus"""
+# ---- Index persistence ------------------------------------------------------
+def load_index_and_corpus():
     try:
         if INDEX_PATH.exists() and CORPUS_PATH.exists():
             index = faiss.read_index(str(INDEX_PATH))
-            with open(CORPUS_PATH, 'r') as f:
+            with open(CORPUS_PATH, "r") as f:
                 corpus = json.load(f)
             return index, corpus
     except Exception as e:
@@ -804,229 +754,164 @@ def load_index_and_corpus() -> tuple:
     return None, []
 
 def save_index_and_corpus(index, corpus: List[Dict]):
-    """Save FAISS index and corpus"""
     try:
         if index is not None:
             faiss.write_index(index, str(INDEX_PATH))
-        with open(CORPUS_PATH, 'w') as f:
+        with open(CORPUS_PATH, "w") as f:
             json.dump(corpus, f, indent=2)
     except Exception as e:
         st.error(f"Error saving index: {e}")
 
+# ---- KB processing ----------------------------------------------------------
 def process_kb_files(silent: bool = False) -> List[Dict]:
-    """Process all KB files and create corpus with image data extraction"""
-    corpus = []
-    
+    corpus: List[Dict] = []
+
     if not KB_DIR.exists():
         if not silent:
             st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
-    
+
     files = list(KB_DIR.iterdir())
-    # Only show file count during initial loading
-    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+    if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
         st.info(f"Found {len(files)} files in KB directory")
-    
+
     processed_files = 0
-    total_chunks_before_validation = 0
-    
     for file_path in files:
-        if file_path.is_file():
-            try:
-                if file_path.suffix.lower() == '.docx':
-                    text = extract_text_from_docx_bytes(file_path.read_bytes())
-                    if text.strip():
-                        chunks = chunk_text(text)
-                        for i, chunk in enumerate(chunks):
-                            corpus.append({
-                                "text": chunk,
+        if not file_path.is_file():
+            continue
+
+        try:
+            suffix = file_path.suffix.lower()
+            content = file_path.read_bytes()
+
+            if suffix == ".docx":
+                text = extract_text_from_docx_bytes(content)
+            elif suffix == ".doc":
+                text = extract_text_from_doc_bytes(content)
+            elif suffix == ".pdf":
+                text = extract_text_from_pdf_bytes(content)
+            elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
+                if file_path.stat().st_size == 0:
+                    processed_files += 1
+                    continue
+                text = extract_text_from_image_bytes(content)
+            else:
+                processed_files += 1
+                continue
+
+            if text.strip():
+                chunks = chunk_text(text)
+                for i, chunk in enumerate(chunks):
+                    corpus.append(
+                        {
+                            "text": chunk,
+                            "source": file_path.name,
+                            "chunk_id": i,
+                            "file_type": suffix,
+                        }
+                    )
+
+            if suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
+                try:
+                    structured_items = parse_report_data_from_ocr(text, file_path.name)
+                    for item in structured_items:
+                        searchable_text = " ".join(
+                            [
+                                f"Report: {item.get('report_type', 'Unknown')}",
+                                f"Customer: {item.get('customer_name', '')}",
+                                f"Contract: {item.get('contract', '')}",
+                                f"Stock: {item.get('stock_number', '')}",
+                                f"Make: {item.get('make', '')}",
+                                f"Model: {item.get('model', '')}",
+                                f"Type: {item.get('equipment_type', '')}",
+                                f"Year: {item.get('year', '')}",
+                                f"Serial: {item.get('serial', '')}",
+                                f"Days Overdue: {item.get('days_overdue', '')}",
+                                f"Date Out: {item.get('date_out', item.get('date_time_out', ''))}",
+                                f"Expected Due: {item.get('expected_due', '')}",
+                                f"Phone: {item.get('phone', '')}",
+                                f"Location: {item.get('location', '')}",
+                                f"Meter: {item.get('meter', '')}",
+                            ]
+                        )
+
+                        corpus.append(
+                            {
+                                "text": searchable_text.strip(),
                                 "source": file_path.name,
-                                "chunk_id": i,
-                                "file_type": file_path.suffix.lower()
-                            })
-                
-                elif file_path.suffix.lower() == '.doc':
-                    text = extract_text_from_doc_bytes(file_path.read_bytes())
-                    if text.strip():
-                        chunks = chunk_text(text)
-                        for i, chunk in enumerate(chunks):
-                            corpus.append({
-                                "text": chunk,
-                                "source": file_path.name,
-                                "chunk_id": i,
-                                "file_type": file_path.suffix.lower()
-                            })
-                
-                elif file_path.suffix.lower() == '.pdf':
-                    text = extract_text_from_pdf_bytes(file_path.read_bytes())
-                    if text.strip():
-                        chunks = chunk_text(text)
-                        for i, chunk in enumerate(chunks):
-                            corpus.append({
-                                "text": chunk,
-                                "source": file_path.name,
-                                "chunk_id": i,
-                                "file_type": file_path.suffix.lower()
-                            })
-                
-                elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
-                    file_size = file_path.stat().st_size
-                    if file_size == 0:
-                        continue
-                    
-                    try:
-                        ocr_text = extract_text_from_image_bytes(file_path.read_bytes())
-                        
-                        if ocr_text.strip():
-                            chunks = chunk_text(ocr_text)
-                            for i, chunk in enumerate(chunks):
-                                corpus.append({
-                                    "text": chunk,
-                                    "source": file_path.name,
-                                    "chunk_id": i,
-                                    "file_type": file_path.suffix.lower(),
-                                    "content_type": "ocr_text"
-                                })
-                            
-                            try:
-                                structured_data = parse_report_data_from_ocr(ocr_text, file_path.name)
-                                
-                                for data_item in structured_data:
-                                    searchable_text = f"Report: {data_item.get('report_type', 'Unknown')} "
-                                    if 'customer_name' in data_item:
-                                        searchable_text += f"Customer: {data_item['customer_name']} "
-                                    if 'contract' in data_item:
-                                        searchable_text += f"Contract: {data_item['contract']} "
-                                    if 'stock_number' in data_item:
-                                        searchable_text += f"Stock: {data_item['stock_number']} "
-                                    if 'make' in data_item:
-                                        searchable_text += f"Make: {data_item['make']} "
-                                    if 'model' in data_item:
-                                        searchable_text += f"Model: {data_item['model']} "
-                                    if 'equipment_type' in data_item:
-                                        searchable_text += f"Type: {data_item['equipment_type']} "
-                                    if 'year' in data_item:
-                                        searchable_text += f"Year: {data_item['year']} "
-                                    if 'serial' in data_item:
-                                        searchable_text += f"Serial: {data_item['serial']} "
-                                    if 'days_overdue' in data_item:
-                                        searchable_text += f"Days Overdue: {data_item['days_overdue']} "
-                                    if 'date_out' in data_item:
-                                        searchable_text += f"Date Out: {data_item['date_out']} "
-                                    if 'expected_due' in data_item:
-                                        searchable_text += f"Expected Due: {data_item['expected_due']} "
-                                    if 'date_time_out' in data_item:
-                                        searchable_text += f"Date/Time Out: {data_item['date_time_out']} "
-                                    if 'phone' in data_item:
-                                        searchable_text += f"Phone: {data_item['phone']} "
-                                    if 'location' in data_item:
-                                        searchable_text += f"Location: {data_item['location']} "
-                                    if 'meter' in data_item:
-                                        searchable_text += f"Meter: {data_item['meter']} "
-                                    
-                                    corpus.append({
-                                        "text": searchable_text,
-                                        "source": file_path.name,
-                                        "chunk_id": len(corpus),
-                                        "file_type": file_path.suffix.lower(),
-                                        "content_type": "structured_data",
-                                        "structured_data": data_item
-                                    })
-                                
-                            except Exception as e:
-                                pass
-                                
-                    except Exception as e:
-                        pass
-                
-            except Exception as e:
-                if not silent:
-                    st.error(f"Error processing {file_path.name}: {e}")
-        
+                                "chunk_id": len(corpus),
+                                "file_type": suffix,
+                                "content_type": "structured_data",
+                                "structured_data": item,
+                            }
+                        )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            if not silent:
+                st.error(f"Error processing {file_path.name}: {e}")
+
         processed_files += 1
-    
-    # Validate chunk sizes and split oversized ones
-    # Only show validation message during initial loading
-    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+
+    if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
         st.info("Validating chunk sizes...")
-    validated_corpus = []
-    oversized_chunks = 0
-    max_chunk_size = 0
-    total_chunks = len(corpus)
-    
+
+    validated, oversized, max_chunk_size = [], 0, 0
     for idx, item in enumerate(corpus):
         chunk_tokens = estimate_tokens(item["text"])
         max_chunk_size = max(max_chunk_size, chunk_tokens)
-        
+
         if chunk_tokens > 2000:
-            oversized_chunks += 1
-            if not silent and oversized_chunks <= 3 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+            oversized += 1
+            if not silent and oversized <= 3 and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
                 st.warning(f"Chunk {idx+1} from {item['source']} has {chunk_tokens} tokens - splitting")
-            
-            # Split the oversized chunk
-            sub_chunks = split_oversized_chunk(item["text"], max_tokens=2000)
-            for i, sub_chunk in enumerate(sub_chunks):
-                validated_corpus.append({
-                    **item,
-                    "text": sub_chunk,
-                    "chunk_id": f"{item['chunk_id']}_split_{i}"
-                })
+
+            sub_chunks = split_oversized_chunk(item["text"], 2000)
+            for i, sub in enumerate(sub_chunks):
+                validated.append({**item, "text": sub, "chunk_id": f"{item['chunk_id']}_split_{i}"})
         else:
-            validated_corpus.append(item)
-    
-    # Only show max chunk size during initial loading
-    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
+            validated.append(item)
+
+    if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
         st.info(f"Max chunk size found: {max_chunk_size} tokens")
-    
-    if not silent and oversized_chunks > 0 and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
-        st.warning(f"Split {oversized_chunks} oversized chunks into smaller pieces")
-    
-    # Only show success message during initial loading
-    if not silent and hasattr(st.session_state, 'kb_loading') and st.session_state.kb_loading:
-        st.success(f"Processed {processed_files} files, created {len(validated_corpus)} chunks (after validation)")
-    return validated_corpus
+        if oversized > 0:
+            st.warning(f"Split {oversized} oversized chunks into smaller pieces")
+        st.success(f"Processed {processed_files} files, created {len(validated)} chunks (after validation)")
+
+    return validated
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
-    """Extract conversation context from recent messages with token limiting"""
     if not messages or len(messages) < 2:
         return ""
-    
-    recent_messages = messages[-6:]
-    
-    context_parts = []
-    current_tokens = 0
-    
-    for msg in reversed(recent_messages):
-        role = msg["role"]
-        content = msg["content"]
-        msg_text = f"{role.capitalize()}: {content}"
-        msg_tokens = estimate_tokens(msg_text)
-        
-        if current_tokens + msg_tokens > max_tokens:
-            break
-        
-        context_parts.insert(0, msg_text)
-        current_tokens += msg_tokens
-    
-    return "\n".join(context_parts)
 
-# ---- Image Processing Functions ----
+    recent = messages[-6:]
+    context, current_tokens = [], 0
+    for msg in reversed(recent):
+        msg_text = f"{msg['role'].capitalize()}: {msg['content']}"
+        tokens = estimate_tokens(msg_text)
+        if current_tokens + tokens > max_tokens:
+            break
+        context.insert(0, msg_text)
+        current_tokens += tokens
+    return "\n".join(context)
+
+# ---- Image handling ---------------------------------------------------------
 def process_user_uploaded_image(image_bytes: bytes, query: str, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Process user uploaded image and generate response"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        
+
         mime_type = "image/jpeg"
-        if image_bytes.startswith(b'\x89PNG'):
+        if image_bytes.startswith(b"\x89PNG"):
             mime_type = "image/png"
-        elif image_bytes.startswith(b'GIF'):
+        elif image_bytes.startswith(b"GIF"):
             mime_type = "image/gif"
-        elif image_bytes.startswith(b'RIFF') and b'WEBP' in image_bytes[:12]:
+        elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:12]:
             mime_type = "image/webp"
-        
+
         image_part = Part.from_data(image_bytes, mime_type=mime_type)
-        
+
         prompt = f"""You are an HBS assistant helping dealership employees with NetView.
 
 SYSTEM CONTEXT:
@@ -1034,130 +919,85 @@ You operate inside HBS Systems' NetView — a dealership management system (DMS)
 
 Analyze this image and answer the user's question: {query}
 
-If this appears to be a screenshot or document related to HBS/NetView, provide detailed analysis using dealership terminology. If it's not related, politely explain that you specialize in HBS NetView assistance."""
-        
+If this appears to be a screenshot or document related to HBS/NetView, provide detailed analysis using dealership terminology. If it's not related, explain that you specialize in HBS NetView assistance."""
+
         response = model.generate_content([prompt, image_part])
         return response.text if response.text else "I couldn't analyze the image. Please try again."
-    
     except Exception as e:
         return f"Error analyzing image: {str(e)}"
 
-# ---- Semantic Analysis Functions ----
+# ---- Sentiment & intent -----------------------------------------------------
 def analyze_user_sentiment_and_intent(query: str, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> Dict:
-    """Use LLM to semantically analyze user sentiment and intent"""
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        
-        # Keep analysis prompt lean
+
         context_snippet = truncate_to_token_limit(conversation_context, 500)
-        
-        analysis_prompt = f"""Analyze the user's query semantically and provide comprehensive analysis.
+
+        prompt = f"""Analyze the user's query and classify intent, sentiment, context relevance, and escalation need.
 
 CONVERSATION CONTEXT:
 {context_snippet}
 
 USER QUERY: {query}
 
-Analyze and classify:
-
-1. INTENT: What is the user trying to accomplish?
-   - "greeting" - Hello, hi, good morning, etc.
-   - "farewell" - Goodbye, bye, see you later, etc.
-   - "question" - Asking for information
-   - "troubleshooting" - Having problems, things not working
-   - "clarification" - Needs more explanation, doesn't understand
-   - "alternative" - Asking for different methods/approaches
-   - "escalation" - Wants human help, frustrated, urgent
-   - "conversational" - Casual chat, compliments, small talk
-
-2. SENTIMENT: What is the user's emotional state?
-   - "positive" - Happy, satisfied, grateful
-   - "neutral" - Matter-of-fact, informational
-   - "frustrated" - Annoyed, confused, struggling
-   - "urgent" - Pressed for time, critical issue
-   - "negative" - Angry, disappointed, upset
-
-3. CONTEXT_RELEVANCE: How does this relate to previous conversation?
-   - "follow_up" - Building on previous topic
-   - "clarification" - Asking for more details on previous answer
-   - "correction" - Pointing out errors or inconsistencies
-   - "new_topic" - Completely new subject
-   - "continuation" - Same topic, different aspect
-
-4. ESCALATION_NEEDED: Does this indicate need for human assistance?
-   - Consider frustration level, complexity, repeated failures, explicit requests
-
-Respond with ONLY a JSON object:
-{{
-    "intent": "one_of_the_intents_above",
-    "sentiment": "one_of_the_sentiments_above", 
-    "context_relevance": "one_of_the_relevance_types_above",
-    "escalation_needed": true/false,
-    "confidence": 0.95,
-    "reasoning": "brief explanation of the analysis"
-}}"""
+Return JSON with keys intent, sentiment, context_relevance, escalation_needed, confidence, reasoning.
+"""
 
         response = model.generate_content(
-            analysis_prompt,
+            prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
                 max_output_tokens=300,
                 top_p=0.8,
-                top_k=40
-            )
+                top_k=40,
+            ),
         )
-        
+
         if response.text:
             try:
-                result = json.loads(response.text.strip())
-                return result
+                return json.loads(response.text.strip())
             except json.JSONDecodeError:
-                return {
-                    "intent": "question",
-                    "sentiment": "neutral",
-                    "context_relevance": "new_topic",
-                    "escalation_needed": False,
-                    "confidence": 0.5,
-                    "reasoning": "Failed to parse analysis response"
-                }
-        else:
-            return {
-                "intent": "question",
-                "sentiment": "neutral", 
-                "context_relevance": "new_topic",
-                "escalation_needed": False,
-                "confidence": 0.5,
-                "reasoning": "No response from analysis model"
-            }
-    
-    except Exception as e:
-        return {
-            "intent": "question",
-            "sentiment": "neutral",
-            "context_relevance": "new_topic", 
-            "escalation_needed": False,
-            "confidence": 0.3,
-            "reasoning": f"Analysis error: {str(e)}"
-        }
+                pass
+    except Exception:
+        pass
 
-def generate_semantic_response(query: str, context_chunks: List[Dict], user_analysis: Dict, conversation_context: str, model_name: str, project_id: str, location: str, credentials) -> str:
-    """Generate response using semantic understanding with optimized context"""
-    
-    # Build optimized context
-    context_text = build_optimized_context(context_chunks, max_tokens=MAX_CONTEXT_TOKENS)
-    
-    # Limit conversation context
+    return {
+        "intent": "question",
+        "sentiment": "neutral",
+        "context_relevance": "new_topic",
+        "escalation_needed": False,
+        "confidence": 0.3,
+        "reasoning": "Fallback classification",
+    }
+
+# ---- Response generation ----------------------------------------------------
+def generate_semantic_response(
+    query: str,
+    context_chunks: List[Dict],
+    user_analysis: Dict,
+    conversation_context: str,
+    model_name: str,
+    project_id: str,
+    location: str,
+    credentials,
+    deep_mode: bool,
+) -> str:
+    max_tokens = get_max_context_tokens(model_name)
+
+    if deep_mode:
+        context_chunks = cluster_chunks(context_chunks)
+
+    context_text = build_optimized_context(context_chunks, max_tokens=max_tokens)
+
     context_section = ""
     if conversation_context:
-        limited_conv_context = truncate_to_token_limit(conversation_context, 2000)
         context_section = f"""
 RECENT CONVERSATION CONTEXT:
-{limited_conv_context}
+{truncate_to_token_limit(conversation_context, 2000)}
 
 """
-    
-    # Build user analysis section
+
     analysis_section = f"""
 USER ANALYSIS:
 - Intent: {user_analysis.get('intent', 'unknown')}
@@ -1168,81 +1008,73 @@ USER ANALYSIS:
 - Reasoning: {user_analysis.get('reasoning', 'N/A')}
 
 """
-    
-    system_prompt = f"""You are an expert HBS assistant. Provide comprehensive, detailed answers that fully address the user's question.
+
+    system_prompt = f"""You are an expert HBS NetView assistant. Provide accurate, actionable answers.
 
 SYSTEM CONTEXT:
-You operate inside HBS Systems' NetView — a dealership management system (DMS) used by equipment dealers across agriculture, construction, and rental industries. 
-
-NetView manages every department of a dealership — Parts, Service, Rental, Sales, Accounting, and CRM — through integrated modules (NetView ECO, Service Connect, ECOM, DealerNow App, etc.). Users rely on NetView to look up part availability and pricing, check repair order status, schedule service jobs, quote rentals, manage invoices, and view customer or unit history. 
-
-Your purpose is to help dealership employees (e.g., parts clerks, service advisors, rental managers, accountants) quickly find information or complete tasks inside NetView. Always respond using dealership terminology (RO, unit, quote, part number, location, etc.) and stay within the context of HBS Systems' workflows.
+You operate inside HBS Systems' NetView — a DMS used by equipment dealers across agriculture, construction, and rental industries.
 
 {context_section}{analysis_section}KNOWLEDGE BASE CONTEXT:
 {context_text}
 
 USER QUESTION: {query}
 
-INSTRUCTIONS:
-1. **BE ACCURATE FIRST**: Carefully read and use ALL information from the knowledge base context above. This is your PRIMARY source of truth.
-2. **BE THOROUGH**: Extract and present relevant information from the KB context. Don't summarize too much - include specific details.
-3. **BE HELPFUL**: Provide complete answers with context, examples, and step-by-step guidance when available in the KB.
-4. **BE STRUCTURED**: Use clear formatting with:
-   - Direct answer to the question
-   - Detailed steps or information from the KB
-   - Specific examples, field names, or procedures mentioned in the KB
-   - Related information if relevant
-5. **ESCALATION**: If the KB context doesn't contain the answer, say "I don't have specific information about that in my knowledge base. Would you like me to connect you with an HBS Support Technician?"
+ANSWER STRUCTURE:
+1. **Direct Answer** – clear and concise
+2. **Supporting Details** – cite specifics from sources (Source: filename)
+3. **Steps/Procedures** – list if present
+4. **Examples/Data** – include field names, values, or terminology
+5. **Related Info** – mention useful related tips
 
-RESPONSE GUIDELINES:
-- Keep responses concise - aim for ~200 words unless the user asks for more detail or says "elaborate"
-- Read the KB context carefully - the answer is likely there
-- Use specific information, terms, and procedures from the KB context
-- Include field names, button locations, menu paths, or steps exactly as described in the KB
-- Use dealership terminology consistently (RO, unit, quote, part number, location, etc.)
-- Format responses clearly with bullet points and numbered lists for scannability
-- Provide the essential information first, then supporting details
-- If the user asks to "elaborate", "explain more", "give details", or similar, then provide fuller 400-600 word responses
-- If KB context has detailed steps, summarize them concisely unless user requests full details
+RULES:
+- Use only the knowledge base context.
+- Cite sources explicitly (Source: filename).
+- If info is missing, say so and offer escalation.
+- Avoid hallucinations.
 
-RESPONSE:"""
+LENGTH:
+- Default ~200 words.
+- Use bullets/numbered lists for clarity.
+"""
+
+    if deep_mode:
+        system_prompt += """
+MULTI-SOURCE INSTRUCTIONS:
+- Combine information across multiple documents.
+- Indicate which source provides each part.
+- Note gaps or conflicts clearly.
+"""
 
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        
+
         response = model.generate_content(
             system_prompt,
             generation_config=GenerationConfig(
                 temperature=0.1,
                 max_output_tokens=4096,
                 top_p=0.8,
-                top_k=40
-            )
+                top_k=40,
+            ),
         )
-        
-        # Check for response truncation or safety issues
-        if hasattr(response, 'candidates') and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, 'finish_reason'):
-                if candidate.finish_reason in ['SAFETY', 'MAX_TOKENS', 'LENGTH']:
-                    return f"{response.text}\n\n[Response truncated - ask me to continue or rephrase for a more concise answer]"
-        
-        return response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
-    
+
+        answer = response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
+        verification = verify_answer_quality(query, answer, context_chunks, model_name, project_id, location, credentials)
+
+        if verification.get("needs_improvement"):
+            answer += "\n\n*Note: Some details may require confirmation with HBS Support.*"
+
+        return answer
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
+# ---- Escalation -------------------------------------------------------------
 def escalate_to_live_agent(query: str, conversation_context: str, user_analysis: Dict) -> str:
-    """Escalate to live agent when bot cannot help"""
-    
-    confidence = user_analysis.get('confidence', 0)
-    
     conversation_summary = f"""
-CONVERSATION SUMMARY FOR LIVE AGENT:
-===============================
-
-USER'S CURRENT QUESTION: {query}
+CONVERSATION SUMMARY FOR LIVE AGENT
+===================================
+USER QUESTION: {query}
 
 CONVERSATION CONTEXT:
 {conversation_context}
@@ -1251,78 +1083,80 @@ USER ANALYSIS:
 - Intent: {user_analysis.get('intent', 'unknown')}
 - Sentiment: {user_analysis.get('sentiment', 'neutral')}
 - Context Relevance: {user_analysis.get('context_relevance', 'new_topic')}
-- Confidence: {confidence:.2f}
+- Confidence: {user_analysis.get('confidence', 0):.2f}
 - Reasoning: {user_analysis.get('reasoning', 'N/A')}
 
-ESCALATION REASON: Bot determined user needs human assistance based on semantic analysis.
-
-===============================
+Escalation triggered by bot.
+===================================
 """
-    
-    if "escalation_requests" not in st.session_state:
-        st.session_state.escalation_requests = []
-    
-    st.session_state.escalation_requests.append({
-        "timestamp": len(st.session_state.messages),
-        "query": query,
-        "conversation_summary": conversation_summary,
-        "user_analysis": user_analysis
-    })
-    
-    response_parts = [
-        "I understand you need additional assistance. Let me connect you with an HBS Support Technician.",
-        "",
-        "**Connecting you with an HBS Support Technician now...**",
-        "",
-        f"Your question: {query}",
-        "",
-        "**What to expect:**",
-        "- An HBS Support Technician will join the chat shortly",
-        "- They have access to additional resources and can provide specialized assistance",
-        "- Feel free to ask any follow-up questions once connected",
-        "",
-        f"**Reference ID:** ESC-{len(st.session_state.messages):04d}",
-        "",
-        "Please hold while I connect you with a support technician..."
-    ]
-    
-    return "\n".join(response_parts)
 
-# LangChain integration removed - using direct Vertex AI only
-
-# ---- Streamlit App ----
-def main():
-    st.set_page_config(
-        page_title="HBS Help Chatbot",
-        page_icon="🤖",
-        layout="wide"
+    st.session_state.setdefault("escalation_requests", []).append(
+        {
+            "timestamp": len(st.session_state.messages),
+            "query": query,
+            "conversation_summary": conversation_summary,
+            "user_analysis": user_analysis,
+        }
     )
-    
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "index" not in st.session_state:
-        st.session_state.index = None
-    if "corpus" not in st.session_state:
-        st.session_state.corpus = []
-    if "creds" not in st.session_state:
-        st.session_state.creds = None
-    if "project_id" not in st.session_state:
-        st.session_state.project_id = None
-    if "location" not in st.session_state:
-        st.session_state.location = None
-    if "model_name" not in st.session_state:
-        st.session_state.model_name = CANDIDATE_MODELS[0]
-    if "kb_loaded" not in st.session_state:
-        st.session_state.kb_loaded = False
-    if "kb_loading" not in st.session_state:
-        st.session_state.kb_loading = False
-    if "escalation_requests" not in st.session_state:
-        st.session_state.escalation_requests = []
-    if "last_kb_check" not in st.session_state:
-        st.session_state.last_kb_check = 0
 
-    # Initialize credentials
+    esc_id = f"ESC-{len(st.session_state.messages):04d}"
+    return "\n".join(
+        [
+            "I understand you need additional assistance. Let me connect you with an HBS Support Technician.",
+            "",
+            "**Connecting you with an HBS Support Technician now...**",
+            "",
+            f"Your question: {query}",
+            "",
+            "**What to expect:**",
+            "- An HBS Support Technician will join the chat shortly",
+            "- They have access to additional resources",
+            "",
+            f"**Reference ID:** {esc_id}",
+            "",
+            "Please hold while I connect you with a support technician...",
+        ]
+    )
+
+# ---- Source summarizer (new) ------------------------------------------------
+def summarize_sources(chunks: List[Dict]) -> List[Dict]:
+    summaries: Dict[str, Dict[str, float]] = {}
+    for chunk in chunks:
+        source = chunk.get("source", "Unknown")
+        entry = summaries.setdefault(
+            source,
+            {"source": source, "similarity": 0.0, "rerank": 0.0, "count": 0},
+        )
+        entry["similarity"] = max(entry["similarity"], chunk.get("similarity_score", 0.0))
+        entry["rerank"] = max(entry["rerank"], chunk.get("rerank_score", 0.0))
+        entry["count"] += 1
+
+    return sorted(
+        summaries.values(),
+        key=lambda x: (x["rerank"], x["similarity"]),
+        reverse=True,
+    )
+
+# ---- Streamlit app ----------------------------------------------------------
+def main():
+    st.set_page_config(page_title="HBS Help Chatbot", page_icon="🤖", layout="wide")
+
+    defaults = {
+        "messages": [],
+        "index": None,
+        "corpus": [],
+        "creds": None,
+        "project_id": None,
+        "location": None,
+        "model_name": CANDIDATE_MODELS[0],
+        "kb_loaded": False,
+        "kb_loading": False,
+        "escalation_requests": [],
+        "last_kb_check": 0,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
     try:
         sa_info = json.loads(st.secrets["google"]["credentials_json"])
         st.session_state.creds = service_account.Credentials.from_service_account_info(sa_info)
@@ -1332,28 +1166,28 @@ def main():
         st.error(f"Error loading credentials: {e}")
         st.stop()
 
-    # Initialize app
     @st.cache_resource
     def initialize_app():
-        """Initialize the app - load index or build from KB files"""
-        # Try to load existing index first
         index, corpus = load_index_and_corpus()
         if index is not None and corpus:
             return index, corpus, True
-        
-        # Build index from KB files (silent mode for cached function)
+
         corpus = process_kb_files(silent=True)
         if not corpus:
             return None, [], False
-        
-        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds, silent=True)
+
+        index, corpus = build_faiss_index(
+            corpus,
+            st.session_state.project_id,
+            st.session_state.location,
+            st.session_state.creds,
+            silent=True,
+        )
         if index is not None:
             save_index_and_corpus(index, corpus)
             return index, corpus, True
-        
         return None, [], False
 
-    # Initialize
     if not st.session_state.kb_loaded:
         st.session_state.kb_loading = True
         with st.spinner("Loading knowledge base..."):
@@ -1363,36 +1197,32 @@ def main():
             st.session_state.kb_loaded = loaded
             st.session_state.kb_loading = False
 
-    # Start database polling
-    if not st.session_state.get('polling_started', False):
+    if not st.session_state.get("polling_started", False):
         start_database_polling()
         st.session_state.polling_started = True
 
-    # Sidebar
+    # Sidebar -----------------------------------------------------------------
     with st.sidebar:
         st.header("HBS Help Chatbot")
-        
-        # Model selection
+
         st.subheader("Model Settings")
         st.session_state.model_name = st.selectbox(
             "Select Model",
             CANDIDATE_MODELS,
-            index=0,
-            key="model_select"
+            index=CANDIDATE_MODELS.index(st.session_state.model_name),
+            key="model_select",
         )
-        
-        # Show escalation requests
+
         if st.session_state.escalation_requests:
             st.subheader("📞 Live Agent Requests")
             for i, req in enumerate(st.session_state.escalation_requests):
-                with st.expander(f"Request #{i+1} - {req['query'][:50]}..."):
+                with st.expander(f"Request #{i + 1} - {req['query'][:50]}..."):
                     st.write(f"**Query:** {req['query']}")
                     st.write(f"**Intent:** {req['user_analysis'].get('intent', 'unknown') if req['user_analysis'] else 'unknown'}")
                     st.write(f"**Sentiment:** {req['user_analysis'].get('sentiment', 'unknown') if req['user_analysis'] else 'unknown'}")
                     st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
-        
-        # Rebuild index button
-        if st.button("🔄 Rebuild Index", key="rebuild_btn"):
+
+        if st.button("🔄 Rebuild Index"):
             INDEX_PATH.unlink(missing_ok=True)
             CORPUS_PATH.unlink(missing_ok=True)
             st.session_state.kb_loaded = False
@@ -1400,70 +1230,61 @@ def main():
             st.cache_resource.clear()
             st.success("Cache cleared! The page will reload to rebuild the knowledge base.")
             st.rerun()
-        
-        # Clear conversation button
-        if st.button("🗑️ Clear Conversation", key="clear_btn"):
+
+        if st.button("🗑️ Clear Conversation"):
             st.session_state.messages = []
             st.rerun()
 
-    # Main chat interface
+    # Main area ---------------------------------------------------------------
     st.title("HBS Help Chatbot")
-    
-    # Display welcome message if no messages yet
+
     if not st.session_state.messages:
         st.info("Hi! How can I help you today?")
-    
-    # Display chat messages
+
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
-            
-            # Display sources if available
             if "sources" in message and message["sources"]:
+                display_sources = summarize_sources(message["sources"])
                 with st.expander("📄 Sources"):
-                    for source in message["sources"][:15]:
-                        source_name = source['source']
-                        similarity = source['similarity_score']
-                        rerank = source.get('rerank_score', 'N/A')
-                        st.write(f"📄 {source_name} (sim: {similarity:.3f}, rerank: {rerank})")
-    
-    # Image upload section
+                    for src in display_sources:
+                        st.write(
+                            f"📄 {src['source']} "
+                            f"(chunks: {src['count']}, sim: {src['similarity']:.3f}, rerank: {src['rerank']:.3f})"
+                        )
+
     upload_key = f"image_uploader_{len(st.session_state.messages)}"
     uploaded_image = st.file_uploader(
         "📷 Upload Image for Analysis",
-        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff'],
-        key=upload_key
+        type=["png", "jpg", "jpeg", "webp", "bmp", "tiff"],
+        key=upload_key,
     )
-    
-    # Chat input
+
     if prompt := st.chat_input("Ask me anything about HBS systems..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
+
         if uploaded_image is not None:
             with st.spinner("Analyzing your image..."):
                 image_bytes = uploaded_image.read()
                 response = process_user_uploaded_image(
-                    image_bytes, 
-                    prompt, 
+                    image_bytes,
+                    prompt,
                     st.session_state.model_name,
                     st.session_state.project_id,
                     st.session_state.location,
-                    st.session_state.creds
+                    st.session_state.creds,
                 )
-                
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "timestamp": len(st.session_state.messages)
-                })
-            
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": response,
+                        "timestamp": len(st.session_state.messages),
+                    }
+                )
             st.rerun()
         else:
-            # Regular text processing with optimized retrieval
-            conversation_context = ""
-            if len(st.session_state.messages) > 1:
-                conversation_context = get_conversation_context(st.session_state.messages)
-            
+            conversation_context = get_conversation_context(st.session_state.messages)
+
             with st.spinner("Understanding your request..."):
                 user_analysis = analyze_user_sentiment_and_intent(
                     prompt,
@@ -1471,28 +1292,33 @@ def main():
                     st.session_state.model_name,
                     st.session_state.project_id,
                     st.session_state.location,
-                    st.session_state.creds
+                    st.session_state.creds,
                 )
-            
-            if user_analysis.get('escalation_needed', False):
+
+            if user_analysis.get("escalation_needed", False):
                 response = escalate_to_live_agent(prompt, conversation_context, user_analysis)
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response,
-                    "timestamp": len(st.session_state.messages)
-                })
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": response,
+                        "timestamp": len(st.session_state.messages),
+                    }
+                )
             else:
+                deep_mode = needs_deep_retrieval(prompt)
+
                 with st.spinner("Searching knowledge base..."):
                     context_chunks = search_index(
-                        prompt, 
-                        st.session_state.index, 
+                        prompt,
+                        st.session_state.index,
                         st.session_state.corpus,
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds,
-                        st.session_state.model_name
+                        st.session_state.model_name,
+                        deep_mode=deep_mode,
                     )
-                    
+
                     response = generate_semantic_response(
                         prompt,
                         context_chunks,
@@ -1501,16 +1327,19 @@ def main():
                         st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
-                        st.session_state.creds
+                        st.session_state.creds,
+                        deep_mode=deep_mode,
                     )
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": response,
-                        "sources": context_chunks,
-                        "timestamp": len(st.session_state.messages)
-                    })
-        
+
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": response,
+                            "sources": context_chunks,
+                            "timestamp": len(st.session_state.messages),
+                        }
+                    )
+
         st.rerun()
 
 if __name__ == "__main__":
