@@ -902,10 +902,9 @@ USER QUESTION: {query}
 
 RESPONSE GUIDELINES:
 1. **Direct Answer** first
-2. Cite supporting details with source names (Source: filename)
-3. List steps/procedures when present
-4. Include field names, values, dealership terminology
-5. Add related tips
+2. List steps/procedures when present
+3. Include field names, values, dealership terminology
+4. Add related tips
 
 RULES:
 - Use only the knowledge base context.
