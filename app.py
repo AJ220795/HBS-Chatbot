@@ -905,7 +905,7 @@ RESPONSE GUIDELINES:
 2. List steps/procedures when present
 3. Include field names, values, dealership terminology
 4. Add related tips
-5. It is possible that the complete answer to a question lies across several different documents – each step in a document related to another in a different document. 
+5. It is possible that the complete answer to a question lies across several different documents – each step in a document related to another in a different document with a lower similarity score. 
    If that is the case, make sure you stitch together different parts of the answer from different documents and provide the complete answer to the user.
 6. Accuracy takes priority over length of answer.
 
