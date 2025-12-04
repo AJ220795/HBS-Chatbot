@@ -911,7 +911,7 @@ RESPONSE GUIDELINES:
 
 RULES:
 - Use only the knowledge base context.
-- If info is missing, say it is not avaialble in your resources and offer escalation.
+- If info is missing, say so and offer escalation.
 - Avoid hallucinations.
 
 Length ≈200 words. Use bullets/numbered lists."""
