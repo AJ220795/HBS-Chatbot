@@ -1272,7 +1272,7 @@ USER ANALYSIS:
 - Confidence: {user_analysis.get('confidence', 0):.2f}
 - Reasoning: {user_analysis.get('reasoning', 'N/A')}
 """
-    system_prompt = f"""You are an expert HBS NetView assistant. Provide accurate, actionable answers.
+    system_prompt = f"""You are an expert HBS NetView assistant. Provide accurate, actionable, and comprehensive answers.
 
 SYSTEM CONTEXT:
 You operate inside HBS Systems' NetView — a DMS for equipment dealerships.
@@ -1285,28 +1285,32 @@ KNOWLEDGE BASE CONTEXT:
 USER QUESTION: {query}
 
 RESPONSE GUIDELINES:
-1. **Direct Answer** first
-2. List steps/procedures when present
-3. Include field names, values, dealership terminology
-4. Add related tips
-5. It is possible that the complete answer to a question lies across several different documents – each step in a document related to another in a different document with a lower similarity score. 
-   If that is the case, make sure you stitch together different parts of the answer from different documents and provide the complete answer to the user.
-6. Accuracy takes priority over length of answer.
+1. **Direct Answer** first - provide a clear, direct response to the question
+2. **Detailed Explanation** - elaborate on the answer with relevant details from the context
+3. **Steps/Procedures** - when present, list all steps in detail with specific field names, screen names, and values
+4. **Examples** - include specific examples, field names, values, and dealership terminology when available
+5. **Related Information** - add related tips, warnings, or important notes that might be helpful
+6. **Multi-Document Integration** - it is possible that the complete answer to a question lies across several different documents. Each step in one document may relate to another in a different document. If that is the case, make sure you stitch together different parts of the answer from different documents and provide the complete, comprehensive answer to the user.
+7. **Accuracy Priority** - accuracy takes priority, but provide as much detail as is available in the context
 
 RULES:
-- Use only the knowledge base context.
-- If info is missing, say so and offer escalation.
-- Avoid hallucinations.
-
-Length ≈200 words. Use bullets/numbered lists."""
+- Use only the knowledge base context provided above
+- If information is missing or unclear, say so explicitly and offer escalation
+- Avoid hallucinations - only use information present in the context
+- Be thorough and comprehensive - aim for 400-600 words for detailed answers
+- Use bullets/numbered lists for clarity
+- Include all relevant details, field names, screen references, and specific terminology
+- When multiple documents contain related information, synthesize them into a cohesive answer"""
+    
     if deep_mode:
-        system_prompt += "\n\nMULTI-SOURCE INSTRUCTION: combine information across documents and credit each source.\n"
+        system_prompt += "\n\nMULTI-SOURCE INSTRUCTION: This is a complex query requiring information from multiple documents. Carefully combine information across all relevant documents, explain connections between different sources, and credit each source. Be comprehensive and detailed.\n"
+    
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
         response = model.generate_content(
             system_prompt,
-            generation_config=GenerationConfig(temperature=0.1, max_output_tokens=4096, top_p=0.8, top_k=40),
+            generation_config=GenerationConfig(temperature=0.1, max_output_tokens=8192, top_p=0.8, top_k=40),
         )
         answer = response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
         verification = verify_answer_quality(query, answer, context_chunks, model_name, project_id, location, credentials)
