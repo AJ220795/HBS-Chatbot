@@ -1477,7 +1477,7 @@ def main():
             st.write(f"- Chunks: {chunk_nodes}")
             st.write(f"Edges: {num_edges}")
 
-    st.title("HBS Help Chatbot (GraphRAG)")
+    st.title("HBS AI HelpDesk")
 
     if not st.session_state.messages:
         st.info("Hi! How can I help you today?")
