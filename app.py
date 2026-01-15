@@ -615,89 +615,134 @@ Return ONLY JSON array: ["entity1", "entity2", ...]
     entities.extend(re.findall(r"\b[A-Z0-9]{6,}\b", query))
     return entities
 
+def fallback_text_retrieval(query: str, corpus: List[Dict], top_k: int) -> List[Dict]:
+    """Fallback to text matching - improved with better scoring."""
+    query_lower = query.lower()
+    query_words = set([w for w in query_lower.split() if len(w) > 2])
+    results = []
+    
+    for item in corpus:
+        text_lower = item["text"].lower()
+        
+        # Count keyword matches
+        text_words = set([w for w in text_lower.split() if len(w) > 2])
+        common = query_words.intersection(text_words)
+        
+        if len(common) == 0:
+            continue
+        
+        # Better scoring: consider both word overlap and phrase matching
+        word_score = len(common) / max(len(query_words), 1)
+        
+        # Check for phrase matches (2+ consecutive words)
+        query_phrases = []
+        query_words_list = query_lower.split()
+        for i in range(len(query_words_list) - 1):
+            phrase = " ".join(query_words_list[i:i+2])
+            if len(phrase) > 5:
+                query_phrases.append(phrase)
+        
+        phrase_matches = sum(1 for phrase in query_phrases if phrase in text_lower)
+        phrase_score = phrase_matches / max(len(query_phrases), 1) * 0.3
+        
+        score = word_score + phrase_score
+        
+        if score > 0.05:  # Lower threshold
+            results.append({**item, "similarity_score": score})
+    
+    results.sort(key=lambda x: x["similarity_score"], reverse=True)
+    return results[:top_k]
+
 def graph_based_retrieval(query: str, graph: nx.DiGraph, corpus: List[Dict], 
                          model_name: str, project_id: str, location: str, credentials,
                          max_hops: int = MAX_GRAPH_HOPS, top_k: int = MAX_CHUNKS_FINAL) -> List[Dict]:
-    """Retrieve chunks using graph traversal from query entities."""
+    """Retrieve chunks using graph traversal from query entities, with text similarity fallback."""
     if graph is None or len(corpus) == 0:
-        return []
+        return fallback_text_retrieval(query, corpus, top_k)
     
     # Extract entities from query
     query_entities_str = extract_query_entities(query, model_name, project_id, location, credentials)
     
-    # Normalize entity format to match graph keys
+    # Also extract key terms from query for text matching
+    query_lower = query.lower()
+    query_terms = set([w for w in query_lower.split() if len(w) > 3])
+    
+    # Normalize entity format to match graph keys - use fuzzy matching
     query_entity_keys = []
     for ent_str in query_entities_str:
         # Try to match entity nodes in graph
         for node in graph.nodes():
             if graph.nodes[node].get("node_type") == "entity":
-                entity_name = graph.nodes[node].get("entity_name", "")
-                if ent_str.upper() in entity_name.upper() or entity_name.upper() in ent_str.upper():
+                entity_name = graph.nodes[node].get("entity_name", "").upper()
+                ent_upper = ent_str.upper()
+                # Exact match
+                if ent_upper in entity_name or entity_name in ent_upper:
+                    if node not in query_entity_keys:
+                        query_entity_keys.append(node)
+                # Fuzzy match - check if significant portion matches
+                elif len(ent_upper) > 4 and (ent_upper[:4] in entity_name or entity_name[:4] in ent_upper):
                     if node not in query_entity_keys:
                         query_entity_keys.append(node)
     
-    # Also search by substring matching for partial matches
-    for ent_str in query_entities_str:
+    # Also search by query terms in entity names (more flexible)
+    for term in query_terms:
         for node in graph.nodes():
             if graph.nodes[node].get("node_type") == "entity":
-                entity_name = graph.nodes[node].get("entity_name", "")
-                if entity_name and (ent_str.upper() in entity_name.upper() or entity_name.upper() in ent_str.upper()):
+                entity_name = graph.nodes[node].get("entity_name", "").lower()
+                if term in entity_name:
                     if node not in query_entity_keys:
                         query_entity_keys.append(node)
     
-    if not query_entity_keys:
-        # Fallback: search chunks directly by text similarity
-        return fallback_text_retrieval(query, corpus, top_k)
-    
-    # Graph traversal: start from query entities
+    # Graph traversal results
     retrieved_chunks = set()
     chunk_scores = defaultdict(float)
     
-    # Direct chunks connected to query entities
-    for entity_key in query_entity_keys:
-        if entity_key not in graph:
-            continue
-        
-        # Get chunks that contain this entity (reverse direction)
-        for neighbor in graph.neighbors(entity_key):
-            if graph.nodes[neighbor].get("node_type") == "chunk":
-                retrieved_chunks.add(neighbor)
-                chunk_scores[neighbor] += 2.0  # High score for direct match
-        # Also check incoming edges (chunk -> entity)
-        for predecessor in graph.predecessors(entity_key):
-            if graph.nodes[predecessor].get("node_type") == "chunk":
-                retrieved_chunks.add(predecessor)
-                chunk_scores[predecessor] += 2.0
-    
-    # Multi-hop: find related entities and their chunks
-    for entity_key in query_entity_keys:
-        if entity_key not in graph:
-            continue
-        
-        for hop in range(1, max_hops + 1):
-            try:
-                # Find all nodes within hop distance
-                paths = dict(nx.single_source_shortest_path_length(graph, entity_key, cutoff=hop))
-                for target_node, distance in paths.items():
-                    if distance > 0 and graph.nodes[target_node].get("node_type") == "chunk":
-                        retrieved_chunks.add(target_node)
-                        # Score decreases with hop distance
-                        score = 2.0 / (distance + 1)
-                        chunk_scores[target_node] += score
-                    
-                    # Also traverse through entity nodes to find related chunks
-                    if distance > 0 and graph.nodes[target_node].get("node_type") == "entity":
-                        # From this related entity, find its chunks
-                        for chunk_neighbor in graph.neighbors(target_node):
-                            if graph.nodes[chunk_neighbor].get("node_type") == "chunk":
-                                retrieved_chunks.add(chunk_neighbor)
-                                score = 1.5 / (distance + 2)
-                                chunk_scores[chunk_neighbor] += score
-            except Exception as e:
-                print(f"Error in graph traversal: {e}")
+    if query_entity_keys:
+        # Direct chunks connected to query entities
+        for entity_key in query_entity_keys:
+            if entity_key not in graph:
                 continue
+            
+            # Get chunks that contain this entity (reverse direction)
+            for neighbor in graph.neighbors(entity_key):
+                if graph.nodes[neighbor].get("node_type") == "chunk":
+                    retrieved_chunks.add(neighbor)
+                    chunk_scores[neighbor] += 2.0  # High score for direct match
+            # Also check incoming edges (chunk -> entity)
+            for predecessor in graph.predecessors(entity_key):
+                if graph.nodes[predecessor].get("node_type") == "chunk":
+                    retrieved_chunks.add(predecessor)
+                    chunk_scores[predecessor] += 2.0
+        
+        # Multi-hop: find related entities and their chunks
+        for entity_key in query_entity_keys:
+            if entity_key not in graph:
+                continue
+            
+            for hop in range(1, max_hops + 1):
+                try:
+                    # Find all nodes within hop distance
+                    paths = dict(nx.single_source_shortest_path_length(graph, entity_key, cutoff=hop))
+                    for target_node, distance in paths.items():
+                        if distance > 0 and graph.nodes[target_node].get("node_type") == "chunk":
+                            retrieved_chunks.add(target_node)
+                            # Score decreases with hop distance
+                            score = 2.0 / (distance + 1)
+                            chunk_scores[target_node] += score
+                        
+                        # Also traverse through entity nodes to find related chunks
+                        if distance > 0 and graph.nodes[target_node].get("node_type") == "entity":
+                            # From this related entity, find its chunks
+                            for chunk_neighbor in graph.neighbors(target_node):
+                                if graph.nodes[chunk_neighbor].get("node_type") == "chunk":
+                                    retrieved_chunks.add(chunk_neighbor)
+                                    score = 1.5 / (distance + 2)
+                                    chunk_scores[chunk_neighbor] += score
+                except Exception as e:
+                    print(f"Error in graph traversal: {e}")
+                    continue
     
-    # Convert chunk nodes to corpus items
+    # Convert chunk nodes to corpus items and add text similarity scores
     results = []
     for chunk_id in retrieved_chunks:
         # Parse chunk_id: source__chunk_id
@@ -720,41 +765,55 @@ def graph_based_retrieval(query: str, graph: nx.DiGraph, corpus: List[Dict],
                     except:
                         pass
                 
+                # Add text similarity score as well
+                text_lower = corpus_item["text"].lower()
+                text_terms = set([w for w in text_lower.split() if len(w) > 3])
+                text_score = len(query_terms.intersection(text_terms)) / max(len(query_terms), 1)
+                
+                # Combine graph score with text score
+                combined_score = chunk_scores[chunk_id] + (text_score * 0.5)
+                
                 results.append({
                     **corpus_item,
-                    "similarity_score": chunk_scores[chunk_id],
-                    "graph_hop": min_hop
+                    "similarity_score": combined_score,
+                    "graph_hop": min_hop,
+                    "graph_score": chunk_scores[chunk_id],
+                    "text_score": text_score
                 })
                 break
     
-    # Sort by score
+    # If graph retrieval didn't find enough results, supplement with text-based retrieval
+    if len(results) < top_k:
+        # Get text-based results
+        text_results = fallback_text_retrieval(query, corpus, top_k * 2)
+        
+        # Merge with graph results (avoid duplicates)
+        existing_signatures = {(r["source"], str(r["chunk_id"])) for r in results}
+        
+        for text_item in text_results:
+            sig = (text_item["source"], str(text_item["chunk_id"]))
+            if sig not in existing_signatures:
+                # Add with lower score since it wasn't in graph
+                results.append({
+                    **text_item,
+                    "similarity_score": text_item.get("similarity_score", 0.0) * 0.7,  # Penalty for not being in graph
+                    "graph_hop": 999,
+                    "graph_score": 0.0,
+                    "text_score": text_item.get("similarity_score", 0.0)
+                })
+                existing_signatures.add(sig)
+    
+    # If still no results, fall back entirely to text search
+    if not results:
+        return fallback_text_retrieval(query, corpus, top_k)
+    
+    # Sort by combined score
     results.sort(key=lambda x: (x["similarity_score"], -x.get("graph_hop", 999)), reverse=True)
     
     # Ensure source diversity
     diversified = diversify_chunks(results, lambda_param=0.7, top_k=top_k * 2)
     
     return diversified[:top_k * DEEP_RETRIEVAL_MULTIPLIER]
-
-def fallback_text_retrieval(query: str, corpus: List[Dict], top_k: int) -> List[Dict]:
-    """Fallback to simple text matching if graph retrieval fails."""
-    query_lower = query.lower()
-    results = []
-    
-    for item in corpus:
-        text_lower = item["text"].lower()
-        score = 0.0
-        
-        # Count keyword matches
-        query_words = set(query_lower.split())
-        text_words = set(text_lower.split())
-        common = query_words.intersection(text_words)
-        score = len(common) / max(len(query_words), 1)
-        
-        if score > 0.1:
-            results.append({**item, "similarity_score": score})
-    
-    results.sort(key=lambda x: x["similarity_score"], reverse=True)
-    return results[:top_k]
 
 # --- embeddings/index (keeping for reranking) ---------------------------------
 
@@ -1375,11 +1434,11 @@ def main():
     with st.sidebar:
         st.header("HBS Help Chatbot (GraphRAG)")
         st.subheader("Model Settings")
+        current_index = CANDIDATE_MODELS.index(st.session_state.model_name) if st.session_state.model_name in CANDIDATE_MODELS else 0
         st.session_state.model_name = st.selectbox(
             "Select Model",
             CANDIDATE_MODELS,
-            index=CANDIDATE_MODELS.index(st.session_state.model_name),
-            index=CANDIDATE_MODELS.index(st.session_state.model_name) if st.session_state.model_name in CANDIDATE_MODELS else 0,
+            index=current_index,
             key="model_select",
         )
         if st.session_state.escalation_requests:
