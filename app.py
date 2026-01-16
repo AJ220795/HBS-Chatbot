@@ -6,11 +6,11 @@ import time
 import threading
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple
 
 import streamlit as st
 import numpy as np
-import networkx as nx
+import faiss
 
 from google.oauth2 import service_account
 from vertexai import init as vertexai_init
@@ -29,8 +29,8 @@ APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
 KB_DIR = APP_DIR / "kb"
 EXTRACT_DIR = DATA_DIR / "kb_extracted"
+INDEX_PATH = DATA_DIR / "faiss.index"
 CORPUS_PATH = DATA_DIR / "corpus.json"
-GRAPH_PATH = DATA_DIR / "graph.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 KB_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,12 +40,12 @@ CANDIDATE_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-pro"]
 DEFAULT_LOCATION = "us-central1"
 
 MAX_CONTEXT_TOKENS = 150_000
-MAX_CHUNKS_INITIAL = 150
+MAX_CHUNKS_INITIAL = 250
 MAX_CHUNKS_FINAL = 15
 
 MULTI_QUERY_VARIATIONS = 3
 DEEP_RETRIEVAL_MULTIPLIER = 3
-REQUIRED_UNIQUE_SOURCES = 4
+REQUIRED_UNIQUE_SOURCES = 6
 
 MODEL_CONTEXT_LIMITS = {
     "gemini-2.5-flash-lite": 1_000_000,
@@ -58,11 +58,6 @@ DEEP_RETRIEVAL_KEYWORDS = [
     "all details", "comprehensive", "complete answer", "entire process",
     "different documents", "across", "multi-part", "split across",
 ]
-
-# Graph-specific constants
-MAX_GRAPH_HOPS = 3
-ENTITY_EXTRACTION_BATCH_SIZE = 10
-MIN_ENTITY_SIMILARITY = 0.3
 
 # --- background polling ------------------------------------------------------
 
@@ -172,11 +167,29 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
     return "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
 
 def extract_text_from_doc_bytes(b: bytes) -> str:
+    """Extract text from .doc files using multiple fallback methods."""
+    # Method 1: Try python-docx (sometimes works for older .doc if converted)
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(b))
+        text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
+        if text.strip():
+            return text
+    except Exception:
+        pass
+    
+    # Method 2: Try textract if available
     try:
         import textract
-        return textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
+        text = textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
+        if text.strip():
+            return text
     except ImportError:
         pass
+    except Exception:
+        pass
+    
+    # Method 3: Try antiword command line tool
     try:
         import subprocess, tempfile
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
@@ -184,9 +197,8 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
             tmp_path = tmp_file.name
         try:
             result = subprocess.run(["antiword", tmp_path], capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
-            return ""
         finally:
             try:
                 os.unlink(tmp_path)
@@ -194,11 +206,56 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                 pass
     except Exception:
         pass
+    
+    # Method 4: Try catdoc if available
+    try:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
+            tmp_file.write(b)
+            tmp_path = tmp_file.name
+        try:
+            result = subprocess.run(["catdoc", tmp_path], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+    
+    # Method 5: Try olefile for structured storage (better for .doc format)
+    try:
+        import olefile
+        file_obj = io.BytesIO(b)
+        if olefile.isOleFile(file_obj):
+            ole = olefile.OleFileIO(file_obj)
+            if ole.exists('WordDocument'):
+                stream = ole.openstream('WordDocument')
+                data = stream.read()
+                # Extract readable text from Word binary
+                text = "".join(chr(c) for c in data if 32 <= c < 127 or c in (10, 13, 9))
+                ole.close()
+                if text.strip() and len(text.strip()) > 50:
+                    return text.strip()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Method 6: Last resort - try to extract any readable text
     try:
         text = b.decode("utf-8", errors="ignore")
-        return "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
+        readable = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
+        if len(readable) > 100:  # Only return if we got substantial text
+            return readable
     except Exception:
-        return ""
+        pass
+    
+    # If all methods fail, log and return empty
+    print(f"Warning: Could not extract text from .doc file - all methods failed")
+    return ""
 
 def extract_text_from_pdf_bytes(b: bytes) -> str:
     try:
@@ -393,429 +450,7 @@ def parse_equipment_list_report(lines: List[str], filename: str) -> List[Dict]:
         )
     return data
 
-# --- GraphRAG: Entity Extraction ---------------------------------------------
-
-def extract_entities_from_text(text: str, model_name: str, project_id: str, location: str, credentials) -> List[Dict]:
-    """Extract entities and their types from text using LLM."""
-    try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
-        
-        prompt = f"""Extract all entities from this HBS NetView text. Return JSON array of objects with "name" and "type".
-
-Entity types should be one of: CUSTOMER, CONTRACT, EQUIPMENT, STOCK_NUMBER, SERIAL_NUMBER, MAKE, MODEL, PROCEDURE, SCREEN, FIELD, DOCUMENT_TYPE, DATE, PHONE, LOCATION
-
-Text:
-{truncate_to_token_limit(text, 2000)}
-
-Return ONLY JSON array: [{{"name": "entity name", "type": "ENTITY_TYPE"}}, ...]
-"""
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(temperature=0.1, max_output_tokens=1000),
-        )
-        
-        if response.text:
-            entities = json.loads(response.text.strip())
-            if isinstance(entities, list):
-                # Normalize and deduplicate
-                seen = set()
-                normalized = []
-                for ent in entities:
-                    if not isinstance(ent, dict):
-                        continue
-                    name = str(ent.get("name", "")).strip().upper()
-                    ent_type = str(ent.get("type", "")).strip().upper()
-                    if name and ent_type and (name, ent_type) not in seen:
-                        seen.add((name, ent_type))
-                        normalized.append({"name": name, "type": ent_type})
-                return normalized
-    except Exception as e:
-        print(f"Entity extraction error: {e}")
-    return []
-
-def extract_entities_batch(corpus: List[Dict], model_name: str, project_id: str, location: str, credentials, silent: bool = False) -> Dict[str, List[Dict]]:
-    """Extract entities from all chunks and map to chunk indices."""
-    chunk_entities = {}
-    
-    for i, chunk in enumerate(corpus):
-        if not silent and i % 10 == 0:
-            st.info(f"Extracting entities from chunk {i+1}/{len(corpus)}...")
-        
-        entities = extract_entities_from_text(
-            chunk["text"], model_name, project_id, location, credentials
-        )
-        chunk_entities[str(i)] = entities
-        
-        # Rate limiting
-        if i % ENTITY_EXTRACTION_BATCH_SIZE == 0 and i > 0:
-            time.sleep(0.5)
-    
-    return chunk_entities
-
-def extract_structured_entities(structured_data: Dict) -> List[Dict]:
-    """Extract entities from structured OCR data."""
-    entities = []
-    
-    if "customer_name" in structured_data and structured_data["customer_name"]:
-        entities.append({"name": structured_data["customer_name"].upper(), "type": "CUSTOMER"})
-    
-    if "contract" in structured_data and structured_data["contract"]:
-        entities.append({"name": structured_data["contract"].upper(), "type": "CONTRACT"})
-    
-    if "stock_number" in structured_data and structured_data["stock_number"]:
-        entities.append({"name": structured_data["stock_number"].upper(), "type": "STOCK_NUMBER"})
-    
-    if "serial" in structured_data and structured_data["serial"]:
-        entities.append({"name": structured_data["serial"].upper(), "type": "SERIAL_NUMBER"})
-    
-    if "make" in structured_data and structured_data["make"]:
-        entities.append({"name": structured_data["make"].upper(), "type": "MAKE"})
-    
-    if "model" in structured_data and structured_data["model"]:
-        entities.append({"name": structured_data["model"].upper(), "type": "MODEL"})
-    
-    if "equipment_type" in structured_data and structured_data["equipment_type"]:
-        entities.append({"name": structured_data["equipment_type"].upper(), "type": "EQUIPMENT"})
-    
-    return entities
-
-# --- GraphRAG: Graph Building -------------------------------------------------
-
-def build_knowledge_graph(corpus: List[Dict], chunk_entities: Dict[str, List[Dict]], project_id: str, location: str, credentials, model_name: str, silent: bool = False) -> nx.DiGraph:
-    """Build a knowledge graph from entities and chunks."""
-    G = nx.DiGraph()
-    
-    # Add chunk nodes
-    for i, chunk in enumerate(corpus):
-        chunk_id = f"{chunk['source']}__{chunk['chunk_id']}"
-        G.add_node(chunk_id, node_type="chunk", **chunk)
-    
-    # Add entity nodes and connect to chunks
-    entity_to_chunks = defaultdict(set)
-    chunk_to_entities = defaultdict(list)
-    
-    for chunk_idx_str, entities in chunk_entities.items():
-        chunk_idx = int(chunk_idx_str)
-        if chunk_idx >= len(corpus):
-            continue
-        
-        chunk = corpus[chunk_idx]
-        chunk_id = f"{chunk['source']}__{chunk['chunk_id']}"
-        
-        for entity in entities:
-            entity_key = f"{entity['type']}__{entity['name']}"
-            
-            # Add entity node
-            if not G.has_node(entity_key):
-                G.add_node(entity_key, node_type="entity", entity_type=entity["type"], entity_name=entity["name"])
-            
-            # Connect chunk to entity
-            if not G.has_edge(chunk_id, entity_key):
-                G.add_edge(chunk_id, entity_key, edge_type="contains", weight=1.0)
-                entity_to_chunks[entity_key].add(chunk_id)
-                chunk_to_entities[chunk_id].append(entity_key)
-    
-    # Add entity-entity relationships (co-occurrence and semantic)
-    if not silent:
-        st.info("Building entity relationships...")
-    
-    all_entities = list(set([f"{e['type']}__{e['name']}" for entities in chunk_entities.values() for e in entities]))
-    
-    # Co-occurrence edges: entities in same chunk are related
-    for chunk_id, entities in chunk_to_entities.items():
-        for i, ent1 in enumerate(entities):
-            for ent2 in entities[i+1:]:
-                if not G.has_edge(ent1, ent2):
-                    G.add_edge(ent1, ent2, edge_type="co_occurs", weight=1.0)
-                else:
-                    G[ent1][ent2]["weight"] += 1.0
-    
-    # Semantic relationships using LLM (sample a subset for performance)
-    entity_pairs = []
-    for i, ent1 in enumerate(all_entities[:50]):  # Limit for performance
-        for ent2 in all_entities[i+1:min(i+11, len(all_entities))]:  # Sample pairs
-            if G.has_edge(ent1, ent2) or G.has_edge(ent2, ent1):
-                continue
-            
-            # Check if entities appear in related chunks
-            ent1_chunks = entity_to_chunks.get(ent1, set())
-            ent2_chunks = entity_to_chunks.get(ent2, set())
-            
-            if ent1_chunks and ent2_chunks:
-                # Check if any chunk from ent1 is in same document as chunk from ent2
-                ent1_sources = {c.split("__")[0] for c in ent1_chunks}
-                ent2_sources = {c.split("__")[0] for c in ent2_chunks}
-                
-                if ent1_sources.intersection(ent2_sources):
-                    entity_pairs.append((ent1, ent2))
-    
-    # Add semantic relationships for selected pairs
-    for ent1, ent2 in entity_pairs[:20]:  # Limit LLM calls
-        try:
-            vertexai_init(project=project_id, location=location, credentials=credentials)
-            model = GenerativeModel(model_name)
-            
-            ent1_parts = ent1.split("__", 1)
-            ent2_parts = ent2.split("__", 1)
-            
-            prompt = f"""Do these two HBS NetView entities have a semantic relationship?
-
-Entity 1: {ent1_parts[1]} ({ent1_parts[0]})
-Entity 2: {ent2_parts[1]} ({ent2_parts[0]})
-
-Return JSON: {{"related": true/false, "relationship": "relationship type"}}
-Relationship types: HAS, BELONGS_TO, REFERENCES, PART_OF, SAME_AS, RELATED_TO
-"""
-            response = model.generate_content(
-                prompt,
-                generation_config=GenerationConfig(temperature=0.1, max_output_tokens=100),
-            )
-            
-            if response.text:
-                result = json.loads(response.text.strip())
-                if result.get("related"):
-                    rel_type = result.get("relationship", "RELATED_TO")
-                    G.add_edge(ent1, ent2, edge_type=rel_type, weight=0.8)
-        except Exception:
-            pass
-    
-    return G
-
-# --- GraphRAG: Graph Retrieval ------------------------------------------------
-
-def extract_query_entities(query: str, model_name: str, project_id: str, location: str, credentials) -> List[str]:
-    """Extract entities from user query."""
-    try:
-        vertexai_init(project=project_id, location=location, credentials=credentials)
-        model = GenerativeModel(model_name)
-        
-        prompt = f"""Extract all entities mentioned in this HBS NetView question. Return JSON array of entity names (strings).
-
-Question: {query}
-
-Return ONLY JSON array: ["entity1", "entity2", ...]
-"""
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(temperature=0.1, max_output_tokens=200),
-        )
-        
-        if response.text:
-            entities = json.loads(response.text.strip())
-            if isinstance(entities, list):
-                return [str(e).strip().upper() for e in entities if e]
-    except Exception:
-        pass
-    
-    # Fallback: extract obvious patterns
-    entities = []
-    entities.extend(re.findall(r"C\d+R", query))
-    entities.extend(re.findall(r"\b\d{5}\b", query))
-    entities.extend(re.findall(r"\b[A-Z0-9]{6,}\b", query))
-    return entities
-
-def fallback_text_retrieval(query: str, corpus: List[Dict], top_k: int) -> List[Dict]:
-    """Fallback to text matching - improved with better scoring."""
-    query_lower = query.lower()
-    query_words = set([w for w in query_lower.split() if len(w) > 2])
-    results = []
-    
-    for item in corpus:
-        text_lower = item["text"].lower()
-        
-        # Count keyword matches
-        text_words = set([w for w in text_lower.split() if len(w) > 2])
-        common = query_words.intersection(text_words)
-        
-        if len(common) == 0:
-            continue
-        
-        # Better scoring: consider both word overlap and phrase matching
-        word_score = len(common) / max(len(query_words), 1)
-        
-        # Check for phrase matches (2+ consecutive words)
-        query_phrases = []
-        query_words_list = query_lower.split()
-        for i in range(len(query_words_list) - 1):
-            phrase = " ".join(query_words_list[i:i+2])
-            if len(phrase) > 5:
-                query_phrases.append(phrase)
-        
-        phrase_matches = sum(1 for phrase in query_phrases if phrase in text_lower)
-        phrase_score = phrase_matches / max(len(query_phrases), 1) * 0.3
-        
-        score = word_score + phrase_score
-        
-        if score > 0.05:  # Lower threshold
-            results.append({**item, "similarity_score": score})
-    
-    results.sort(key=lambda x: x["similarity_score"], reverse=True)
-    return results[:top_k]
-
-def graph_based_retrieval(query: str, graph: nx.DiGraph, corpus: List[Dict], 
-                         model_name: str, project_id: str, location: str, credentials,
-                         max_hops: int = MAX_GRAPH_HOPS, top_k: int = MAX_CHUNKS_FINAL) -> List[Dict]:
-    """Retrieve chunks using graph traversal from query entities, with text similarity fallback."""
-    if graph is None or len(corpus) == 0:
-        return fallback_text_retrieval(query, corpus, top_k)
-    
-    # Extract entities from query
-    query_entities_str = extract_query_entities(query, model_name, project_id, location, credentials)
-    
-    # Also extract key terms from query for text matching
-    query_lower = query.lower()
-    query_terms = set([w for w in query_lower.split() if len(w) > 3])
-    
-    # Normalize entity format to match graph keys - use fuzzy matching
-    query_entity_keys = []
-    for ent_str in query_entities_str:
-        # Try to match entity nodes in graph
-        for node in graph.nodes():
-            if graph.nodes[node].get("node_type") == "entity":
-                entity_name = graph.nodes[node].get("entity_name", "").upper()
-                ent_upper = ent_str.upper()
-                # Exact match
-                if ent_upper in entity_name or entity_name in ent_upper:
-                    if node not in query_entity_keys:
-                        query_entity_keys.append(node)
-                # Fuzzy match - check if significant portion matches
-                elif len(ent_upper) > 4 and (ent_upper[:4] in entity_name or entity_name[:4] in ent_upper):
-                    if node not in query_entity_keys:
-                        query_entity_keys.append(node)
-    
-    # Also search by query terms in entity names (more flexible)
-    for term in query_terms:
-        for node in graph.nodes():
-            if graph.nodes[node].get("node_type") == "entity":
-                entity_name = graph.nodes[node].get("entity_name", "").lower()
-                if term in entity_name:
-                    if node not in query_entity_keys:
-                        query_entity_keys.append(node)
-    
-    # Graph traversal results
-    retrieved_chunks = set()
-    chunk_scores = defaultdict(float)
-    
-    if query_entity_keys:
-        # Direct chunks connected to query entities
-        for entity_key in query_entity_keys:
-            if entity_key not in graph:
-                continue
-            
-            # Get chunks that contain this entity (reverse direction)
-            for neighbor in graph.neighbors(entity_key):
-                if graph.nodes[neighbor].get("node_type") == "chunk":
-                    retrieved_chunks.add(neighbor)
-                    chunk_scores[neighbor] += 2.0  # High score for direct match
-            # Also check incoming edges (chunk -> entity)
-            for predecessor in graph.predecessors(entity_key):
-                if graph.nodes[predecessor].get("node_type") == "chunk":
-                    retrieved_chunks.add(predecessor)
-                    chunk_scores[predecessor] += 2.0
-        
-        # Multi-hop: find related entities and their chunks
-        for entity_key in query_entity_keys:
-            if entity_key not in graph:
-                continue
-            
-            for hop in range(1, max_hops + 1):
-                try:
-                    # Find all nodes within hop distance
-                    paths = dict(nx.single_source_shortest_path_length(graph, entity_key, cutoff=hop))
-                    for target_node, distance in paths.items():
-                        if distance > 0 and graph.nodes[target_node].get("node_type") == "chunk":
-                            retrieved_chunks.add(target_node)
-                            # Score decreases with hop distance
-                            score = 2.0 / (distance + 1)
-                            chunk_scores[target_node] += score
-                        
-                        # Also traverse through entity nodes to find related chunks
-                        if distance > 0 and graph.nodes[target_node].get("node_type") == "entity":
-                            # From this related entity, find its chunks
-                            for chunk_neighbor in graph.neighbors(target_node):
-                                if graph.nodes[chunk_neighbor].get("node_type") == "chunk":
-                                    retrieved_chunks.add(chunk_neighbor)
-                                    score = 1.5 / (distance + 2)
-                                    chunk_scores[chunk_neighbor] += score
-                except Exception as e:
-                    print(f"Error in graph traversal: {e}")
-                    continue
-    
-    # Convert chunk nodes to corpus items and add text similarity scores
-    results = []
-    for chunk_id in retrieved_chunks:
-        # Parse chunk_id: source__chunk_id
-        parts = chunk_id.split("__", 1)
-        if len(parts) != 2:
-            continue
-        
-        source, chunk_id_str = parts
-        
-        # Find matching corpus item
-        for idx, corpus_item in enumerate(corpus):
-            if corpus_item["source"] == source and str(corpus_item["chunk_id"]) == chunk_id_str:
-                # Calculate min hop distance
-                min_hop = 999
-                for eq in query_entity_keys:
-                    try:
-                        if nx.has_path(graph, eq, chunk_id) or nx.has_path(graph, chunk_id, eq):
-                            path_length = nx.shortest_path_length(graph, eq, chunk_id) if nx.has_path(graph, eq, chunk_id) else nx.shortest_path_length(graph, chunk_id, eq)
-                            min_hop = min(min_hop, path_length)
-                    except:
-                        pass
-                
-                # Add text similarity score as well
-                text_lower = corpus_item["text"].lower()
-                text_terms = set([w for w in text_lower.split() if len(w) > 3])
-                text_score = len(query_terms.intersection(text_terms)) / max(len(query_terms), 1)
-                
-                # Combine graph score with text score
-                combined_score = chunk_scores[chunk_id] + (text_score * 0.5)
-                
-                results.append({
-                    **corpus_item,
-                    "similarity_score": combined_score,
-                    "graph_hop": min_hop,
-                    "graph_score": chunk_scores[chunk_id],
-                    "text_score": text_score
-                })
-                break
-    
-    # If graph retrieval didn't find enough results, supplement with text-based retrieval
-    if len(results) < top_k:
-        # Get text-based results
-        text_results = fallback_text_retrieval(query, corpus, top_k * 2)
-        
-        # Merge with graph results (avoid duplicates)
-        existing_signatures = {(r["source"], str(r["chunk_id"])) for r in results}
-        
-        for text_item in text_results:
-            sig = (text_item["source"], str(text_item["chunk_id"]))
-            if sig not in existing_signatures:
-                # Add with lower score since it wasn't in graph
-                results.append({
-                    **text_item,
-                    "similarity_score": text_item.get("similarity_score", 0.0) * 0.7,  # Penalty for not being in graph
-                    "graph_hop": 999,
-                    "graph_score": 0.0,
-                    "text_score": text_item.get("similarity_score", 0.0)
-                })
-                existing_signatures.add(sig)
-    
-    # If still no results, fall back entirely to text search
-    if not results:
-        return fallback_text_retrieval(query, corpus, top_k)
-    
-    # Sort by combined score
-    results.sort(key=lambda x: (x["similarity_score"], -x.get("graph_hop", 999)), reverse=True)
-    
-    # Ensure source diversity
-    diversified = diversify_chunks(results, lambda_param=0.7, top_k=top_k * 2)
-    
-    return diversified[:top_k * DEEP_RETRIEVAL_MULTIPLIER]
-
-# --- embeddings/index (keeping for reranking) ---------------------------------
+# --- embeddings/index --------------------------------------------------------
 
 def embed_texts(texts: List[str], project_id: str, location: str, credentials, silent: bool = False) -> np.ndarray:
     try:
@@ -875,31 +510,202 @@ def embed_texts(texts: List[str], project_id: str, location: str, credentials, s
             st.error(f"Embedding error: {e}")
         return np.array([])
 
+def build_faiss_index(corpus: List[Dict], project_id: str, location: str, credentials, silent: bool = False) -> Tuple[faiss.IndexFlatIP, List[Dict]]:
+    if not corpus:
+        return None, []
+    texts = [item["text"] for item in corpus]
+    embeddings = embed_texts(texts, project_id, location, credentials, silent=silent)
+    if embeddings.size == 0:
+        return None, []
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings)
+    return index, corpus
+
 # --- retrieval helpers -------------------------------------------------------
 
+def expand_query(query: str) -> str:
+    q = query.lower()
+    if "overdue" in q:
+        return f"{query} overdue equipment report rental"
+    if "outbound" in q:
+        return f"{query} outbound report rental equipment"
+    if "equipment" in q:
+        return f"{query} equipment list rental"
+    if "customer" in q:
+        return f"{query} customer contract phone"
+    if "stock" in q:
+        return f"{query} stock number equipment"
+    if "serial" in q:
+        return f"{query} serial number equipment"
+    return query
+
+def decompose_complex_query(query: str, model_name: str, project_id: str, location: str, credentials) -> List[str]:
+    """Break down complex queries into sub-queries to find different aspects across documents."""
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        
+        prompt = f"""Given this question about HBS NetView, break it into {MULTI_QUERY_VARIATIONS + 2} separate search queries that target different aspects, documents, or steps.
+Each sub-query should use different terminology that might appear in different documents.
+
+Original question: {query}
+
+Return ONLY a JSON array of strings, each targeting a different aspect, document type, procedure step, or data source.
+Be specific about different procedures, documents, screens, processes, or related concepts.
+"""
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(temperature=0.6, max_output_tokens=400),
+        )
+        
+        if response.text:
+            sub_queries = json.loads(response.text.strip())
+            if isinstance(sub_queries, list) and len(sub_queries) > 1:
+                return [query] + [q for q in sub_queries if isinstance(q, str) and q.strip()][:MULTI_QUERY_VARIATIONS + 2]
+    except Exception as e:
+        print(f"Query decomposition error: {e}")
+    return [query]
+
+def generate_query_variations(query: str, model_name: str, project_id: str, location: str, credentials) -> List[str]:
+    try:
+        vertexai_init(project=project_id, location=location, credentials=credentials)
+        model = GenerativeModel(model_name)
+        prompt = f"""Generate {MULTI_QUERY_VARIATIONS} alternative search queries that might fetch different HBS NetView documents.
+
+Original query: {query}
+
+Return ONLY a JSON array of strings.
+"""
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(temperature=0.5, max_output_tokens=200),
+        )
+        if response.text:
+            variations = json.loads(response.text.strip())
+            if isinstance(variations, list):
+                variations = [v for v in variations if isinstance(v, str) and v.strip()]
+                return [query] + variations[:MULTI_QUERY_VARIATIONS]
+    except Exception:
+        pass
+    return [query]
+
 def needs_deep_retrieval(query: str) -> bool:
+    """Detect queries that need information from multiple documents."""
     lowered = query.lower()
-    return any(keyword in lowered for keyword in DEEP_RETRIEVAL_KEYWORDS)
+    
+    # Existing keywords
+    if any(keyword in lowered for keyword in DEEP_RETRIEVAL_KEYWORDS):
+        return True
+    
+    # Additional patterns for multi-document queries
+    multi_doc_patterns = [
+        r"across\s+(multiple|several|different|various)",
+        r"(both|all|each|every)\s+\w+\s+and",
+        r"compare",
+        r"difference",
+        r"relation",
+        r"related to",
+        r"following.*and",
+        r"multiple steps",
+        r"different.*documents?",
+        r"several.*sources?",
+        r"step.*step",
+        r"\d+\s+and\s+\d+",
+    ]
+    
+    if any(re.search(pattern, lowered) for pattern in multi_doc_patterns):
+        return True
+    
+    # If question has multiple parts
+    clause_markers = r"\s+(and|then|after|before|when|also|plus)\s+"
+    if len(re.split(clause_markers, lowered)) > 2:
+        return True
+    
+    return False
+
+def find_connected_documents(seed_chunks: List[Dict], corpus: List[Dict], 
+                             project_id: str, location: str, credentials, index) -> List[Dict]:
+    """Find documents that share entities/concepts with already-retrieved chunks."""
+    if not seed_chunks or len(seed_chunks) == 0 or index is None:
+        return []
+    
+    try:
+        # Extract key terms from seed chunks
+        seed_texts = [chunk["text"][:500] for chunk in seed_chunks[:10]]
+        
+        # Get embeddings for seed chunks
+        query_vec = embed_texts(seed_texts, project_id, location, credentials, silent=True)
+        if query_vec.size == 0:
+            return []
+        
+        # Average embeddings to find related documents
+        avg_query = np.mean(query_vec, axis=0).reshape(1, -1)
+        faiss.normalize_L2(avg_query)
+        
+        k_connected = min(50, len(corpus))
+        scores, indices = index.search(avg_query, k_connected)
+        
+        connected = []
+        seen_sources = {chunk["source"] for chunk in seed_chunks}
+        
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < len(corpus) and score >= 0.15:
+                candidate = corpus[idx]
+                if candidate["source"] not in seen_sources or len(seen_sources) < 5:
+                    connected.append({
+                        **candidate,
+                        "similarity_score": float(score),
+                        "query_source": "connected_doc",
+                        "connection_type": "semantic_bridge"
+                    })
+                    seen_sources.add(candidate["source"])
+        
+        return connected
+    except Exception as e:
+        print(f"Error finding connected documents: {e}")
+    return []
 
 def diversify_chunks(candidates: List[Dict], lambda_param: float, top_k: int) -> List[Dict]:
+    """MMR-style diversification with better source balancing."""
+    if not candidates:
+        return []
+    
     selected: List[Dict] = []
-    used_sources = set()
+    used_sources = defaultdict(int)
     pool = candidates[:]
+    
+    # Calculate max chunks per source based on diversity of sources
+    unique_sources = len(set(c["source"] for c in candidates[:50]))
+    max_per_source = max(1, top_k // max(3, unique_sources // 2))
+    
     while pool and len(selected) < top_k:
         best_idx, best_score, best_chunk = None, -float("inf"), None
+        
         for idx, chunk in enumerate(pool):
-            base = chunk.get("similarity_score", 0.0)
-            penalty = 0.0
-            if chunk["source"] in used_sources:
-                penalty = (1 - lambda_param) * 0.6
-            score = lambda_param * base - penalty
+            base_score = chunk.get("similarity_score", 0.0)
+            
+            # Penalty for over-represented sources
+            source_count = used_sources[chunk["source"]]
+            if source_count >= max_per_source:
+                penalty = (1 - lambda_param) * 1.0
+            elif chunk["source"] in used_sources:
+                penalty = (1 - lambda_param) * 0.4 * (source_count / max_per_source)
+            else:
+                penalty = 0.0
+            
+            score = lambda_param * base_score - penalty
+            
             if score > best_score:
                 best_idx, best_score, best_chunk = idx, score, chunk
+        
         if best_chunk is None:
             break
+        
         selected.append(best_chunk)
-        used_sources.add(best_chunk["source"])
+        used_sources[best_chunk["source"]] += 1
         pool.pop(best_idx)
+    
     return selected
 
 def ensure_source_diversity(chunks: List[Dict], candidates: List[Dict], min_sources: int) -> List[Dict]:
@@ -973,15 +779,16 @@ def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: s
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        snippet = "\n".join(f"[{i}] {chunk['text'][:600]}" for i, chunk in enumerate(chunks[:50]))
-        prompt = f"""Score chunk relevance to query on 0-10 scale.
+        snippet = "\n".join(f"[{i}] Source: {chunk.get('source', 'Unknown')}\n{chunk['text'][:600]}" for i, chunk in enumerate(chunks[:50]))
+        prompt = f"""Score chunk relevance to query on 0-10 scale. Higher scores for chunks that help answer the complete question.
 
 QUERY: {query}
 
 CHUNKS:
 {snippet}
 
-Return JSON array of scores.
+Return JSON array of scores [score1, score2, ...] matching the order of chunks.
+Consider: direct relevance, completeness of information, and whether it complements other chunks.
 """
         response = model.generate_content(
             prompt,
@@ -1028,38 +835,130 @@ def build_optimized_context(chunks: List[Dict], max_tokens: int) -> str:
         current_tokens += chunk_tokens
     return "\n".join(context_parts)
 
+def search_index(query: str, index, corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, deep_mode: bool, k: int, min_similarity: float = 0.2) -> List[Dict]:
+    if index is None or not corpus:
+        return []
+    
+    try:
+        # For deep mode, use query decomposition instead of just variations
+        if deep_mode:
+            queries = decompose_complex_query(query, model_name, project_id, location, credentials)
+        else:
+            queries = generate_query_variations(query, model_name, project_id, location, credentials)
+        
+        all_candidates, seen_indices = [], set()
+        
+        # PASS 1: Initial retrieval with more candidates for deep mode
+        base_k = min(MAX_CHUNKS_INITIAL, len(corpus))
+        initial_k = min(base_k * (DEEP_RETRIEVAL_MULTIPLIER * 2 if deep_mode else 1), len(corpus))
+        
+        # Lower threshold for deep mode to catch more potentially relevant docs
+        similarity_threshold = min_similarity * 0.7 if deep_mode else min_similarity
+        
+        for query_variant in queries:
+            expanded = expand_query(query_variant)
+            query_vec = embed_texts([expanded], project_id, location, credentials, silent=True)
+            
+            if query_vec.size == 0:
+                continue
+            
+            faiss.normalize_L2(query_vec)
+            scores, indices = index.search(query_vec, initial_k)
+            
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < len(corpus) and score >= similarity_threshold and idx not in seen_indices:
+                    seen_indices.add(idx)
+                    all_candidates.append({
+                        **corpus[idx], 
+                        "similarity_score": float(score), 
+                        "query_source": query_variant
+                    })
+        
+        if not all_candidates:
+            return []
+        
+        # PASS 2: For deep mode, find documents connected to already-retrieved ones
+        if deep_mode and len(all_candidates) > 0:
+            connected_candidates = find_connected_documents(
+                all_candidates[:20],
+                corpus,
+                project_id,
+                location,
+                credentials,
+                index
+            )
+            
+            # Add connected candidates (avoid duplicates)
+            existing_sigs = {(c["source"], str(c.get("chunk_id", ""))) for c in all_candidates}
+            for conn in connected_candidates:
+                sig = (conn["source"], str(conn.get("chunk_id", "")))
+                if sig not in existing_sigs:
+                    all_candidates.append(conn)
+                    existing_sigs.add(sig)
+        
+        # Sort by similarity
+        all_candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
+        
+        # Diversify with more emphasis on source diversity in deep mode
+        lambda_param = 0.6 if deep_mode else 0.75
+        diversified_k = k * (DEEP_RETRIEVAL_MULTIPLIER * 2 if deep_mode else 1)
+        
+        diversified = diversify_chunks(
+            all_candidates,
+            lambda_param=lambda_param,
+            top_k=diversified_k,
+        )
+        
+        # Rerank but keep more candidates
+        rerank_k = len(diversified) if deep_mode else min(k * 2, len(diversified))
+        reranked = rerank_chunks(
+            query,
+            diversified,
+            model_name,
+            project_id,
+            location,
+            credentials,
+            top_k=rerank_k,
+        )
+        
+        # Ensure source diversity with higher minimum for deep mode
+        min_sources = REQUIRED_UNIQUE_SOURCES * 2 if deep_mode else 1
+        final = ensure_source_diversity(
+            reranked, 
+            diversified, 
+            min_sources=min_sources
+        )
+        
+        # Return more chunks for deep mode
+        return final[:k * (DEEP_RETRIEVAL_MULTIPLIER if deep_mode else 1)]
+        
+    except Exception as e:
+        st.error(f"Search error: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 # --- persistence -------------------------------------------------------------
 
 def load_index_and_corpus():
-    """Load corpus and graph (no FAISS index needed for GraphRAG)."""
     try:
-        corpus = []
-        if CORPUS_PATH.exists():
+        if INDEX_PATH.exists() and CORPUS_PATH.exists():
+            index = faiss.read_index(str(INDEX_PATH))
             with open(CORPUS_PATH, "r") as f:
                 corpus = json.load(f)
-        
-        graph = None
-        if GRAPH_PATH.exists():
-            graph_data = json.load(open(GRAPH_PATH, "r"))
-            graph = nx.node_link_graph(graph_data)
-        
-        return graph, corpus
+            return index, corpus
     except Exception as e:
-        st.error(f"Error loading graph/corpus: {e}")
+        st.error(f"Error loading index: {e}")
     return None, []
 
-def save_index_and_corpus(graph, corpus: List[Dict]):
-    """Save corpus and graph."""
+def save_index_and_corpus(index, corpus: List[Dict]):
     try:
+        if index is not None:
+            faiss.write_index(index, str(INDEX_PATH))
         with open(CORPUS_PATH, "w") as f:
             json.dump(corpus, f, indent=2)
-        
-        if graph is not None:
-            graph_data = nx.node_link_data(graph)
-            with open(GRAPH_PATH, "w") as f:
-                json.dump(graph_data, f, indent=2)
     except Exception as e:
-        st.error(f"Error saving graph/corpus: {e}")
+        st.error(f"Error saving index: {e}")
 
 # --- KB processing -----------------------------------------------------------
 
@@ -1085,6 +984,10 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
                 text = extract_text_from_docx_bytes(data)
             elif suffix == ".doc":
                 text = extract_text_from_doc_bytes(data)
+                if not text.strip():
+                    print(f"Warning: No text extracted from .doc file: {file_path.name}")
+                else:
+                    print(f"Successfully extracted {len(text)} characters from .doc file: {file_path.name}")
             elif suffix == ".pdf":
                 text = extract_text_from_pdf_bytes(data)
             elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
@@ -1153,32 +1056,6 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
         else:
             validated.append(item)
     return validated
-
-def build_graph_and_corpus(corpus: List[Dict], project_id: str, location: str, credentials, model_name: str, silent: bool = False) -> Tuple[nx.DiGraph, List[Dict]]:
-    """Build knowledge graph from corpus."""
-    if not corpus:
-        return None, []
-    
-    if not silent:
-        st.info("Extracting entities from documents...")
-    
-    # Extract entities from all chunks
-    chunk_entities = extract_entities_batch(corpus, model_name, project_id, location, credentials, silent=silent)
-    
-    # Add structured entities from OCR data
-    for i, chunk in enumerate(corpus):
-        if "structured_data" in chunk:
-            structured_entities = extract_structured_entities(chunk["structured_data"])
-            existing = chunk_entities.get(str(i), [])
-            chunk_entities[str(i)] = existing + structured_entities
-    
-    if not silent:
-        st.info("Building knowledge graph...")
-    
-    # Build graph
-    graph = build_knowledge_graph(corpus, chunk_entities, project_id, location, credentials, model_name, silent=silent)
-    
-    return graph, corpus
 
 def get_conversation_context(messages: List[Dict], max_tokens: int = 2000) -> str:
     if not messages or len(messages) < 2:
@@ -1381,11 +1258,11 @@ def summarize_sources(chunks: List[Dict]) -> List[Dict]:
 # --- main --------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="HBS AI HelpDesk", page_icon="🤖", layout="wide")
+    st.set_page_config(page_title="HBS Help Chatbot", page_icon="🤖", layout="wide")
 
     defaults = {
         "messages": [],
-        "graph": None,
+        "index": None,
         "corpus": [],
         "creds": None,
         "project_id": None,
@@ -1410,23 +1287,23 @@ def main():
 
     @st.cache_resource
     def initialize_app():
-        graph, corpus = load_index_and_corpus()
-        if graph is not None and corpus:
-            return graph, corpus, True
+        index, corpus = load_index_and_corpus()
+        if index is not None and corpus:
+            return index, corpus, True
         corpus = process_kb_files(silent=True)
         if not corpus:
             return None, [], False
-        graph, corpus = build_graph_and_corpus(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds, st.session_state.model_name, silent=True)
-        if graph is not None:
-            save_index_and_corpus(graph, corpus)
-            return graph, corpus, True
+        index, corpus = build_faiss_index(corpus, st.session_state.project_id, st.session_state.location, st.session_state.creds, silent=True)
+        if index is not None:
+            save_index_and_corpus(index, corpus)
+            return index, corpus, True
         return None, [], False
 
     if not st.session_state.kb_loaded:
         st.session_state.kb_loading = True
-        with st.spinner("Loading knowledge base and building graph... (This may take several minutes)"):
-            graph, corpus, loaded = initialize_app()
-            st.session_state.graph = graph
+        with st.spinner("Loading knowledge base..."):
+            index, corpus, loaded = initialize_app()
+            st.session_state.index = index
             st.session_state.corpus = corpus
             st.session_state.kb_loaded = loaded
             st.session_state.kb_loading = False
@@ -1436,7 +1313,7 @@ def main():
         st.session_state.polling_started = True
 
     with st.sidebar:
-        st.header("HBS AI HelpDesk")
+        st.header("HBS Help Chatbot")
         st.subheader("Model Settings")
         current_index = CANDIDATE_MODELS.index(st.session_state.model_name) if st.session_state.model_name in CANDIDATE_MODELS else 0
         st.session_state.model_name = st.selectbox(
@@ -1453,31 +1330,19 @@ def main():
                     st.write(f"**Intent:** {req['user_analysis'].get('intent', 'unknown')}")
                     st.write(f"**Sentiment:** {req['user_analysis'].get('sentiment', 'unknown')}")
                     st.write(f"**Reference ID:** ESC-{req['timestamp']:04d}")
-        if st.button("🔄 Rebuild Graph"):
-            GRAPH_PATH.unlink(missing_ok=True)
+        if st.button("🔄 Rebuild Index"):
+            INDEX_PATH.unlink(missing_ok=True)
             CORPUS_PATH.unlink(missing_ok=True)
             st.session_state.kb_loaded = False
             st.session_state.kb_loading = True
             st.cache_resource.clear()
-            st.success("Cache cleared! Rebuilding knowledge graph...")
+            st.success("Cache cleared! Rebuilding knowledge base...")
             st.rerun()
         if st.button("🗑️ Clear Conversation"):
             st.session_state.messages = []
             st.rerun()
-        
-        # Graph stats
-        if st.session_state.graph:
-            st.subheader("📊 Graph Stats")
-            num_nodes = st.session_state.graph.number_of_nodes()
-            num_edges = st.session_state.graph.number_of_edges()
-            entity_nodes = sum(1 for n in st.session_state.graph.nodes() if st.session_state.graph.nodes[n].get("node_type") == "entity")
-            chunk_nodes = num_nodes - entity_nodes
-            st.write(f"Nodes: {num_nodes}")
-            st.write(f"- Entities: {entity_nodes}")
-            st.write(f"- Chunks: {chunk_nodes}")
-            st.write(f"Edges: {num_edges}")
 
-    st.title("HBS AI HelpDesk")
+    st.title("HBS Help Chatbot")
 
     if not st.session_state.messages:
         st.info("Hi! How can I help you today?")
@@ -1531,30 +1396,18 @@ def main():
                 st.session_state.messages.append({"role": "assistant", "content": response, "timestamp": len(st.session_state.messages)})
             else:
                 deep_mode = needs_deep_retrieval(prompt)
-                with st.spinner("Searching knowledge graph..."):
-                    context_chunks = graph_based_retrieval(
+                with st.spinner("Searching knowledge base..."):
+                    context_chunks = search_index(
                         prompt,
-                        st.session_state.graph,
+                        st.session_state.index,
                         st.session_state.corpus,
-                        st.session_state.model_name,
                         st.session_state.project_id,
                         st.session_state.location,
                         st.session_state.creds,
-                        max_hops=MAX_GRAPH_HOPS,
-                        top_k=MAX_CHUNKS_FINAL,
+                        st.session_state.model_name,
+                        deep_mode=deep_mode,
+                        k=MAX_CHUNKS_FINAL,
                     )
-                    
-                    # Rerank results
-                    if context_chunks:
-                        context_chunks = rerank_chunks(
-                            prompt,
-                            context_chunks,
-                            st.session_state.model_name,
-                            st.session_state.project_id,
-                            st.session_state.location,
-                            st.session_state.creds,
-                            top_k=MAX_CHUNKS_FINAL * DEEP_RETRIEVAL_MULTIPLIER,
-                        )
 
                     response = generate_semantic_response(
                         prompt,
