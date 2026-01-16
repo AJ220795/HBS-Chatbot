@@ -160,109 +160,341 @@ def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
         sub_chunks.append(" ".join(current))
     return sub_chunks
 
+# --- image extraction helpers -------------------------------------------------
+
+def extract_images_from_pdf(pdf_bytes: bytes) -> List[bytes]:
+    """Extract images from PDF pages."""
+    images = []
+    try:
+        from pdf2image import convert_from_bytes
+        pil_images = convert_from_bytes(pdf_bytes, dpi=200)
+        for img in pil_images:
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            images.append(img_bytes.getvalue())
+    except ImportError:
+        # Fallback: try pypdf image extraction
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page_num, page in enumerate(reader.pages):
+                if '/XObject' in page.get('/Resources', {}):
+                    xobjects = page['/Resources']['/XObject'].get_object()
+                    for obj_name in xobjects:
+                        obj = xobjects[obj_name]
+                        if obj.get('/Subtype') == '/Image':
+                            try:
+                                img_data = obj.get_data()
+                                images.append(img_data)
+                            except:
+                                pass
+        except:
+            pass
+    except Exception:
+        pass
+    return images
+
+def extract_images_from_docx(docx_bytes: bytes) -> List[bytes]:
+    """Extract images from DOCX file."""
+    images = []
+    try:
+        import zipfile
+        docx_zip = zipfile.ZipFile(io.BytesIO(docx_bytes))
+        # Images in DOCX are stored in word/media/
+        for file_info in docx_zip.filelist:
+            if file_info.filename.startswith('word/media/'):
+                image_data = docx_zip.read(file_info.filename)
+                # Filter common image formats
+                if len(image_data) > 4 and any(image_data[:4] == sig for sig in [b'\x89PNG', b'\xff\xd8\xff', b'GIF8']):
+                    images.append(image_data)
+                elif len(image_data) > 12 and b'WEBP' in image_data[:12]:
+                    images.append(image_data)
+        docx_zip.close()
+    except Exception:
+        pass
+    return images
+
+def extract_images_from_doc(doc_bytes: bytes) -> List[bytes]:
+    """Extract images from .doc (OLE) files."""
+    images = []
+    try:
+        import olefile
+        file_obj = io.BytesIO(doc_bytes)
+        if olefile.isOleFile(file_obj):
+            ole = olefile.OleFileIO(file_obj)
+            # Images in .doc files can be in various streams
+            for stream_name in ole.listdir():
+                if stream_name and len(stream_name) > 0:
+                    stream_path = stream_name[0] if isinstance(stream_name, list) else stream_name
+                    try:
+                        stream = ole.openstream(stream_path)
+                        data = stream.read()
+                        # Check if it looks like an image (PNG, JPEG signatures)
+                        if len(data) > 10:
+                            if data[:4] == b'\x89PNG' or data[:2] == b'\xff\xd8':
+                                images.append(data)
+                            elif data[:3] == b'GIF':
+                                images.append(data)
+                    except:
+                        pass
+            ole.close()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return images
+
+def process_image_with_ocr_or_vision(image_bytes: bytes, model_name: str, project_id: str, location: str, credentials, silent: bool = False) -> str:
+    """Process image through OCR first, then vision model if needed."""
+    # Try OCR first (faster, cheaper)
+    try:
+        img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+        arr = np.array(img)[:, :, ::-1]
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        ocr_text = pytesseract.image_to_string(gray) or ""
+        
+        # If OCR got substantial text, use it
+        if len(ocr_text.strip()) > 20:
+            return f"[Image Content via OCR]\n{ocr_text.strip()}"
+    except Exception:
+        pass
+    
+    # Fallback to vision model for complex images
+    if project_id and credentials:
+        try:
+            vertexai_init(project=project_id, location=location, credentials=credentials)
+            model = GenerativeModel(model_name)
+            
+            mime_type = "image/png"
+            if image_bytes.startswith(b"\xff\xd8\xff"):
+                mime_type = "image/jpeg"
+            elif image_bytes.startswith(b"GIF8"):
+                mime_type = "image/gif"
+            
+            image_part = Part.from_data(image_bytes, mime_type=mime_type)
+            prompt = "Extract all text and describe any important visual elements, screenshots, diagrams, or procedures shown in this HBS NetView image. Be thorough and include all details visible."
+            
+            response = model.generate_content([prompt, image_part])
+            if response.text and len(response.text.strip()) > 20:
+                return f"[Image Content via Vision Model]\n{response.text.strip()}"
+        except Exception:
+            pass
+    
+    return ""
+
 # --- extraction helpers ------------------------------------------------------
 
 def extract_text_from_docx_bytes(b: bytes) -> str:
-    doc = Document(io.BytesIO(b))
-    return "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
+    """Extract text AND images from DOCX."""
+    text_parts = []
+    
+    # Extract text
+    try:
+        doc = Document(io.BytesIO(b))
+        docx_text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
+        if docx_text.strip():
+            text_parts.append(docx_text)
+    except Exception:
+        pass
+    
+    # Extract and process images (limit to prevent excessive API calls)
+    try:
+        images = extract_images_from_docx(b)
+        if images:
+            # Limit to first 10 images per document to avoid cost issues
+            for i, img_bytes in enumerate(images[:10]):
+                # Get credentials from session state if available
+                model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
+                project_id = getattr(st.session_state, 'project_id', None)
+                location = getattr(st.session_state, 'location', None) or DEFAULT_LOCATION
+                creds = getattr(st.session_state, 'creds', None)
+                
+                if project_id and creds:
+                    img_text = process_image_with_ocr_or_vision(
+                        img_bytes,
+                        model_name,
+                        project_id,
+                        location,
+                        creds,
+                        silent=True
+                    )
+                    if img_text:
+                        text_parts.append(img_text)
+    except Exception as e:
+        print(f"Error processing DOCX images: {e}")
+    
+    return "\n\n".join(text_parts) if text_parts else ""
 
 def extract_text_from_doc_bytes(b: bytes) -> str:
-    """Extract text from .doc files using multiple fallback methods."""
+    """Extract text AND images from .doc files using multiple fallback methods."""
+    text_parts = []
+    
     # Method 1: Try python-docx (sometimes works for older .doc if converted)
     try:
         from docx import Document
         doc = Document(io.BytesIO(b))
         text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
         if text.strip():
-            return text
+            text_parts.append(text)
     except Exception:
         pass
     
     # Method 2: Try textract if available
-    try:
-        import textract
-        text = textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
-        if text.strip():
-            return text
-    except ImportError:
-        pass
-    except Exception:
-        pass
+    if not text_parts:
+        try:
+            import textract
+            text = textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
+            if text.strip():
+                text_parts.append(text)
+        except ImportError:
+            pass
+        except Exception:
+            pass
     
     # Method 3: Try antiword command line tool
-    try:
-        import subprocess, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
-            tmp_file.write(b)
-            tmp_path = tmp_file.name
+    if not text_parts:
         try:
-            result = subprocess.run(["antiword", tmp_path], capture_output=True, text=True, timeout=30)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        finally:
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
+                tmp_file.write(b)
+                tmp_path = tmp_file.name
             try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-    except Exception:
-        pass
+                result = subprocess.run(["antiword", tmp_path], capture_output=True, text=True, timeout=30)
+                if result.returncode == 0 and result.stdout.strip():
+                    text_parts.append(result.stdout.strip())
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            pass
     
     # Method 4: Try catdoc if available
-    try:
-        import subprocess, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
-            tmp_file.write(b)
-            tmp_path = tmp_file.name
+    if not text_parts:
         try:
-            result = subprocess.run(["catdoc", tmp_path], capture_output=True, text=True, timeout=30)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        finally:
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
+                tmp_file.write(b)
+                tmp_path = tmp_file.name
             try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-    except Exception:
-        pass
+                result = subprocess.run(["catdoc", tmp_path], capture_output=True, text=True, timeout=30)
+                if result.returncode == 0 and result.stdout.strip():
+                    text_parts.append(result.stdout.strip())
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            pass
     
     # Method 5: Try olefile for structured storage (better for .doc format)
-    try:
-        import olefile
-        file_obj = io.BytesIO(b)
-        if olefile.isOleFile(file_obj):
-            ole = olefile.OleFileIO(file_obj)
-            if ole.exists('WordDocument'):
-                stream = ole.openstream('WordDocument')
-                data = stream.read()
-                # Extract readable text from Word binary
-                text = "".join(chr(c) for c in data if 32 <= c < 127 or c in (10, 13, 9))
-                ole.close()
-                if text.strip() and len(text.strip()) > 50:
-                    return text.strip()
-    except ImportError:
-        pass
-    except Exception:
-        pass
+    if not text_parts:
+        try:
+            import olefile
+            file_obj = io.BytesIO(b)
+            if olefile.isOleFile(file_obj):
+                ole = olefile.OleFileIO(file_obj)
+                if ole.exists('WordDocument'):
+                    stream = ole.openstream('WordDocument')
+                    data = stream.read()
+                    # Extract readable text from Word binary
+                    text = "".join(chr(c) for c in data if 32 <= c < 127 or c in (10, 13, 9))
+                    ole.close()
+                    if text.strip() and len(text.strip()) > 50:
+                        text_parts.append(text.strip())
+                else:
+                    ole.close()
+        except ImportError:
+            pass
+        except Exception:
+            pass
     
     # Method 6: Last resort - try to extract any readable text
+    if not text_parts:
+        try:
+            text = b.decode("utf-8", errors="ignore")
+            readable = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
+            if len(readable) > 100:  # Only return if we got substantial text
+                text_parts.append(readable)
+        except Exception:
+            pass
+    
+    # Extract and process images from .doc file
     try:
-        text = b.decode("utf-8", errors="ignore")
-        readable = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
-        if len(readable) > 100:  # Only return if we got substantial text
-            return readable
-    except Exception:
-        pass
+        images = extract_images_from_doc(b)
+        if images:
+            # Limit to first 10 images per document
+            for img_bytes in images[:10]:
+                # Get credentials from session state if available
+                model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
+                project_id = getattr(st.session_state, 'project_id', None)
+                location = getattr(st.session_state, 'location', None) or DEFAULT_LOCATION
+                creds = getattr(st.session_state, 'creds', None)
+                
+                if project_id and creds:
+                    img_text = process_image_with_ocr_or_vision(
+                        img_bytes,
+                        model_name,
+                        project_id,
+                        location,
+                        creds,
+                        silent=True
+                    )
+                    if img_text:
+                        text_parts.append(img_text)
+    except Exception as e:
+        print(f"Error processing .doc images: {e}")
+    
+    # Return combined text and image content
+    if text_parts:
+        return "\n\n".join(text_parts)
     
     # If all methods fail, log and return empty
     print(f"Warning: Could not extract text from .doc file - all methods failed")
     return ""
 
 def extract_text_from_pdf_bytes(b: bytes) -> str:
+    """Extract text AND images from PDF."""
+    text_parts = []
+    
+    # Extract text
     try:
         reader = PdfReader(io.BytesIO(b))
-        return "\n\n".join((page.extract_text() or "").strip() for page in reader.pages)
+        pdf_text = "\n\n".join((page.extract_text() or "").strip() for page in reader.pages)
+        if pdf_text.strip():
+            text_parts.append(pdf_text)
     except Exception:
-        return ""
+        pass
+    
+    # Extract and process images (limit to prevent excessive API calls)
+    try:
+        images = extract_images_from_pdf(b)
+        if images:
+            # Limit to first 10 images per document to avoid cost issues
+            for img_bytes in images[:10]:
+                # Get credentials from session state if available
+                model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
+                project_id = getattr(st.session_state, 'project_id', None)
+                location = getattr(st.session_state, 'location', None) or DEFAULT_LOCATION
+                creds = getattr(st.session_state, 'creds', None)
+                
+                if project_id and creds:
+                    img_text = process_image_with_ocr_or_vision(
+                        img_bytes,
+                        model_name,
+                        project_id,
+                        location,
+                        creds,
+                        silent=True
+                    )
+                    if img_text:
+                        text_parts.append(img_text)
+    except Exception as e:
+        print(f"Error processing PDF images: {e}")
+    
+    return "\n\n".join(text_parts) if text_parts else ""
 
 def extract_text_from_image_bytes(b: bytes) -> str:
     try:
@@ -1162,7 +1394,7 @@ KNOWLEDGE BASE CONTEXT:
 USER QUESTION: {query}
 
 RESPONSE GUIDELINES:
-1. **Direct Answer** first - provide a clear, direct response to the question
+1. **Direct Answer** first - provide a clear, direct response based on the context provided
 2. **Detailed Explanation** - elaborate on the answer with relevant details from the context
 3. **Steps/Procedures** - when present, list all steps in detail with specific field names, screen names, and values
 4. **Examples** - include specific examples, field names, values, and dealership terminology when available
@@ -1171,8 +1403,12 @@ RESPONSE GUIDELINES:
 7. **Accuracy Priority** - accuracy takes priority, but provide as much detail as is available in the context
 
 RULES:
-- Use only the knowledge base context provided above
-- If information is missing or unclear, say so explicitly and offer escalation
+- Answer based ONLY on the knowledge base context provided above
+- If you can answer the question with the provided context, do so directly without mentioning what might be missing
+- Only mention missing information if the user specifically asks about something and you need to clarify that specific aspect is not covered
+- Do NOT include meta-commentary like "the documentation does not contain", "it's possible this exists but is not covered", or "the provided text may not have"
+- Focus on providing helpful information from the context rather than explaining what's not there
+- If information is genuinely critical and missing, simply state the limitation briefly (e.g., "To reverse a completed unit sale, please contact HBS Support as this process requires system access permissions.")
 - Avoid hallucinations - only use information present in the context
 - Be thorough and comprehensive - aim for 400-600 words for detailed answers
 - Use bullets/numbered lists for clarity
@@ -1190,8 +1426,10 @@ RULES:
             generation_config=GenerationConfig(temperature=0.1, max_output_tokens=8192, top_p=0.8, top_k=40),
         )
         answer = response.text if response.text else "I couldn't generate a response. Please try rephrasing your question."
+        
+        # Only add verification note if answer quality is poor, not for missing info
         verification = verify_answer_quality(query, answer, context_chunks, model_name, project_id, location, credentials)
-        if verification.get("needs_improvement"):
+        if verification.get("needs_improvement") and verification.get("support", 0) < 3:
             answer += "\n\n*Note: Some details may require confirmation with HBS Support.*"
         return answer
     except Exception as e:
@@ -1301,7 +1539,7 @@ def main():
 
     if not st.session_state.kb_loaded:
         st.session_state.kb_loading = True
-        with st.spinner("Loading knowledge base..."):
+        with st.spinner("Loading knowledge base... (Extracting images from documents - this may take a while)"):
             index, corpus, loaded = initialize_app()
             st.session_state.index = index
             st.session_state.corpus = corpus
