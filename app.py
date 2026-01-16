@@ -328,6 +328,7 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
 def extract_text_from_doc_bytes(b: bytes) -> str:
     """Extract text AND images from .doc files using multiple fallback methods."""
     text_parts = []
+    errors = []
     
     # Method 1: Try python-docx (sometimes works for older .doc if converted)
     try:
@@ -336,8 +337,9 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
         text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
         if text.strip():
             text_parts.append(text)
-    except Exception:
-        pass
+            print(f"✓ Successfully extracted text from .doc using python-docx: {len(text)} characters")
+    except Exception as e:
+        errors.append(f"python-docx: {str(e)[:100]}")
     
     # Method 2: Try textract if available
     if not text_parts:
@@ -346,10 +348,11 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
             text = textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
             if text.strip():
                 text_parts.append(text)
+                print(f"✓ Successfully extracted text from .doc using textract: {len(text)} characters")
         except ImportError:
-            pass
-        except Exception:
-            pass
+            errors.append("textract: not installed")
+        except Exception as e:
+            errors.append(f"textract: {str(e)[:100]}")
     
     # Method 3: Try antiword command line tool
     if not text_parts:
@@ -362,13 +365,18 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                 result = subprocess.run(["antiword", tmp_path], capture_output=True, text=True, timeout=30)
                 if result.returncode == 0 and result.stdout.strip():
                     text_parts.append(result.stdout.strip())
+                    print(f"✓ Successfully extracted text from .doc using antiword: {len(result.stdout)} characters")
+                elif result.returncode != 0:
+                    errors.append(f"antiword: exit code {result.returncode}")
             finally:
                 try:
                     os.unlink(tmp_path)
                 except FileNotFoundError:
                     pass
-        except Exception:
-            pass
+        except FileNotFoundError:
+            errors.append("antiword: command not found (install: apt-get install antiword or brew install antiword)")
+        except Exception as e:
+            errors.append(f"antiword: {str(e)[:100]}")
     
     # Method 4: Try catdoc if available
     if not text_parts:
@@ -381,13 +389,18 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                 result = subprocess.run(["catdoc", tmp_path], capture_output=True, text=True, timeout=30)
                 if result.returncode == 0 and result.stdout.strip():
                     text_parts.append(result.stdout.strip())
+                    print(f"✓ Successfully extracted text from .doc using catdoc: {len(result.stdout)} characters")
+                elif result.returncode != 0:
+                    errors.append(f"catdoc: exit code {result.returncode}")
             finally:
                 try:
                     os.unlink(tmp_path)
                 except FileNotFoundError:
                     pass
-        except Exception:
-            pass
+        except FileNotFoundError:
+            errors.append("catdoc: command not found (install: apt-get install catdoc or brew install catdoc)")
+        except Exception as e:
+            errors.append(f"catdoc: {str(e)[:100]}")
     
     # Method 5: Try olefile for structured storage (better for .doc format)
     if not text_parts:
@@ -396,35 +409,58 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
             file_obj = io.BytesIO(b)
             if olefile.isOleFile(file_obj):
                 ole = olefile.OleFileIO(file_obj)
+                streams = ole.listdir()
                 if ole.exists('WordDocument'):
                     stream = ole.openstream('WordDocument')
                     data = stream.read()
-                    # Extract readable text from Word binary
-                    text = "".join(chr(c) for c in data if 32 <= c < 127 or c in (10, 13, 9))
+                    # Better text extraction from Word binary format
+                    # Word stores text in a table structure, this is a simplified extraction
+                    text = ""
+                    # Look for readable text sequences
+                    for i in range(len(data) - 1):
+                        byte1 = data[i]
+                        # ASCII printable range
+                        if 32 <= byte1 < 127:
+                            text += chr(byte1)
+                        elif byte1 in (10, 13, 9):  # newline, carriage return, tab
+                            text += ' ' if byte1 != 10 else '\n'
+                    
+                    # Clean up excessive whitespace
+                    text = re.sub(r'\s+', ' ', text).strip()
                     ole.close()
                     if text.strip() and len(text.strip()) > 50:
                         text_parts.append(text.strip())
+                        print(f"✓ Successfully extracted text from .doc using olefile: {len(text.strip())} characters")
                 else:
+                    available_streams = [str(s) for s in streams[:5]]
+                    errors.append(f"olefile: WordDocument stream not found. Available: {available_streams}")
                     ole.close()
+            else:
+                errors.append("olefile: Not a valid OLE file")
         except ImportError:
-            pass
-        except Exception:
-            pass
+            errors.append("olefile: not installed (pip install olefile)")
+        except Exception as e:
+            errors.append(f"olefile: {str(e)[:100]}")
     
     # Method 6: Last resort - try to extract any readable text
     if not text_parts:
         try:
             text = b.decode("utf-8", errors="ignore")
             readable = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
-            if len(readable) > 100:  # Only return if we got substantial text
+            # Only use if we got substantial readable text (not just random characters)
+            if len(readable) > 200 and len([c for c in readable if c.isalpha()]) > 50:
                 text_parts.append(readable)
-        except Exception:
-            pass
+                print(f"✓ Successfully extracted text from .doc using raw extraction: {len(readable)} characters")
+            else:
+                errors.append("raw extraction: insufficient readable text")
+        except Exception as e:
+            errors.append(f"raw extraction: {str(e)[:100]}")
     
     # Extract and process images from .doc file
     try:
         images = extract_images_from_doc(b)
         if images:
+            print(f"Found {len(images)} images in .doc file")
             # Limit to first 10 images per document
             for img_bytes in images[:10]:
                 # Get credentials from session state if available
@@ -444,15 +480,20 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                     )
                     if img_text:
                         text_parts.append(img_text)
+                        print(f"✓ Processed image from .doc file")
     except Exception as e:
-        print(f"Error processing .doc images: {e}")
+        errors.append(f"image extraction: {str(e)[:100]}")
     
     # Return combined text and image content
     if text_parts:
         return "\n\n".join(text_parts)
     
-    # If all methods fail, log and return empty
-    print(f"Warning: Could not extract text from .doc file - all methods failed")
+    # If all methods fail, log errors
+    print(f"✗ FAILED to extract text from .doc file")
+    print(f"  Methods tried: {len(errors)}")
+    if errors:
+        print(f"  Errors: {'; '.join(errors[:5])}")  # Show first 5 errors
+    
     return ""
 
 def extract_text_from_pdf_bytes(b: bytes) -> str:
@@ -1205,6 +1246,9 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
     if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
         st.info(f"Found {len(files)} files in KB directory")
 
+    doc_files_processed = 0
+    doc_files_failed = 0
+
     for file_path in files:
         if not file_path.is_file():
             continue
@@ -1217,9 +1261,11 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
             elif suffix == ".doc":
                 text = extract_text_from_doc_bytes(data)
                 if not text.strip():
-                    print(f"Warning: No text extracted from .doc file: {file_path.name}")
+                    doc_files_failed += 1
+                    print(f"⚠ No text extracted from .doc file: {file_path.name}")
                 else:
-                    print(f"Successfully extracted {len(text)} characters from .doc file: {file_path.name}")
+                    doc_files_processed += 1
+                    print(f"✓ Successfully processed .doc file: {file_path.name} ({len(text)} characters)")
             elif suffix == ".pdf":
                 text = extract_text_from_pdf_bytes(data)
             elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
@@ -1278,6 +1324,16 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
         except Exception as e:
             if not silent:
                 st.error(f"Error processing {file_path.name}: {e}")
+
+    # Summary of .doc file processing
+    if doc_files_processed > 0 or doc_files_failed > 0:
+        print(f"\n📊 .doc File Processing Summary:")
+        print(f"   Successfully processed: {doc_files_processed}")
+        print(f"   Failed: {doc_files_failed}")
+        if doc_files_failed > 0:
+            print(f"   💡 Tip: Install antiword or catdoc for better .doc support")
+            print(f"      Linux: sudo apt-get install antiword")
+            print(f"      Mac: brew install antiword")
 
     validated: List[Dict] = []
     for item in corpus:
