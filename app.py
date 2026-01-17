@@ -18,7 +18,6 @@ from vertexai.language_models import TextEmbeddingModel
 from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part, Image
 
 from docx import Document
-from pypdf import PdfReader
 import cv2
 import pytesseract
 from PIL import Image as PILImage
@@ -60,7 +59,7 @@ DEEP_RETRIEVAL_KEYWORDS = [
 ]
 
 # Performance optimization: limit images per document
-MAX_IMAGES_PER_DOCUMENT = 5  
+MAX_IMAGES_PER_DOCUMENT = 5  # Change this to increase/decrease image limit per DOCX file
 USE_VISION_MODEL_FOR_IMAGES = False  # Set to True to enable vision model, False for OCR only (faster)
 
 # --- background polling ------------------------------------------------------
@@ -166,37 +165,6 @@ def split_oversized_chunk(chunk: str, max_tokens: int = 2000) -> List[str]:
 
 # --- image extraction helpers -------------------------------------------------
 
-def extract_images_from_pdf(pdf_bytes: bytes) -> List[bytes]:
-    """Extract images from PDF pages."""
-    images = []
-    try:
-        from pdf2image import convert_from_bytes
-        pil_images = convert_from_bytes(pdf_bytes, dpi=200)
-        for img in pil_images:
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format='PNG')
-            images.append(img_bytes.getvalue())
-    except ImportError:
-        # Fallback: try pypdf image extraction
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            for page_num, page in enumerate(reader.pages):
-                if '/XObject' in page.get('/Resources', {}):
-                    xobjects = page['/Resources']['/XObject'].get_object()
-                    for obj_name in xobjects:
-                        obj = xobjects[obj_name]
-                        if obj.get('/Subtype') == '/Image':
-                            try:
-                                img_data = obj.get_data()
-                                images.append(img_data)
-                            except:
-                                pass
-        except:
-            pass
-    except Exception:
-        pass
-    return images
-
 def extract_images_from_docx(docx_bytes: bytes) -> List[bytes]:
     """Extract images from DOCX file."""
     images = []
@@ -213,38 +181,10 @@ def extract_images_from_docx(docx_bytes: bytes) -> List[bytes]:
                 elif len(image_data) > 12 and b'WEBP' in image_data[:12]:
                     images.append(image_data)
         docx_zip.close()
-    except Exception:
-        pass
-    return images
-
-def extract_images_from_doc(doc_bytes: bytes) -> List[bytes]:
-    """Extract images from .doc (OLE) files."""
-    images = []
-    try:
-        import olefile
-        file_obj = io.BytesIO(doc_bytes)
-        if olefile.isOleFile(file_obj):
-            ole = olefile.OleFileIO(file_obj)
-            # Images in .doc files can be in various streams
-            for stream_name in ole.listdir():
-                if stream_name and len(stream_name) > 0:
-                    stream_path = stream_name[0] if isinstance(stream_name, list) else stream_name
-                    try:
-                        stream = ole.openstream(stream_path)
-                        data = stream.read()
-                        # Check if it looks like an image (PNG, JPEG signatures)
-                        if len(data) > 10:
-                            if data[:4] == b'\x89PNG' or data[:2] == b'\xff\xd8':
-                                images.append(data)
-                            elif data[:3] == b'GIF':
-                                images.append(data)
-                    except:
-                        pass
-            ole.close()
-    except ImportError:
-        pass
-    except Exception:
-        pass
+        if images:
+            print(f"✓ Extracted {len(images)} images from DOCX file")
+    except Exception as e:
+        print(f"Error extracting images from DOCX: {e}")
     return images
 
 def process_image_with_ocr_or_vision(image_bytes: bytes, model_name: str, project_id: str, location: str, credentials, silent: bool = False) -> str:
@@ -298,13 +238,16 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
         docx_text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
         if docx_text.strip():
             text_parts.append(docx_text)
-    except Exception:
-        pass
+            print(f"✓ Extracted {len(docx_text)} characters of text from DOCX")
+    except Exception as e:
+        print(f"Error extracting text from DOCX: {e}")
     
     # Extract and process images (limited for performance)
     try:
         images = extract_images_from_docx(b)
         if images:
+            print(f"Processing {min(len(images), MAX_IMAGES_PER_DOCUMENT)} of {len(images)} images...")
+            processed_count = 0
             # Limit to MAX_IMAGES_PER_DOCUMENT for faster processing
             for i, img_bytes in enumerate(images[:MAX_IMAGES_PER_DOCUMENT]):
                 # Get credentials from session state if available
@@ -324,404 +267,21 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
                     )
                     if img_text:
                         text_parts.append(img_text)
+                        processed_count += 1
+                        print(f"  ✓ Processed image {i+1}: {len(img_text)} characters extracted")
+                else:
+                    print(f"  ⚠ Skipping image {i+1}: credentials not available")
+            
+            if processed_count > 0:
+                print(f"✓ Successfully processed {processed_count} images from DOCX file")
+            elif len(images) > 0:
+                print(f"⚠ Found {len(images)} images but none were processed (credentials missing or processing failed)")
+        else:
+            print("No images found in DOCX file")
     except Exception as e:
         print(f"Error processing DOCX images: {e}")
     
     return "\n\n".join(text_parts) if text_parts else ""
-
-def extract_text_from_doc_bytes(b: bytes) -> str:
-    """Extract text AND images from .doc files using multiple fallback methods."""
-    text_parts = []
-    errors = []
-    
-    # Method 1: Try python-docx (sometimes works for older .doc if converted)
-    try:
-        from docx import Document
-        doc = Document(io.BytesIO(b))
-        text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
-        if text.strip():
-            text_parts.append(text)
-            print(f"✓ Successfully extracted text from .doc using python-docx: {len(text)} characters")
-    except Exception as e:
-        errors.append(f"python-docx: {str(e)[:100]}")
-    
-    # Method 2: Try textract if available
-    if not text_parts:
-        try:
-            import textract
-            text = textract.process(io.BytesIO(b), extension="doc").decode("utf-8").strip()
-            if text.strip():
-                text_parts.append(text)
-                print(f"✓ Successfully extracted text from .doc using textract: {len(text)} characters")
-        except ImportError:
-            errors.append("textract: not installed")
-        except Exception as e:
-            errors.append(f"textract: {str(e)[:100]}")
-    
-    # Method 3: Try antiword command line tool
-    if not text_parts:
-        try:
-            import subprocess, tempfile
-            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
-                tmp_file.write(b)
-                tmp_path = tmp_file.name
-            try:
-                result = subprocess.run(["antiword", tmp_path], capture_output=True, text=True, timeout=30)
-                if result.returncode == 0 and result.stdout.strip():
-                    text_parts.append(result.stdout.strip())
-                    print(f"✓ Successfully extracted text from .doc using antiword: {len(result.stdout)} characters")
-                elif result.returncode != 0:
-                    errors.append(f"antiword: exit code {result.returncode}")
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except FileNotFoundError:
-                    pass
-        except FileNotFoundError:
-            errors.append("antiword: command not found (install: apt-get install antiword or brew install antiword)")
-        except Exception as e:
-            errors.append(f"antiword: {str(e)[:100]}")
-    
-    # Method 4: Try catdoc if available
-    if not text_parts:
-        try:
-            import subprocess, tempfile
-            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp_file:
-                tmp_file.write(b)
-                tmp_path = tmp_file.name
-            try:
-                result = subprocess.run(["catdoc", tmp_path], capture_output=True, text=True, timeout=30)
-                if result.returncode == 0 and result.stdout.strip():
-                    text_parts.append(result.stdout.strip())
-                    print(f"✓ Successfully extracted text from .doc using catdoc: {len(result.stdout)} characters")
-                elif result.returncode != 0:
-                    errors.append(f"catdoc: exit code {result.returncode}")
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except FileNotFoundError:
-                    pass
-        except FileNotFoundError:
-            errors.append("catdoc: command not found (install: apt-get install catdoc or brew install catdoc)")
-        except Exception as e:
-            errors.append(f"catdoc: {str(e)[:100]}")
-    
-    # Method 5: Try olefile for structured storage (better for .doc format)
-    if not text_parts:
-        try:
-            import olefile
-            file_obj = io.BytesIO(b)
-            if olefile.isOleFile(file_obj):
-                ole = olefile.OleFileIO(file_obj)
-                streams = ole.listdir()
-                if ole.exists('WordDocument'):
-                    stream = ole.openstream('WordDocument')
-                    data = stream.read()
-                    # Better text extraction from Word binary format
-                    text = ""
-                    # Look for readable text sequences
-                    for i in range(len(data) - 1):
-                        byte1 = data[i]
-                        # ASCII printable range
-                        if 32 <= byte1 < 127:
-                            text += chr(byte1)
-                        elif byte1 in (10, 13, 9):  # newline, carriage return, tab
-                            text += ' ' if byte1 != 10 else '\n'
-                    
-                    # Clean up excessive whitespace
-                    text = re.sub(r'\s+', ' ', text).strip()
-                    ole.close()
-                    if text.strip() and len(text.strip()) > 50:
-                        text_parts.append(text.strip())
-                        print(f"✓ Successfully extracted text from .doc using olefile: {len(text.strip())} characters")
-                else:
-                    available_streams = [str(s) for s in streams[:5]]
-                    errors.append(f"olefile: WordDocument stream not found. Available: {available_streams}")
-                    ole.close()
-            else:
-                errors.append("olefile: Not a valid OLE file")
-        except ImportError:
-            errors.append("olefile: not installed (pip install olefile)")
-        except Exception as e:
-            errors.append(f"olefile: {str(e)[:100]}")
-    
-    # Method 6: Last resort - try to extract any readable text
-    if not text_parts:
-        try:
-            text = b.decode("utf-8", errors="ignore")
-            readable = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t").strip()
-            # Only use if we got substantial readable text (not just random characters)
-            if len(readable) > 200 and len([c for c in readable if c.isalpha()]) > 50:
-                text_parts.append(readable)
-                print(f"✓ Successfully extracted text from .doc using raw extraction: {len(readable)} characters")
-            else:
-                errors.append("raw extraction: insufficient readable text")
-        except Exception as e:
-            errors.append(f"raw extraction: {str(e)[:100]}")
-    
-    # Extract and process images from .doc file (limited for performance)
-    try:
-        images = extract_images_from_doc(b)
-        if images:
-            # Limit to MAX_IMAGES_PER_DOCUMENT
-            for img_bytes in images[:MAX_IMAGES_PER_DOCUMENT]:
-                # Get credentials from session state if available
-                model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
-                project_id = getattr(st.session_state, 'project_id', None)
-                location = getattr(st.session_state, 'location', None) or DEFAULT_LOCATION
-                creds = getattr(st.session_state, 'creds', None)
-                
-                if project_id and creds:
-                    img_text = process_image_with_ocr_or_vision(
-                        img_bytes,
-                        model_name,
-                        project_id,
-                        location,
-                        creds,
-                        silent=True
-                    )
-                    if img_text:
-                        text_parts.append(img_text)
-    except Exception as e:
-        errors.append(f"image extraction: {str(e)[:100]}")
-    
-    # Return combined text and image content
-    if text_parts:
-        return "\n\n".join(text_parts)
-    
-    # If all methods fail, log errors (only show first few to avoid spam)
-    if errors and len(errors) > 0:
-        print(f"✗ FAILED to extract text from .doc file")
-        print(f"  Errors: {'; '.join(errors[:3])}")  # Show first 3 errors only
-    
-    return ""
-
-def extract_text_from_pdf_bytes(b: bytes) -> str:
-    """Extract text AND images from PDF."""
-    text_parts = []
-    
-    # Extract text
-    try:
-        reader = PdfReader(io.BytesIO(b))
-        pdf_text = "\n\n".join((page.extract_text() or "").strip() for page in reader.pages)
-        if pdf_text.strip():
-            text_parts.append(pdf_text)
-    except Exception:
-        pass
-    
-    # Extract and process images (limited for performance)
-    try:
-        images = extract_images_from_pdf(b)
-        if images:
-            # Limit to MAX_IMAGES_PER_DOCUMENT for faster processing
-            for img_bytes in images[:MAX_IMAGES_PER_DOCUMENT]:
-                # Get credentials from session state if available
-                model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
-                project_id = getattr(st.session_state, 'project_id', None)
-                location = getattr(st.session_state, 'location', None) or DEFAULT_LOCATION
-                creds = getattr(st.session_state, 'creds', None)
-                
-                if project_id and creds:
-                    img_text = process_image_with_ocr_or_vision(
-                        img_bytes,
-                        model_name,
-                        project_id,
-                        location,
-                        creds,
-                        silent=True
-                    )
-                    if img_text:
-                        text_parts.append(img_text)
-    except Exception as e:
-        print(f"Error processing PDF images: {e}")
-    
-    return "\n\n".join(text_parts) if text_parts else ""
-
-def extract_text_from_image_bytes(b: bytes) -> str:
-    try:
-        img = PILImage.open(io.BytesIO(b)).convert("RGB")
-        arr = np.array(img)[:, :, ::-1]
-        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        return (pytesseract.image_to_string(gray) or "").strip()
-    except Exception:
-        return ""
-
-# --- structured OCR parsing --------------------------------------------------
-
-def parse_report_data_from_ocr(ocr_text: str, filename: str) -> List[Dict]:
-    lines = [line.strip() for line in ocr_text.split("\n") if line.strip()]
-    if "overdue" in filename.lower() or "overdue" in ocr_text.lower():
-        return parse_overdue_report(lines, filename)
-    if "outbound" in filename.lower() or "outbound" in ocr_text.lower():
-        return parse_outbound_report(lines, filename)
-    if "equipment list" in filename.lower() or "equipment list" in ocr_text.lower():
-        return parse_equipment_list_report(lines, filename)
-    return []
-
-def parse_overdue_report(lines: List[str], filename: str) -> List[Dict]:
-    data = []
-    for i, line in enumerate(lines):
-        if re.match(r"^[A-Z\s]+$", line) and len(line) > 3:
-            if i + 1 >= len(lines):
-                continue
-            next_line = lines[i + 1]
-            contract_match = re.search(r"C\d+R", next_line)
-            if not contract_match:
-                continue
-            customer_name = line
-            contract = contract_match.group()
-            phone = stock = make = model = equipment_type = ""
-            year = serial = date_out = expected = days_over = ""
-            for j in range(i, min(i + 5, len(lines))):
-                current_line = lines[j]
-                phone_match = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", current_line)
-                if phone_match:
-                    phone = phone_match.group()
-                stock_match = re.search(r"\b\d{5}\b", current_line)
-                if stock_match:
-                    stock = stock_match.group()
-                make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", current_line)
-                if make_match:
-                    make = make_match.group()
-                model_match = re.search(
-                    r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
-                    current_line,
-                )
-                if model_match:
-                    model = model_match.group()
-                type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", current_line)
-                if type_match:
-                    equipment_type = type_match.group()
-                year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", current_line)
-                if year_match:
-                    year = year_match.group()
-                serial_match = re.search(r"\b[A-Z0-9]{6,}\b", current_line)
-                if serial_match and len(serial_match.group()) > 6:
-                    serial = serial_match.group()
-                date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", current_line)
-                if date_match:
-                    if not date_out:
-                        date_out = date_match.group()
-                    else:
-                        expected = date_match.group()
-                days_match = re.search(r"\b\d{1,4}\b", current_line)
-                if days_match and days_match.group().isdigit():
-                    days_over = days_match.group()
-            if customer_name and contract:
-                data.append(
-                    {
-                        "customer_name": customer_name,
-                        "contract": contract,
-                        "phone": phone,
-                        "stock_number": stock,
-                        "make": make,
-                        "model": model,
-                        "equipment_type": equipment_type,
-                        "year": year,
-                        "serial": serial,
-                        "date_out": date_out,
-                        "expected_due": expected,
-                        "days_overdue": days_over,
-                        "source": filename,
-                        "report_type": "Overdue Equipment Report",
-                    }
-                )
-    return data
-
-def parse_outbound_report(lines: List[str], filename: str) -> List[Dict]:
-    data = []
-    for i, line in enumerate(lines):
-        if re.match(r"^[A-Z\s]+$", line) and len(line) > 3:
-            if i + 1 >= len(lines):
-                continue
-            next_line = lines[i + 1]
-            contract_match = re.search(r"C\d+R", next_line)
-            if not contract_match:
-                continue
-            customer_name = line
-            contract = contract_match.group()
-            phone = stock = make = model = equipment_type = ""
-            year = serial = date_time_out = ""
-            for j in range(i, min(i + 5, len(lines))):
-                current_line = lines[j]
-                phone_match = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", current_line)
-                if phone_match:
-                    phone = phone_match.group()
-                stock_match = re.search(r"\b\d{5}\b", current_line)
-                if stock_match:
-                    stock = stock_match.group()
-                make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", current_line)
-                if make_match:
-                    make = make_match.group()
-                model_match = re.search(
-                    r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
-                    current_line,
-                )
-                if model_match:
-                    model = model_match.group()
-                type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", current_line)
-                if type_match:
-                    equipment_type = type_match.group()
-                year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", current_line)
-                if year_match:
-                    year = year_match.group()
-                serial_match = re.search(r"\b[A-Z0-9]{6,}\b", current_line)
-                if serial_match and len(serial_match.group()) > 6:
-                    serial = serial_match.group()
-                datetime_match = re.search(r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[AP]M\b", current_line)
-                if datetime_match:
-                    date_time_out = datetime_match.group()
-            if customer_name and contract:
-                data.append(
-                    {
-                        "customer_name": customer_name,
-                        "contract": contract,
-                        "phone": phone,
-                        "stock_number": stock,
-                        "make": make,
-                        "model": model,
-                        "equipment_type": equipment_type,
-                        "year": year,
-                        "serial": serial,
-                        "date_time_out": date_time_out,
-                        "source": filename,
-                        "report_type": "Rental Outbound Report",
-                    }
-                )
-    return data
-
-def parse_equipment_list_report(lines: List[str], filename: str) -> List[Dict]:
-    data = []
-    for line in lines:
-        stock_match = re.search(r"\b\d{5}\b", line)
-        if not stock_match:
-            continue
-        stock = stock_match.group()
-        make_match = re.search(r"\b(BOB|KUB|JD|BOM)\b", line)
-        model_match = re.search(
-            r"\b(T650|E32|E42|U55-4R3AP|U35-4R3A|E26|KX080R3AT3|KX121R3TA|KX121RRATS|211D-50|690B|442)\b",
-            line,
-        )
-        type_match = re.search(r"\b(SKIDSTEER|EXCAVATOR|ROLLER)\b", line)
-        year_match = re.search(r"\b(2013|2014|2015|2016|1979|2006|2008|2012)\b", line)
-        serial_match = re.search(r"\b[A-Z0-9]{6,}\b", line)
-        meter_match = re.search(r"\b\d+\b", line)
-        data.append(
-            {
-                "stock_number": stock,
-                "make": make_match.group() if make_match else "",
-                "model": model_match.group() if model_match else "",
-                "equipment_type": type_match.group() if type_match else "",
-                "year": year_match.group() if year_match else "",
-                "serial": serial_match.group() if serial_match and len(serial_match.group()) > 6 else "",
-                "location": "",
-                "meter": meter_match.group() if meter_match else "",
-                "source": filename,
-                "report_type": "Rental Equipment List",
-            }
-        )
-    return data
 
 # --- embeddings/index --------------------------------------------------------
 
@@ -1242,109 +802,72 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
             st.error(f"KB_DIR does not exist: {KB_DIR}")
         return corpus
 
-    files = list(KB_DIR.iterdir())
+    files = [f for f in KB_DIR.iterdir() if f.is_file() and f.suffix.lower() == ".docx"]
     if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
-        st.info(f"Found {len(files)} files in KB directory. Processing... (this may take a while for {len(files)} files)")
+        st.info(f"Found {len(files)} DOCX files in KB directory. Processing... (this may take a while for {len(files)} files)")
 
-    doc_files_processed = 0
-    doc_files_failed = 0
+    docx_files_processed = 0
+    docx_files_failed = 0
+    total_images_found = 0
+    total_images_processed = 0
     start_time = time.time()
 
     for file_idx, file_path in enumerate(files):
-        if not file_path.is_file():
-            continue
         try:
-            suffix = file_path.suffix.lower()
+            print(f"\nProcessing file {file_idx + 1}/{len(files)}: {file_path.name}")
             data = file_path.read_bytes()
-
-            if suffix == ".docx":
-                text = extract_text_from_docx_bytes(data)
-            elif suffix == ".doc":
-                text = extract_text_from_doc_bytes(data)
-                if not text.strip():
-                    doc_files_failed += 1
-                    # Only log failures occasionally to avoid spam
-                    if doc_files_failed <= 5 or doc_files_failed % 10 == 0:
-                        print(f"⚠ No text extracted from .doc file: {file_path.name}")
-                else:
-                    doc_files_processed += 1
-            elif suffix == ".pdf":
-                text = extract_text_from_pdf_bytes(data)
-            elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
-                if file_path.stat().st_size == 0:
-                    continue
-                text = extract_text_from_image_bytes(data)
-            else:
-                continue
-
+            text = extract_text_from_docx_bytes(data)
+            
             if text.strip():
+                docx_files_processed += 1
                 chunks = chunk_text(text)
+                
+                # Count images in the extracted text
+                image_content_count = text.count("[Image Content via OCR]") + text.count("[Image Content via Vision Model]")
+                if image_content_count > 0:
+                    total_images_processed += image_content_count
+                    print(f"✓ File {file_path.name}: {len(chunks)} chunks created, {image_content_count} images included")
+                
                 for i, chunk in enumerate(chunks):
                     corpus.append(
                         {
                             "text": chunk,
                             "source": file_path.name,
                             "chunk_id": i,
-                            "file_type": suffix,
+                            "file_type": ".docx",
                         }
                     )
-
-            if suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"] and text.strip():
-                try:
-                    structured_items = parse_report_data_from_ocr(text, file_path.name)
-                    for item in structured_items:
-                        fields = [
-                            f"Report: {item.get('report_type', 'Unknown')}",
-                            f"Customer: {item.get('customer_name', '')}",
-                            f"Contract: {item.get('contract', '')}",
-                            f"Stock: {item.get('stock_number', '')}",
-                            f"Make: {item.get('make', '')}",
-                            f"Model: {item.get('model', '')}",
-                            f"Type: {item.get('equipment_type', '')}",
-                            f"Year: {item.get('year', '')}",
-                            f"Serial: {item.get('serial', '')}",
-                            f"Days Overdue: {item.get('days_overdue', '')}",
-                            f"Date Out: {item.get('date_out', item.get('date_time_out', ''))}",
-                            f"Expected Due: {item.get('expected_due', '')}",
-                            f"Phone: {item.get('phone', '')}",
-                            f"Location: {item.get('location', '')}",
-                            f"Meter: {item.get('meter', '')}",
-                        ]
-                        searchable_text = " ".join(fields).strip()
-                        corpus.append(
-                            {
-                                "text": searchable_text,
-                                "source": file_path.name,
-                                "chunk_id": len(corpus),
-                                "file_type": suffix,
-                                "content_type": "structured_data",
-                                "structured_data": item,
-                            }
-                        )
-                except Exception:
-                    pass
+            else:
+                docx_files_failed += 1
+                if docx_files_failed <= 5 or docx_files_failed % 10 == 0:
+                    print(f"⚠ No text extracted from DOCX file: {file_path.name}")
             
             # Progress update every 50 files
             if not silent and (file_idx + 1) % 50 == 0:
                 elapsed = time.time() - start_time
                 rate = (file_idx + 1) / elapsed if elapsed > 0 else 0
                 remaining = (len(files) - file_idx - 1) / rate if rate > 0 else 0
-                print(f"Progress: {file_idx + 1}/{len(files)} files processed ({elapsed:.1f}s elapsed, ~{remaining:.0f}s remaining)")
+                print(f"\n📊 Progress: {file_idx + 1}/{len(files)} files processed ({elapsed:.1f}s elapsed, ~{remaining:.0f}s remaining)")
+                print(f"   Images processed so far: {total_images_processed}")
                 
         except Exception as e:
+            docx_files_failed += 1
             if not silent:
                 st.error(f"Error processing {file_path.name}: {e}")
+            print(f"✗ Error processing {file_path.name}: {e}")
 
-    # Summary of .doc file processing
+    # Summary of DOCX file processing
     elapsed_total = time.time() - start_time
-    print(f"\n📊 Processing Summary:")
-    print(f"   Total files: {len(files)}")
+    print(f"\n{'='*60}")
+    print(f"📊 Processing Summary:")
+    print(f"{'='*60}")
+    print(f"   Total DOCX files: {len(files)}")
+    print(f"   DOCX files processed: {docx_files_processed}")
+    print(f"   DOCX files failed: {docx_files_failed}")
+    print(f"   Total images processed: {total_images_processed}")
     print(f"   Total chunks created: {len(corpus)}")
-    print(f"   .doc files processed: {doc_files_processed}")
-    print(f"   .doc files failed: {doc_files_failed}")
     print(f"   Total time: {elapsed_total:.1f} seconds ({elapsed_total/60:.1f} minutes)")
-    if doc_files_failed > 0:
-        print(f"   💡 Tip: Install antiword or catdoc for better .doc support")
+    print(f"{'='*60}\n")
 
     validated: List[Dict] = []
     for item in corpus:
@@ -1471,6 +994,10 @@ RESPONSE GUIDELINES:
 
 RULES:
 - Answer based ONLY on the knowledge base context provided above
+- DO NOT reference document names, filenames, or source files in your answer (e.g., don't say "According to document X.docx" or "As stated in file Y.docx")
+- DO NOT mention "the documentation", "the provided context", "the knowledge base", or similar meta-references
+- Answer naturally as if you are an expert who knows this information - write as if you're speaking directly about HBS NetView features, not about documents
+- Present information as facts about the system, not as citations from documents
 - If you can answer the question with the provided context, do so directly without mentioning what might be missing
 - Only mention missing information if the user specifically asks about something and you need to clarify that specific aspect is not covered
 - Do NOT include meta-commentary like "the documentation does not contain", "it's possible this exists but is not covered", or "the provided text may not have"
@@ -1480,10 +1007,10 @@ RULES:
 - Be thorough and comprehensive - aim for 400-600 words for detailed answers
 - Use bullets/numbered lists for clarity
 - Include all relevant details, field names, screen references, and specific terminology
-- When multiple documents contain related information, synthesize them into a cohesive answer"""
+- When multiple documents contain related information, synthesize them into a cohesive answer without mentioning that it comes from multiple sources"""
     
     if deep_mode:
-        system_prompt += "\n\nMULTI-SOURCE INSTRUCTION: This is a complex query requiring information from multiple documents. Carefully combine information across all relevant documents, explain connections between different sources, and credit each source. Be comprehensive and detailed.\n"
+        system_prompt += "\n\nMULTI-SOURCE INSTRUCTION: This is a complex query requiring information from multiple documents. Carefully combine information across all relevant documents into a single, seamless answer. Do NOT mention that information comes from multiple sources - just provide the complete, integrated answer.\n"
     
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
@@ -1606,7 +1133,7 @@ def main():
 
     if not st.session_state.kb_loaded:
         st.session_state.kb_loading = True
-        with st.spinner("Loading knowledge base... (Processing 600+ files - this will take 30-60 minutes)"):
+        with st.spinner("Loading knowledge base... (Processing DOCX files - this will take 30-60 minutes)"):
             index, corpus, loaded = initialize_app()
             st.session_state.index = index
             st.session_state.corpus = corpus
