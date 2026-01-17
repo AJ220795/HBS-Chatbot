@@ -59,6 +59,10 @@ DEEP_RETRIEVAL_KEYWORDS = [
     "different documents", "across", "multi-part", "split across",
 ]
 
+# Performance optimization: limit images per document
+MAX_IMAGES_PER_DOCUMENT = 5  
+USE_VISION_MODEL_FOR_IMAGES = False  # Set to True to enable vision model, False for OCR only (faster)
+
 # --- background polling ------------------------------------------------------
 
 def check_db_changes():
@@ -259,8 +263,8 @@ def process_image_with_ocr_or_vision(image_bytes: bytes, model_name: str, projec
     except Exception:
         pass
     
-    # Fallback to vision model for complex images
-    if project_id and credentials:
+    # Fallback to vision model only if enabled (slow/expensive)
+    if USE_VISION_MODEL_FOR_IMAGES and project_id and credentials:
         try:
             vertexai_init(project=project_id, location=location, credentials=credentials)
             model = GenerativeModel(model_name)
@@ -297,12 +301,12 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
     except Exception:
         pass
     
-    # Extract and process images (limit to prevent excessive API calls)
+    # Extract and process images (limited for performance)
     try:
         images = extract_images_from_docx(b)
         if images:
-            # Limit to first 10 images per document to avoid cost issues
-            for i, img_bytes in enumerate(images[:10]):
+            # Limit to MAX_IMAGES_PER_DOCUMENT for faster processing
+            for i, img_bytes in enumerate(images[:MAX_IMAGES_PER_DOCUMENT]):
                 # Get credentials from session state if available
                 model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
                 project_id = getattr(st.session_state, 'project_id', None)
@@ -414,7 +418,6 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                     stream = ole.openstream('WordDocument')
                     data = stream.read()
                     # Better text extraction from Word binary format
-                    # Word stores text in a table structure, this is a simplified extraction
                     text = ""
                     # Look for readable text sequences
                     for i in range(len(data) - 1):
@@ -456,13 +459,12 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
         except Exception as e:
             errors.append(f"raw extraction: {str(e)[:100]}")
     
-    # Extract and process images from .doc file
+    # Extract and process images from .doc file (limited for performance)
     try:
         images = extract_images_from_doc(b)
         if images:
-            print(f"Found {len(images)} images in .doc file")
-            # Limit to first 10 images per document
-            for img_bytes in images[:10]:
+            # Limit to MAX_IMAGES_PER_DOCUMENT
+            for img_bytes in images[:MAX_IMAGES_PER_DOCUMENT]:
                 # Get credentials from session state if available
                 model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
                 project_id = getattr(st.session_state, 'project_id', None)
@@ -480,7 +482,6 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
                     )
                     if img_text:
                         text_parts.append(img_text)
-                        print(f"✓ Processed image from .doc file")
     except Exception as e:
         errors.append(f"image extraction: {str(e)[:100]}")
     
@@ -488,11 +489,10 @@ def extract_text_from_doc_bytes(b: bytes) -> str:
     if text_parts:
         return "\n\n".join(text_parts)
     
-    # If all methods fail, log errors
-    print(f"✗ FAILED to extract text from .doc file")
-    print(f"  Methods tried: {len(errors)}")
-    if errors:
-        print(f"  Errors: {'; '.join(errors[:5])}")  # Show first 5 errors
+    # If all methods fail, log errors (only show first few to avoid spam)
+    if errors and len(errors) > 0:
+        print(f"✗ FAILED to extract text from .doc file")
+        print(f"  Errors: {'; '.join(errors[:3])}")  # Show first 3 errors only
     
     return ""
 
@@ -509,12 +509,12 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
     except Exception:
         pass
     
-    # Extract and process images (limit to prevent excessive API calls)
+    # Extract and process images (limited for performance)
     try:
         images = extract_images_from_pdf(b)
         if images:
-            # Limit to first 10 images per document to avoid cost issues
-            for img_bytes in images[:10]:
+            # Limit to MAX_IMAGES_PER_DOCUMENT for faster processing
+            for img_bytes in images[:MAX_IMAGES_PER_DOCUMENT]:
                 # Get credentials from session state if available
                 model_name = getattr(st.session_state, 'model_name', None) or CANDIDATE_MODELS[0]
                 project_id = getattr(st.session_state, 'project_id', None)
@@ -1244,12 +1244,13 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
 
     files = list(KB_DIR.iterdir())
     if not silent and hasattr(st.session_state, "kb_loading") and st.session_state.kb_loading:
-        st.info(f"Found {len(files)} files in KB directory")
+        st.info(f"Found {len(files)} files in KB directory. Processing... (this may take a while for {len(files)} files)")
 
     doc_files_processed = 0
     doc_files_failed = 0
+    start_time = time.time()
 
-    for file_path in files:
+    for file_idx, file_path in enumerate(files):
         if not file_path.is_file():
             continue
         try:
@@ -1262,10 +1263,11 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
                 text = extract_text_from_doc_bytes(data)
                 if not text.strip():
                     doc_files_failed += 1
-                    print(f"⚠ No text extracted from .doc file: {file_path.name}")
+                    # Only log failures occasionally to avoid spam
+                    if doc_files_failed <= 5 or doc_files_failed % 10 == 0:
+                        print(f"⚠ No text extracted from .doc file: {file_path.name}")
                 else:
                     doc_files_processed += 1
-                    print(f"✓ Successfully processed .doc file: {file_path.name} ({len(text)} characters)")
             elif suffix == ".pdf":
                 text = extract_text_from_pdf_bytes(data)
             elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
@@ -1321,19 +1323,28 @@ def process_kb_files(silent: bool = False) -> List[Dict]:
                         )
                 except Exception:
                     pass
+            
+            # Progress update every 50 files
+            if not silent and (file_idx + 1) % 50 == 0:
+                elapsed = time.time() - start_time
+                rate = (file_idx + 1) / elapsed if elapsed > 0 else 0
+                remaining = (len(files) - file_idx - 1) / rate if rate > 0 else 0
+                print(f"Progress: {file_idx + 1}/{len(files)} files processed ({elapsed:.1f}s elapsed, ~{remaining:.0f}s remaining)")
+                
         except Exception as e:
             if not silent:
                 st.error(f"Error processing {file_path.name}: {e}")
 
     # Summary of .doc file processing
-    if doc_files_processed > 0 or doc_files_failed > 0:
-        print(f"\n📊 .doc File Processing Summary:")
-        print(f"   Successfully processed: {doc_files_processed}")
-        print(f"   Failed: {doc_files_failed}")
-        if doc_files_failed > 0:
-            print(f"   💡 Tip: Install antiword or catdoc for better .doc support")
-            print(f"      Linux: sudo apt-get install antiword")
-            print(f"      Mac: brew install antiword")
+    elapsed_total = time.time() - start_time
+    print(f"\n📊 Processing Summary:")
+    print(f"   Total files: {len(files)}")
+    print(f"   Total chunks created: {len(corpus)}")
+    print(f"   .doc files processed: {doc_files_processed}")
+    print(f"   .doc files failed: {doc_files_failed}")
+    print(f"   Total time: {elapsed_total:.1f} seconds ({elapsed_total/60:.1f} minutes)")
+    if doc_files_failed > 0:
+        print(f"   💡 Tip: Install antiword or catdoc for better .doc support")
 
     validated: List[Dict] = []
     for item in corpus:
@@ -1595,7 +1606,7 @@ def main():
 
     if not st.session_state.kb_loaded:
         st.session_state.kb_loading = True
-        with st.spinner("Loading knowledge base... (Extracting images from documents - this may take a while)"):
+        with st.spinner("Loading knowledge base... (Processing 600+ files - this will take 30-60 minutes)"):
             index, corpus, loaded = initialize_app()
             st.session_state.index = index
             st.session_state.corpus = corpus
