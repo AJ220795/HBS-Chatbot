@@ -40,11 +40,11 @@ DEFAULT_LOCATION = "us-central1"
 
 MAX_CONTEXT_TOKENS = 150_000
 MAX_CHUNKS_INITIAL = 250
-MAX_CHUNKS_FINAL = 15
+MAX_CHUNKS_FINAL = 25  # Increased from 15 for complex procedures
 
 MULTI_QUERY_VARIATIONS = 3
 DEEP_RETRIEVAL_MULTIPLIER = 3
-REQUIRED_UNIQUE_SOURCES = 6
+REQUIRED_UNIQUE_SOURCES = 3  # Reduced from 6 to 3, max sources is 3
 
 MODEL_CONTEXT_LIMITS = {
     "gemini-3.0-flash": 1_000_000,
@@ -404,7 +404,7 @@ def expand_query(query: str) -> str:
     if "outbound" in q:
         return f"{query} outbound report rental equipment"
     if "equipment" in q:
-        return f"{query} equipment list rental"
+        return f"{query} equipment list rental equipment"
     if "customer" in q:
         return f"{query} customer contract phone"
     if "stock" in q:
@@ -539,8 +539,8 @@ def find_connected_documents(seed_chunks: List[Dict], corpus: List[Dict],
         print(f"Error finding connected documents: {e}")
     return []
 
-def diversify_chunks(candidates: List[Dict], lambda_param: float, top_k: int) -> List[Dict]:
-    """MMR-style diversification with better source balancing."""
+def diversify_chunks(candidates: List[Dict], lambda_param: float, top_k: int, deep_mode: bool = False) -> List[Dict]:
+    """MMR-style diversification with better source balancing for deep mode."""
     if not candidates:
         return []
     
@@ -548,9 +548,16 @@ def diversify_chunks(candidates: List[Dict], lambda_param: float, top_k: int) ->
     used_sources = defaultdict(int)
     pool = candidates[:]
     
-    # Calculate max chunks per source based on diversity of sources
+    # Calculate max chunks per source based on diversity of sources and mode
     unique_sources = len(set(c["source"] for c in candidates[:50]))
-    max_per_source = max(1, top_k // max(3, unique_sources // 2))
+    
+    # In regular mode, prioritize top document (allow 60-70% from it)
+    # In deep mode, allow up to 40% from one source
+    if deep_mode:
+        max_per_source = max(5, int(top_k * 0.4))  # Allow up to 40% from one source
+    else:
+        # For regular queries, allow most chunks from the top document
+        max_per_source = max(int(top_k * 0.7), top_k - unique_sources + 1)
     
     while pool and len(selected) < top_k:
         best_idx, best_score, best_chunk = None, -float("inf"), None
@@ -560,12 +567,28 @@ def diversify_chunks(candidates: List[Dict], lambda_param: float, top_k: int) ->
             
             # Penalty for over-represented sources
             source_count = used_sources[chunk["source"]]
-            if source_count >= max_per_source:
-                penalty = (1 - lambda_param) * 1.0
-            elif chunk["source"] in used_sources:
-                penalty = (1 - lambda_param) * 0.4 * (source_count / max_per_source)
+            
+            if deep_mode:
+                # Deep mode: moderate penalty
+                if source_count >= max_per_source:
+                    if source_count < max_per_source * 1.5:
+                        penalty = (1 - lambda_param) * 0.2
+                    else:
+                        penalty = (1 - lambda_param) * 1.0
+                elif chunk["source"] in used_sources:
+                    penalty = (1 - lambda_param) * 0.3 * (source_count / max_per_source)
+                else:
+                    penalty = 0.0
             else:
-                penalty = 0.0
+                # Regular mode: minimal penalty until really over-represented
+                if source_count >= max_per_source * 1.2:
+                    penalty = (1 - lambda_param) * 0.8
+                elif source_count >= max_per_source:
+                    penalty = (1 - lambda_param) * 0.2  # Small penalty
+                elif chunk["source"] in used_sources:
+                    penalty = (1 - lambda_param) * 0.1 * (source_count / max_per_source)
+                else:
+                    penalty = 0.0
             
             score = lambda_param * base_score - penalty
             
@@ -592,6 +615,31 @@ def ensure_source_diversity(chunks: List[Dict], candidates: List[Dict], min_sour
         if len(selected_sources) >= min_sources:
             break
     return chunks
+
+def limit_to_top_sources(chunks: List[Dict], max_sources: int = 3) -> List[Dict]:
+    """Limit results to chunks from only the top N sources by best rerank/similarity score."""
+    if not chunks or len(chunks) == 0:
+        return chunks
+    
+    # Group chunks by source and find best score per source
+    source_scores = defaultdict(float)
+    for chunk in chunks:
+        source = chunk.get("source", "Unknown")
+        # Use rerank_score if available, otherwise similarity_score
+        score = max(
+            chunk.get("rerank_score", 0) * 10 if "rerank_score" in chunk else 0,
+            chunk.get("similarity_score", 0)
+        )
+        source_scores[source] = max(source_scores[source], score)
+    
+    # Sort sources by best score and take top max_sources
+    top_sources = sorted(source_scores.items(), key=lambda x: x[1], reverse=True)[:max_sources]
+    top_source_names = {source for source, _ in top_sources}
+    
+    # Filter chunks to only include those from top sources
+    filtered = [chunk for chunk in chunks if chunk.get("source", "Unknown") in top_source_names]
+    
+    return filtered
 
 def cluster_chunks(chunks: List[Dict]) -> List[Dict]:
     if not chunks:
@@ -647,12 +695,23 @@ Return JSON: {{"relevance":8,"support":7,"completeness":6,"accuracy_risk":2}}
     return {"relevance": 6, "support": 6, "completeness": 6, "accuracy_risk": 4, "needs_improvement": False}
 
 def rerank_chunks(query: str, chunks: List[Dict], model_name: str, project_id: str, location: str, credentials, top_k: int) -> List[Dict]:
+    """Rerank chunks with better error handling and fallback to similarity scores."""
+    
     if len(chunks) <= top_k:
+        # Ensure all chunks have rerank_score set (use similarity as fallback)
+        for chunk in chunks:
+            if "rerank_score" not in chunk:
+                chunk["rerank_score"] = chunk.get("similarity_score", 0.0)
         return chunks
+    
     try:
         vertexai_init(project=project_id, location=location, credentials=credentials)
         model = GenerativeModel(model_name)
-        snippet = "\n".join(f"[{i}] Source: {chunk.get('source', 'Unknown')}\n{chunk['text'][:600]}" for i, chunk in enumerate(chunks[:50]))
+        
+        # Limit to top 50 chunks for reranking to avoid token limits
+        chunks_to_rerank = chunks[:50]
+        snippet = "\n".join(f"[{i}] Source: {chunk.get('source', 'Unknown')}\n{chunk['text'][:600]}" for i, chunk in enumerate(chunks_to_rerank))
+        
         prompt = f"""Score chunk relevance to query on 0-10 scale. Higher scores for chunks that help answer the complete question.
 
 QUERY: {query}
@@ -660,22 +719,68 @@ QUERY: {query}
 CHUNKS:
 {snippet}
 
-Return JSON array of scores [score1, score2, ...] matching the order of chunks.
+Return ONLY a JSON array of scores [score1, score2, ...] matching the order of chunks.
 Consider: direct relevance, completeness of information, and whether it complements other chunks.
 """
+
         response = model.generate_content(
             prompt,
             generation_config=GenerationConfig(temperature=0.1, max_output_tokens=500),
         )
+
         if response.text:
-            scores = json.loads(response.text.strip())
-            if isinstance(scores, list):
-                for i, score in enumerate(scores[: len(chunks)]):
-                    chunks[i]["rerank_score"] = float(score)
-                chunks.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
-                return chunks[:top_k]
-    except Exception:
-        pass
+            # Try to extract JSON array from response
+            response_text = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            if response_text.startswith("```"):
+                response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
+                response_text = re.sub(r'\s*```$', '', response_text)
+            
+            scores = json.loads(response_text)
+            
+            if isinstance(scores, list) and len(scores) > 0:
+                # Assign scores to chunks
+                for i, score in enumerate(scores[: len(chunks_to_rerank)]):
+                    if i < len(chunks_to_rerank):
+                        # Validate score is a number
+                        try:
+                            chunk_score = float(score)
+                            # Clamp to 0-10 range
+                            chunk_score = max(0.0, min(10.0, chunk_score))
+                            chunks_to_rerank[i]["rerank_score"] = chunk_score
+                        except (ValueError, TypeError):
+                            # Fallback to similarity score if rerank fails
+                            chunks_to_rerank[i]["rerank_score"] = chunks_to_rerank[i].get("similarity_score", 0.0) * 10.0
+                
+                # Ensure all reranked chunks have scores
+                for chunk in chunks_to_rerank:
+                    if "rerank_score" not in chunk:
+                        chunk["rerank_score"] = chunk.get("similarity_score", 0.0) * 10.0
+                
+                # Sort by rerank score, then similarity
+                chunks_to_rerank.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
+                
+                # Add remaining chunks (not reranked) with similarity-based scores
+                remaining_chunks = chunks[50:]
+                for chunk in remaining_chunks:
+                    chunk["rerank_score"] = chunk.get("similarity_score", 0.0) * 10.0
+                
+                # Combine and return top_k
+                all_chunks = chunks_to_rerank + remaining_chunks
+                all_chunks.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
+                return all_chunks[:top_k]
+    except Exception as e:
+        print(f"Reranking error: {e}")
+        # Fallback: use similarity scores
+        for chunk in chunks:
+            chunk["rerank_score"] = chunk.get("similarity_score", 0.0) * 10.0
+    
+    # Final fallback: return top_k chunks sorted by similarity
+    for chunk in chunks:
+        if "rerank_score" not in chunk:
+            chunk["rerank_score"] = chunk.get("similarity_score", 0.0) * 10.0
+    chunks.sort(key=lambda x: (x.get("rerank_score", 0), x.get("similarity_score", 0)), reverse=True)
     return chunks[:top_k]
 
 def build_optimized_context(chunks: List[Dict], max_tokens: int) -> str:
@@ -726,7 +831,7 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         initial_k = min(base_k * (DEEP_RETRIEVAL_MULTIPLIER * 2 if deep_mode else 1), len(corpus))
         
         # Lower threshold for deep mode to catch more potentially relevant docs
-        similarity_threshold = min_similarity * 0.7 if deep_mode else min_similarity
+        similarity_threshold = min_similarity * 0.6 if deep_mode else min_similarity
         
         for query_variant in queries:
             expanded = expand_query(query_variant)
@@ -773,16 +878,20 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
         all_candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
         
         # Diversify with more emphasis on source diversity in deep mode
-        lambda_param = 0.6 if deep_mode else 0.75
-        diversified_k = k * (DEEP_RETRIEVAL_MULTIPLIER * 2 if deep_mode else 1)
+        # For regular queries, prioritize relevance (higher lambda = more weight on similarity)
+        lambda_param = 0.85 if not deep_mode else 0.65  # High lambda for regular = prioritize top doc
+        
+        # For regular queries, don't need as many candidates
+        diversified_k = min(k * (DEEP_RETRIEVAL_MULTIPLIER * 3 if deep_mode else 1), len(all_candidates))
         
         diversified = diversify_chunks(
             all_candidates,
             lambda_param=lambda_param,
             top_k=diversified_k,
+            deep_mode=deep_mode,
         )
         
-        # Rerank but keep more candidates
+        # Rerank but keep more candidates (especially for deep mode)
         rerank_k = len(diversified) if deep_mode else min(k * 2, len(diversified))
         reranked = rerank_chunks(
             query,
@@ -794,13 +903,16 @@ def search_index(query: str, index, corpus: List[Dict], project_id: str, locatio
             top_k=rerank_k,
         )
         
-        # Ensure source diversity with higher minimum for deep mode
-        min_sources = REQUIRED_UNIQUE_SOURCES * 2 if deep_mode else 1
+        # Ensure source diversity - only for deep mode
+        min_sources = REQUIRED_UNIQUE_SOURCES if deep_mode else 1
         final = ensure_source_diversity(
             reranked, 
             diversified, 
             min_sources=min_sources
         )
+        
+        # Limit to max 3 sources
+        final = limit_to_top_sources(final, max_sources=3)
         
         # Return more chunks for deep mode
         return final[:k * (DEEP_RETRIEVAL_MULTIPLIER if deep_mode else 1)]
@@ -1024,30 +1136,65 @@ KNOWLEDGE BASE CONTEXT:
 USER QUESTION: {query}
 
 RESPONSE GUIDELINES:
+
 1. **Direct Answer** - provide a clear, direct response based on the context provided
-2. **Concise but Complete** - be thorough but avoid unnecessary verbosity
+
+2. **Comprehensive and Detailed** - use ALL available information from the context documents
+   - Minimum 400 words for all answers
+   - For procedures/steps: include EVERY step, field, screen, and detail mentioned
+   - NO word limit - use as many words as needed to cover everything in the documents
+   - Do not omit, summarize, or skip details - be exhaustive when the context provides detailed information
+
 3. **Steps/Procedures** - when present, list all steps in detail with specific field names, screen names, and values
+
 4. **Examples** - include specific examples, field names, values, and dealership terminology when available
+
 5. **Related Information** - add related tips, warnings, or important notes that might be helpful
+
 6. **Multi-Document Integration** - it is possible that the complete answer to a question lies across several different documents. Each step in one document may relate to another in a different document. If that is the case, make sure you stitch together different parts of the answer from different documents and provide the complete, comprehensive answer to the user.
+
 7. **Accuracy Priority** - accuracy takes priority, but provide as much detail as is available in the context
 
 CRITICAL RULES:
+
 - Answer based ONLY on the knowledge base context provided above
+
 - DO NOT reference document names, filenames, or source files in your answer (e.g., don't say "According to document X.docx" or "As stated in file Y.docx")
+
 - DO NOT mention "the documentation", "the provided context", "the knowledge base", or similar meta-references
+
 - DO NOT explain your confidence level, assumptions, edge cases, or methodology unless explicitly asked
+
 - DO NOT say things like "Based on the provided information", "If you need more details", "I assume", "I am X% confident", or similar defensive language
+
 - DO NOT mention what could be missing, what you don't know, or uncertainty unless the user specifically asks
+
 - DO NOT repeat the question back to the user - just answer it directly
+
 - Answer naturally as if you are an expert who knows this information - write as if you're speaking directly about HBS NetView features, not about documents
+
 - Present information as facts about the system, not as citations from documents
+
 - If asked for "exact source" or page numbers and you don't have that information, say "Page numbers are not available in the extracted content, but this information comes from [document name]"
-- Be concise but complete - aim for 300-500 words for standard answers, 500-700 words for complex multi-step procedures
+
+- Minimum length: 400 words for all answers
+
+- For detailed procedures or multi-step processes: include ALL information available in the context - use as many words as needed to fully explain everything
+
+- There is NO maximum word limit - use everything stated in the documents
+
+- For complex procedures: include every step, every field name, every screen reference, every detail mentioned in the context
+
+- Do not summarize or omit steps/details - provide comprehensive, exhaustive answers when detailed information is available
+
 - Use bullets/numbered lists for clarity
+
 - Include all relevant details, field names, screen references, and specific terminology
+
 - When multiple documents contain related information, synthesize them into a cohesive answer without mentioning that it comes from multiple sources
+
 - Answer the question asked - if asked for a summary, give a brief summary; if asked for details, give details
+
 - Do not volunteer additional explanations about methodology, constraints, or confidence unless specifically requested"""
     
     if deep_mode:
