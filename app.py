@@ -35,7 +35,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 KB_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
-CANDIDATE_MODELS = ["gemini-3.0-flash", "gemini-3.0-pro"]
+CANDIDATE_MODELS = ["gemini-3.0-flash-preview", "gemini-3.0-pro-preview"]
 DEFAULT_LOCATION = "us-central1"
 
 MAX_CONTEXT_TOKENS = 150_000
